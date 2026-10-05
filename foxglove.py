@@ -7,14 +7,18 @@ Foxglove - a Firefox-inspired web browser written in Python (PyQt6 + Qt WebEngin
     cookies come back next launch, so you stay signed in
   * Bookmarks: star button, bookmarks toolbar with folders, bookmark manager, HTML import/export
   * Chrome extensions (Manifest V3): one-click install from the Chrome Web Store, or from a
-    .crx/.zip file or an unpacked folder; toolbar popups, options pages, enable/disable/remove
+    .crx/.zip file or an unpacked folder; toolbar popups with badges, options pages, enable/disable/remove.
+    Foxglove fills in the extension APIs its engine lacks - chrome.action, contextMenus, notifications,
+    alarms, tabs, windows, scripting, offscreen, storage.sync/onChanged, i18n, commands - so extensions
+    built for Chrome run (ad blockers' network rules are kept but not enforced yet)
   * VPN / proxy: route the browser through Tor, Cloudflare WARP or your own HTTP/SOCKS5 proxy,
     with WebRTC leak protection, a connection check and a kill switch (shield button in the toolbar)
   * Smart address bar (history + bookmarks), downloads panel, find in page, per-site zoom,
     developer tools, printing, permission prompts, full-screen video and more
 
 Setup (once):   python3 -m pip install --upgrade PyQt6 PyQt6-WebEngine
-Run:            python3 foxglove.py            (optionally followed by URLs to open)
+Run:            python3 foxglove.py            (optionally followed by URLs to open; --verbose shows
+                                                extensions' errors)
 
 Your data (tabs, bookmarks, cookies, extensions) is kept in
   macOS:   ~/Library/Application Support/Foxglove
@@ -26,12 +30,17 @@ from __future__ import annotations
 import argparse
 import atexit
 import base64
+import errno
 import hashlib
+import hmac
 import html
 import io
+import itertools
 import json
+import mimetypes
 import os
 import re
+import secrets
 import shutil
 import signal
 import socket
@@ -45,24 +54,25 @@ import traceback
 import uuid
 import weakref
 import zipfile
-from dataclasses import dataclass
+from dataclasses import dataclass, field as dc_field
 from html.parser import HTMLParser
 from pathlib import Path
-from urllib.parse import quote_plus
+from urllib.parse import quote, quote_plus, unquote
 
 try:
     from PyQt6 import sip
     from PyQt6.QtCore import (
-        QT_VERSION_STR, QBuffer, QByteArray, QCoreApplication, QDataStream, QEvent, QIODevice, QItemSelectionModel,
+        QT_VERSION_STR, QBuffer, QByteArray, QCoreApplication, QDataStream, QDateTime, QEvent, QIODevice, QItemSelectionModel,
         QLocale, QLockFile, QObject, QPoint, QRect, QRectF, QSize, QStandardPaths, Qt, QTimer, QUrl,
         pyqtSignal,
     )
     from PyQt6.QtGui import (
-        QAction, QColor, QDesktopServices, QFont, QGuiApplication, QIcon, QIntValidator, QKeySequence, QPainter,
+        QAction, QColor, QDesktopServices, QFont, QFontDatabase, QGuiApplication, QIcon, QIntValidator, QKeySequence, QPainter,
         QPalette, QPen, QPixmap, QStandardItem, QStandardItemModel,
     )
     from PyQt6.QtNetwork import (
-        QAuthenticator, QNetworkAccessManager, QNetworkProxy, QNetworkProxyFactory, QNetworkReply, QNetworkRequest,
+        QAuthenticator, QNetworkAccessManager, QNetworkCookie, QNetworkProxy, QNetworkProxyFactory, QNetworkReply,
+        QNetworkRequest,
     )
     from PyQt6.QtPrintSupport import QPrintDialog, QPrinter
     from PyQt6.QtWidgets import (
@@ -74,9 +84,9 @@ try:
     )
     from PyQt6.QtWebEngineCore import (
         QWebEngineCertificateError, QWebEngineContextMenuRequest, QWebEngineDownloadRequest, QWebEngineLoadingInfo,
-        QWebEngineNewWindowRequest, QWebEnginePage, QWebEnginePermission, QWebEngineProfile,
-        QWebEngineSettings, QWebEngineUrlRequestJob, QWebEngineUrlScheme, QWebEngineUrlSchemeHandler,
-        qWebEngineChromiumVersion,
+        QWebEngineNewWindowRequest, QWebEnginePage, QWebEnginePermission, QWebEngineProfile, QWebEngineScript,
+        QWebEngineSettings, QWebEngineUrlRequestInfo, QWebEngineUrlRequestInterceptor, QWebEngineUrlRequestJob,
+        QWebEngineUrlScheme, QWebEngineUrlSchemeHandler, qWebEngineChromiumVersion,
     )
     from PyQt6.QtWebEngineWidgets import QWebEngineView
 except ImportError as exc:  # shown instead of a traceback when the packages are missing
@@ -92,6 +102,7 @@ IS_MAC = sys.platform == "darwin"
 HAS_EXTENSIONS = hasattr(QWebEngineProfile, "extensionManager")  # Qt WebEngine 6.10+
 TRANSLUCENT_POPUPS = sys.platform in ("darwin", "win32")
 NEWTAB = "foxglove://newtab"
+VERBOSE = False               # --verbose: Chromium's and extensions' messages in the terminal
 
 TAB_MIN_WIDTH, TAB_MAX_WIDTH, TAB_HEIGHT = 80, 240, 40
 TAB_CLOSE_AREA = 32           # room for the close button on the right of each tab
@@ -112,7 +123,13 @@ WEBSTORE_RE = re.compile(
     r"^https://(?:chromewebstore\.google\.com/detail|chrome\.google\.com/webstore/detail)/"
     r"(?:[^/?#]+/)?([a-p]{32})(?:[/?#]|$)"
 )
+# The Web Store's update service: answers with a redirect to the extension's signed .crx ({version}: Chromium's).
+WEBSTORE_CRX_URL = ("https://clients2.google.com/service/update2/crx?response=redirect&prodversion={version}"
+                    "&acceptformat=crx2,crx3&x=id%3D{id}%26uc")
 COMPONENT_EXTENSIONS = {"mhjfbmdgcfjbbpaeojofohoefgiehjai", "nkeimhogjdpnpccoofpliimaahmaaome"}
+EXT_SCHEME = "foxglove-ext"   # extensions -> Foxglove calls (foxglove-ext://bridge/call) + web-accessible files
+EXT_BRIDGE_URL = f"{EXT_SCHEME}://bridge/call"
+MAX_UNPACKED_SIZE = 512 * 1024 * 1024
 
 _PT = QWebEnginePermission.PermissionType
 PERMISSION_TEXT = {
@@ -552,10 +569,52 @@ def is_newtab(url: QUrl) -> bool:
     return url.scheme() == "foxglove" and url.host() == "newtab"
 
 
+NEWTAB_OVERRIDES: set[str] = set()  # extension New Tab pages (chrome_url_overrides) - shown with an empty address bar
+
+
 def display_url(url: QUrl) -> str:
-    if url.isEmpty() or is_newtab(url) or url.toString() == "about:blank":
+    if url.isEmpty() or is_newtab(url) or url.toString() in ("about:blank", *NEWTAB_OVERRIDES):
         return ""
     return url.toDisplayString()
+
+
+def match_pattern(pattern: str, url: str) -> bool:
+    """Chrome's match patterns ("<all_urls>", "*://*.example.com/path*") - also accepts a bare origin pattern."""
+    if pattern == "<all_urls>":
+        return re.match(r"^(https?|wss?|ftp|file|data|urn):", url) is not None
+    m = re.fullmatch(r"(\*|[a-z][a-z0-9+.-]*)://(\*|\*\.[^/*]+|[^/*]*)(/.*)?", pattern)
+    target = QUrl(url)
+    if m is None or not target.isValid():
+        return False
+    scheme, host, path = m.group(1), m.group(2), m.group(3) or "/*"
+    if (scheme == "*" and target.scheme() not in ("http", "https", "ws", "wss")) or (scheme != "*" and scheme != target.scheme()):
+        return False
+    have = target.host().lower()
+    if host.startswith("*.") and not (have == host[2:].lower() or have.endswith(host[1:].lower())):
+        return False
+    if host not in ("*", "") and not host.startswith("*.") and host.split(":")[0].lower() != have:
+        return False
+    full = target.path(QUrl.ComponentFormattingOption.FullyEncoded) or "/"
+    if target.hasQuery():
+        full += "?" + target.query(QUrl.ComponentFormattingOption.FullyEncoded)
+    return re.fullmatch(".*".join(map(re.escape, path.split("*"))), full) is not None
+
+
+def plain_tip(text: str) -> str:
+    """Tool tips guess rich text; keep HTML-looking names (from extensions, web pages) literal."""
+    return f"<span>{html.escape(text)}</span>" if "<" in text or "&lt;" in text else text
+
+
+def ask_question(parent: QWidget | None, title: str, text: str, yes: str = "") -> bool:
+    box = QMessageBox(QMessageBox.Icon.Question, title, text,
+                      QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No, parent)
+    box.setTextFormat(Qt.TextFormat.PlainText)  # names come from extensions and web pages: never render them
+    if yes:
+        box.button(QMessageBox.StandardButton.Yes).setText(yes)
+    try:
+        return box.exec() == QMessageBox.StandardButton.Yes
+    finally:
+        box.deleteLater()
 
 
 def safe_filename(name: str, fallback: str = "download") -> str:
@@ -711,8 +770,107 @@ def extension_id_from_key(public_key: bytes) -> str:
     return "".join(chr(ord("a") + int(ch, 16)) for ch in digest)
 
 
+def _der(buf: bytes, pos: int = 0) -> tuple[int, bytes, int]:
+    """One DER element: (tag, contents, position after it)."""
+    if pos + 2 > len(buf):
+        raise ValueError("truncated DER")
+    tag, length, pos = buf[pos], buf[pos + 1], pos + 2
+    if length & 0x80:
+        count = length & 0x7F
+        if not 0 < count <= 4 or pos + count > len(buf):
+            raise ValueError("bad DER length")
+        length, pos = int.from_bytes(buf[pos:pos + count], "big"), pos + count
+    if pos + length > len(buf):
+        raise ValueError("truncated DER")
+    return tag, buf[pos:pos + length], pos + length
+
+
+def _spki(spki: bytes) -> tuple[bytes, bytes, bytes]:
+    """SubjectPublicKeyInfo -> (algorithm OID, parameters, key bits)."""
+    tag, body, _ = _der(spki)
+    tag_alg, alg, pos = _der(body)
+    tag_bits, bits, _ = _der(body, pos)
+    tag_oid, oid, pos = _der(alg)
+    params = _der(alg, pos)[1] if pos < len(alg) else b""
+    if (tag, tag_alg, tag_bits, tag_oid) != (0x30, 0x30, 0x03, 0x06) or not bits or bits[0] != 0:
+        raise ValueError("not a public key")
+    return oid, params, bits[1:]
+
+
+_DIGEST_INFO = {"sha256": bytes.fromhex("3031300d060960864801650304020105000420"),
+                "sha1": bytes.fromhex("3021300906052b0e03021a05000414")}
+_RSA_OID, _EC_OID, _P256_OID = (bytes.fromhex("2a864886f70d010101"), bytes.fromhex("2a8648ce3d0201"),
+                                bytes.fromhex("2a8648ce3d030107"))
+_P256 = (0xffffffff00000001000000000000000000000000ffffffffffffffffffffffff,       # p
+         0xffffffff00000000ffffffffffffffffbce6faada7179e84f3b9cac2fc632551,       # n
+         0x5ac635d8aa3a93e7b3ebbd55769886bc651d06b0cc53b0f63bce3c3e27d2604b,       # b
+         (0x6b17d1f2e12c4247f8bce6e563a440f277037d812deb33a0f4a13945d898c296,
+          0x4fe342e2fe1a7f9b8ee7eb4a7c0f9e162bce33576b315ececbb6406837bf51f5))      # G
+
+
+def _ec_add(a, b):
+    p = _P256[0]
+    if a is None or b is None:
+        return a or b
+    if a[0] == b[0] and (a[1] + b[1]) % p == 0:
+        return None
+    if a == b:
+        lam = 3 * (a[0] * a[0] - 1) * pow(2 * a[1], -1, p) % p   # curve a = -3
+    else:
+        lam = (b[1] - a[1]) * pow(b[0] - a[0], -1, p) % p
+    x = (lam * lam - a[0] - b[0]) % p
+    return x, (lam * (a[0] - x) - a[1]) % p
+
+
+def _ec_mul(k: int, point):
+    result = None
+    while k:
+        if k & 1:
+            result = _ec_add(result, point)
+        point, k = _ec_add(point, point), k >> 1
+    return result
+
+
+def verify_signature(spki: bytes, signature: bytes, message: bytes, hash_name: str = "sha256") -> bool:
+    """RSA PKCS#1 v1.5 or ECDSA P-256 signature check (all a .crx needs), without extra packages."""
+    try:
+        oid, params, key = _spki(spki)
+        digest = hashlib.new(hash_name, message).digest()
+        if oid == _RSA_OID:
+            tag, body, _ = _der(key)
+            tag_n, n_raw, pos = _der(body)
+            tag_e, e_raw, _ = _der(body, pos)
+            n, e = int.from_bytes(n_raw, "big"), int.from_bytes(e_raw, "big")
+            size = (n.bit_length() + 7) // 8
+            info = _DIGEST_INFO[hash_name] + digest
+            if (tag, tag_n, tag_e) != (0x30, 2, 2) or len(signature) != size or size < len(info) + 11:
+                return False
+            decoded = pow(int.from_bytes(signature, "big"), e, n).to_bytes(size, "big")
+            return hmac.compare_digest(decoded, b"\x00\x01" + b"\xff" * (size - len(info) - 3) + b"\x00" + info)
+        if oid == _EC_OID and params == _P256_OID and len(key) == 65 and key[0] == 4:
+            p, n, b, g = _P256
+            q = (int.from_bytes(key[1:33], "big"), int.from_bytes(key[33:], "big"))
+            if (q[1] * q[1] - q[0] ** 3 + 3 * q[0] - b) % p:
+                return False
+            tag, body, _ = _der(signature)
+            tag_r, r, pos = _der(body)
+            tag_s, s, _ = _der(body, pos)
+            r, s = int.from_bytes(r, "big"), int.from_bytes(s, "big")
+            if (tag, tag_r, tag_s) != (0x30, 2, 2) or not (0 < r < n and 0 < s < n):
+                return False
+            w = pow(s, -1, n)
+            point = _ec_add(_ec_mul(int.from_bytes(digest, "big") * w % n, g), _ec_mul(r * w % n, q))
+            return point is not None and point[0] % n == r
+    except (ValueError, KeyError, ZeroDivisionError):
+        pass
+    return False
+
+
 def parse_crx(data: bytes) -> tuple[bytes, bytes | None]:
-    """Return (zip archive, developer public key) for a .crx (v2/v3) - or (data, None) for a plain zip."""
+    """Return (zip archive, developer public key) for a signed .crx (v2/v3) - or (data, None) for a plain zip.
+
+    The key decides the extension's ID, so - like Chrome - only a package whose signature by that key verifies
+    is accepted (otherwise any file could claim to be, and silently replace, an installed extension)."""
     if data[:4] != b"Cr24":
         if data[:2] == b"PK":
             return data, None
@@ -721,21 +879,32 @@ def parse_crx(data: bytes) -> tuple[bytes, bytes | None]:
     if version == 2:
         key_len = int.from_bytes(data[8:12], "little")
         sig_len = int.from_bytes(data[12:16], "little")
-        return data[16 + key_len + sig_len:], data[16:16 + key_len]
+        key, signature = data[16:16 + key_len], data[16 + key_len:16 + key_len + sig_len]
+        archive = data[16 + key_len + sig_len:]
+        if len(data) < 16 + key_len + sig_len or not verify_signature(key, signature, archive, "sha1"):
+            raise InstallError("The extension file's signature doesn't verify, so it can't be installed.")
+        return archive, key
     if version == 3:
         header_len = int.from_bytes(data[8:12], "little")
         header = data[12:12 + header_len]
-        keys: list[bytes] = []
-        crx_id = None
+        proofs: list[tuple[bytes, bytes]] = []
+        signed = crx_id = None
         for number, wire, value in _proto_fields(header):
             if wire != 2:
                 continue
-            if number in (2, 3):  # sha256_with_rsa / sha256_with_ecdsa proofs
-                keys += [v for n, w, v in _proto_fields(value) if n == 1 and w == 2]
+            if number in (2, 3):  # sha256_with_rsa / sha256_with_ecdsa: AsymmetricKeyProof {public_key, signature}
+                fields = {n: v for n, w, v in _proto_fields(value) if w == 2}
+                proofs.append((fields.get(1, b""), fields.get(2, b"")))
             elif number == 10000:  # signed header data -> crx_id
+                signed = value
                 crx_id = next((v for n, w, v in _proto_fields(value) if n == 1 and w == 2), None)
-        key = next((k for k in keys if crx_id is not None and hashlib.sha256(k).digest()[:16] == crx_id), None)
-        return data[12 + header_len:], key
+        archive = data[12 + header_len:]
+        message = b"CRX3 SignedData\x00" + len(signed or b"").to_bytes(4, "little") + (signed or b"") + archive
+        key = next((k for k, sig in proofs if crx_id is not None and hashlib.sha256(k).digest()[:16] == crx_id
+                    and verify_signature(k, sig, message)), None)
+        if key is None:
+            raise InstallError("The extension file's signature doesn't verify, so it can't be installed.")
+        return archive, key
     raise InstallError(f"Unsupported .crx version ({version}).")
 
 
@@ -773,8 +942,8 @@ def load_manifest(directory: Path) -> dict:
     raw = (directory / "manifest.json").read_bytes().decode("utf-8-sig")
     try:
         data = json.loads(raw)
-    except ValueError:  # Chrome tolerates comments and trailing commas in manifest.json
-        data = json.loads(re.sub(r",(\s*[}\]])", r"\1", _strip_json_comments(raw)))
+    except ValueError:  # Chrome tolerates comments in manifest.json (not trailing commas)
+        data = json.loads(_strip_json_comments(raw))
     if not isinstance(data, dict):
         raise ValueError("manifest.json does not contain an object")
     return data
@@ -798,12 +967,858 @@ def localized(directory: Path, manifest: dict, value) -> str:
 
 
 def _safe_extract(archive: zipfile.ZipFile, target: Path) -> None:
-    root = target.resolve()
-    for member in archive.infolist():
+    root, total = target.resolve(), 0
+    members = archive.infolist()
+    for member in members:
+        member.filename = member.filename.replace("\\", "/")  # zips made on Windows
         destination = (root / member.filename).resolve()
         if destination != root and root not in destination.parents:
             raise InstallError("The extension archive contains unsafe file paths.")
-    archive.extractall(root)
+        total += member.file_size
+        if total > MAX_UNPACKED_SIZE or (member.file_size > 10 * 1024 * 1024 and member.file_size > 200 * max(1, member.compress_size)):
+            raise InstallError("The extension package is too large to install.")
+    for member in members:
+        archive.extract(member, root)
+
+
+# ── Foxglove's chrome.* polyfill, wired into every extension at install time ───────────────────────
+# Qt WebEngine gives extensions only runtime, storage, i18n, management and tabs.update, and several calls it does
+# have crash or hang the browser. The shim below runs first in each extension context and fills the gaps; calls
+# that need the browser go to Foxglove over the foxglove-ext:// scheme (ExtensionBridge).
+SHIM_VERSION = 1
+SHIM_FILE, SHIM_WORKER, SHIM_BRIDGE, SHIM_ORIGINAL = (
+    "foxglove-shim.js", "foxglove-worker.js", "foxglove-bridge.html", "foxglove-manifest.json")
+SHIM_TAG = f'<script src="/{SHIM_FILE}"></script>'
+SHIM_CFG_MARK = "/*FOXGLOVE_CFG*/"
+EXTENSION_SHIM_JS = r"""/* foxglove-shim %(stamp)s
+   Foxglove fills in the chrome.* APIs that Qt WebEngine lacks or gets wrong. Written at install time; runs first in
+   the service worker, in every extension page and in front of every content script. */
+(() => {
+  "use strict";
+  const g = globalThis;
+  if (g.__foxgloveShim || typeof chrome !== "object" || !chrome || !chrome.runtime || !chrome.runtime.id) return;
+  Object.defineProperty(g, "__foxgloveShim", { value: true });
+  const CFG = /*FOXGLOVE_CFG*/{}/*END*/;
+  const rt = chrome.runtime, ID = rt.id, ORIGIN = "chrome-extension://" + ID;
+  const isSW = typeof ServiceWorkerGlobalScope === "function" && g instanceof ServiceWorkerGlobalScope;
+  const isPage = !isSW && typeof location === "object" && location.origin === ORIGIN;
+  const isCS = !isSW && !isPage;
+  const isBridge = isPage && location.pathname === "/foxglove-bridge.html";
+  const inTab = isCS || (isPage && !isBridge);  // may be in a tab (an extension page in a pop-up or offscreen isn't)
+  const FRAME = inTab ? (g === g.top ? 0 : -1) : undefined;
+  const rtSend = rt.sendMessage.bind(rt), getURL = rt.getURL.bind(rt);
+  const nop = () => undefined;
+  const put = (obj, members) => {
+    for (const [k, v] of Object.entries(members)) {
+      try { obj[k] = v; } catch (err) { /* read-only */ }
+      if (obj[k] !== v) { try { Object.defineProperty(obj, k, { value: v, configurable: true, writable: true, enumerable: true }); } catch (err) { /* keep it */ } }
+    }
+    return obj;
+  };
+  const ns = (name) => (chrome[name] && typeof chrome[name] === "object" ? chrome[name] : (chrome[name] = {}));
+  const has = (perm) => (CFG.permissions || []).includes(perm) || (CFG.optional || []).includes(perm);
+  const url = (p) => (typeof p === "string" && p && !/^[a-z][a-z0-9+.-]*:/i.test(p) ? getURL(p.replace(/^\//, "")) : p);
+
+  // ── which tab this is: Foxglove's script in the tab answers a DOM event named for this extension alone - and
+  //    only an answer that arrives while we ask counts (DOM events reach every world of a page) ──
+  let myTab, asking = false;
+  const tabId = () => {
+    if (myTab === undefined && inTab && CFG.tabQuery && typeof document === "object") {
+      asking = true;
+      try { document.dispatchEvent(new CustomEvent(CFG.tabQuery)); } finally { asking = false; }
+    }
+    return myTab;
+  };
+  if (inTab && CFG.tabAnswer && typeof document === "object") {
+    document.addEventListener(CFG.tabAnswer, (e) => { if (asking && myTab === undefined) myTab = Number(e.detail); });
+  }
+
+  // ── calls to Foxglove: fetch() to its scheme (pages and the worker are known by their origin, content scripts by a token) ──
+  const unwrap = (r) => { if (r && r.ok) return r.value; throw new Error((r && r.error) || "Foxglove couldn't complete the request."); };
+  const post = g.fetch.bind(g), json = JSON.stringify;  // the originals: page code may replace them later
+  const PART = 12000;  // Qt garbles request bodies over 16 KiB: bigger calls go in parts, as ASCII so a part is never cut mid-character
+  const ascii = (s) => s.replace(/[\u007f-\uffff]/g, (c) => "\\u" + c.charCodeAt(0).toString(16).padStart(4, "0"));
+  const send = (body, part) => post(CFG.bridge + (part ? "?part=" + part : ""), { method: "POST", body }).then((r) => r.json()).then(unwrap);
+  const call = async (api, args) => {
+    const body = ascii(json(isCS ? { api, args, token: CFG.token, tab: tabId(), frame: FRAME } : { api, args, from: isSW ? "" : location.href }));
+    if (body.length <= PART) return send(body);
+    const id = Math.random().toString(36).slice(2) + Math.random().toString(36).slice(2), n = Math.ceil(body.length / PART);
+    const auth = (isCS ? CFG.token : "") + "\n";  // Foxglove only keeps parts for callers it knows
+    for (let i = 0; i < n - 1; i++) await send(auth + body.slice(i * PART, (i + 1) * PART), `${id}.${i}.${n}`);
+    return send(auth + body.slice((n - 1) * PART), `${id}.${n - 1}.${n}`);
+  };
+  const chains = {};  // calls whose order matters (a menu item before its children, the last badge text wins)
+  const ordered = (api, args) => {
+    const key = api.split(".")[0], next = (chains[key] || Promise.resolve()).then(() => call(api, args));
+    chains[key] = next.catch(nop);
+    return next;
+  };
+
+  // ── callbacks or promises, with chrome.runtime.lastError for callbacks ──
+  const withError = (message, cb, ...args) => {
+    const d = Object.getOwnPropertyDescriptor(rt, "lastError");
+    try { Object.defineProperty(rt, "lastError", { configurable: true, enumerable: true, get: () => ({ message }) }); } catch (err) { /* keep */ }
+    try { cb(...args); } finally {
+      try { if (d) Object.defineProperty(rt, "lastError", d); else delete rt.lastError; } catch (err) { /* keep */ }
+    }
+  };
+  const fn = (impl) => function (...args) {
+    const cb = typeof args[args.length - 1] === "function" ? args.pop() : null;
+    let p;  // started right away: a page that closes next (a pop-up saving its settings) must not lose the call
+    try { p = Promise.resolve(impl(...args)); } catch (err) { p = Promise.reject(err); }
+    if (!cb) return p;
+    p.then((v) => cb(v), (err) => withError(String((err && err.message) || err), cb));
+  };
+
+  // ── events: Foxglove's (delivered through its bridge page) and the ones emulated here ──
+  const events = new Map(), told = new Set();
+  const listen = (name) => {  // storage: only the worker's onChanged (a change in a page must wake it, as in Chrome)
+    if (isCS || isBridge || told.has(name) || (name.startsWith("storage.") && !(isSW && /^storage\.(\w+\.)?onChanged$/.test(name)))) return;
+    told.add(name);
+    call("events.listen", { name, worker: isSW }).catch(nop);
+  };
+  const event = (name) => {
+    if (!events.has(name)) {
+      const set = new Set();
+      events.set(name, { set, api: {
+        addListener(f) { if (typeof f === "function") { set.add(f); listen(name); } },
+        removeListener(f) { set.delete(f); },
+        hasListener(f) { return set.has(f); },
+        hasListeners() { return set.size > 0; },
+        addRules: fn(() => []), getRules: fn(() => []), removeRules: fn(nop),
+      } });
+    }
+    return events.get(name).api;
+  };
+  const emit = (name, args) => {
+    const e = events.get(name);
+    for (const f of e ? [...e.set] : []) { try { f(...(args || [])); } catch (err) { console.error(err); } }
+  };
+  const seen = [];
+  const deliver = (m) => {
+    if (!m || m.__fg !== "event") return;
+    if (m.eid) { if (seen.includes(m.eid)) return; seen.push(m.eid); if (seen.length > 64) seen.shift(); }
+    emit(m.name, m.args);
+  };
+  const channel = !isCS && typeof BroadcastChannel === "function" ? new BroadcastChannel("__foxglove") : null;
+  if (channel && !isBridge) channel.onmessage = (e) => deliver(e.data);
+  if (isSW) g.addEventListener("message", (e) => { if (e.data && e.data.__fg === "event") { e.stopImmediatePropagation(); deliver(e.data); } });
+  if (isBridge) {  // Foxglove -> the extension: other pages hear the channel, the worker gets (and is woken by) a message
+    g.__foxgloveEmit = async (name, args, eid, workerOnly) => {
+      const m = { __fg: "event", name, args, eid: eid || Math.random().toString(36).slice(2) };
+      if (!workerOnly) channel.postMessage(m);
+      for (let i = 0; CFG.worker && i < 40; i++) {
+        const reg = await navigator.serviceWorker.getRegistration();
+        const w = reg && (reg.active || reg.waiting || reg.installing);
+        if (w) { w.postMessage(m); return true; }
+        await new Promise((r) => setTimeout(r, 250));
+      }
+      return false;
+    };
+  }
+
+  // ── runtime.onMessage / onConnect: hide Foxglove's own traffic, give content-script senders their tab ──
+  const tabOf = (sender, m) => (sender.tab || typeof m.tab !== "number" || m.tab < 0 ? sender : { ...sender, frameId: m.frame,
+    tab: { id: m.tab, index: -1, windowId: 1, url: sender.url, title: m.title, active: true, highlighted: true, selected: true,
+      pinned: false, incognito: false, status: "complete", audible: false, discarded: false, autoDiscardable: true, groupId: -1,
+      mutedInfo: { muted: false } } });
+  // A listener may also answer by returning a promise (newer Chrome). One that settles without a value only closes
+  // the channel if no other listener still means to answer (returned true or a promise of its own).
+  const replies = new WeakMap();  // sendResponse (one per message) -> {open, kept, done, send}
+  const invoke = (f, msg, sender, respond) => {
+    let st = replies.get(respond);
+    if (!st) {
+      st = { open: 0, kept: false, done: false };
+      st.send = (v) => { if (!st.done) { st.done = true; respond(v); } };
+      replies.set(respond, st);
+    }
+    const r = f(msg, sender, st.send);
+    if (r === true) { st.kept = true; return true; }
+    if (!r || typeof r.then !== "function") return r;
+    st.open++;
+    const settle = (v) => { st.open--; if (v !== undefined) st.send(v); else if (!st.open && !st.kept) st.send(undefined); };
+    r.then(settle, () => settle(undefined));
+    return true;
+  };
+  const onMsg = rt.onMessage, nmAdd = onMsg.addListener.bind(onMsg), nmRemove = onMsg.removeListener.bind(onMsg), nmHas = onMsg.hasListener.bind(onMsg);
+  const wrapped = new WeakMap(), csListeners = new Set();
+  put(onMsg, {
+    addListener(f) {
+      if (typeof f !== "function" || wrapped.has(f)) return;
+      const w = (m, sender, respond) => (m && typeof m === "object" && m.__fg
+        ? (m.__fg === "cs-msg" ? invoke(f, m.msg, tabOf(sender, m), respond) : undefined) : invoke(f, m, sender, respond));
+      wrapped.set(f, w);
+      if (isCS) csListeners.add(f);
+      nmAdd(w);
+    },
+    removeListener(f) { nmRemove(wrapped.get(f) || f); wrapped.delete(f); csListeners.delete(f); },
+    hasListener(f) { return nmHas(wrapped.get(f) || f); },
+  });
+  if (!isCS) nmAdd((m) => { if (m && m.__fg === "event") deliver(m); return undefined; });
+  const onConnect = rt.onConnect;
+  if (onConnect && !isCS) {
+    const ocAdd = onConnect.addListener.bind(onConnect), ocRemove = onConnect.removeListener.bind(onConnect), ocWrapped = new WeakMap();
+    put(onConnect, {
+      addListener(f) {
+        if (typeof f !== "function" || ocWrapped.has(f)) return;
+        const w = (port) => {
+          const m = /^__fg([^|]*)\|/.exec(port.name || "");
+          if (m) {
+            try {
+              const [tab, frame, title] = JSON.parse(decodeURIComponent(m[1]));
+              Object.defineProperty(port, "name", { value: port.name.slice(m[0].length), configurable: true });
+              if (port.sender) Object.defineProperty(port, "sender", { value: tabOf(port.sender, { tab, frame, title }), configurable: true });
+            } catch (err) { /* leave the port as it is */ }
+          }
+          return f(port);
+        };
+        ocWrapped.set(f, w);
+        ocAdd(w);
+      },
+      removeListener(f) { ocRemove(ocWrapped.get(f) || f); ocWrapped.delete(f); },
+    });
+  }
+
+  // ── chrome.i18n (Qt: always "", and the first call can stall the extension for a minute) ──
+  const ui = CFG.uiLocale || "en_US", messages = CFG.messages || {};
+  const predefined = { "@@extension_id": ID, "@@ui_locale": ui, "@@bidi_dir": "ltr", "@@bidi_reversed_dir": "rtl",
+    "@@bidi_start_edge": "left", "@@bidi_end_edge": "right" };
+  if (chrome.i18n) {
+    put(chrome.i18n, {
+      getMessage(name, subs) {
+        const key = String(name).toLowerCase(), msg = key in predefined ? predefined[key] : messages[key];
+        if (msg === undefined) return "";
+        const list = subs === undefined || subs === null ? [] : Array.isArray(subs) ? subs : [subs];
+        return msg.replace(/\$(\$|[1-9])/g, (_, d) => (d === "$" ? "$" : list[d - 1] === undefined ? "" : String(list[d - 1])));
+      },
+      getUILanguage: () => ui.replace("_", "-"),
+      getAcceptLanguages: fn(() => [...new Set([ui.replace("_", "-"), ui.split("_")[0]])]),
+      detectLanguage: fn(() => ({ isReliable: false, languages: [] })),
+    });
+  }
+  put(rt, { getManifest: ((native) => () => Object.assign(native(), CFG.manifest || {}))(rt.getManifest.bind(rt)) });
+
+  // ── chrome.storage: sync/managed (Qt: "not available") and onChanged (Qt: never fires) ──
+  const S = chrome.storage, SRC = Math.random().toString(36).slice(2);
+  let seq = 0;
+  if (S && S.local) {
+    const L = S.local, PFX = "__foxglove_sync__:";
+    const isSync = (k) => k.startsWith(PFX);
+    const empty = (o) => Object.keys(o).length === 0;
+    const dispatch = (area, changes) => {
+      if (empty(changes)) return;
+      emit("storage.onChanged", [changes, area]);
+      emit(`storage.${area}.onChanged`, [changes]);
+    };
+    const announce = (area, changes) => {
+      if (empty(changes)) return;
+      dispatch(area, changes);
+      const m = { __fg: "event", name: "storage.changed", args: [area, changes, SRC], eid: SRC + ++seq };
+      if (channel) channel.postMessage(m);  // open pages, a running worker
+      if (isCS) rtSend(m).catch(nop);  // wakes the worker
+      // Foxglove: content scripts in tabs, and a stopped worker that listens (a page's change wakes it, once: same eid)
+      if (((CFG.cs || isCS) && area !== "session") || (isPage && CFG.worker)) call("storage.changed", { area, changes, src: SRC, eid: m.eid }).catch(nop);
+    };
+    event("storage.changed").addListener((area, changes, src) => { if (src !== SRC) dispatch(area, changes); });
+    const same = (a, b) => JSON.stringify(a) === JSON.stringify(b);
+    const diff = (old, items) => {
+      const out = {};
+      for (const [k, v] of Object.entries(items)) {
+        if (v === undefined) continue;
+        if (!(k in old)) out[k] = { newValue: v }; else if (!same(old[k], v)) out[k] = { oldValue: old[k], newValue: v };
+      }
+      return out;
+    };
+    const gone = (old) => Object.fromEntries(Object.entries(old).map(([k, v]) => [k, { oldValue: v }]));
+    const area = (name, n, wrap, unwrapKeys, mine) => {
+      const get = async (keys) => {
+        if (keys === null || keys === undefined) return unwrapKeys(await n.get(null));
+        if (typeof keys === "string") keys = [keys];
+        if (Array.isArray(keys)) return unwrapKeys(await n.get(keys.map(wrap)));
+        return Object.assign({}, keys, unwrapKeys(await n.get(Object.keys(keys).map(wrap))));
+      };
+      const all = async () => Object.keys(await n.get(null)).filter(mine);
+      return {
+        get: fn(get),
+        set: fn(async (items) => {  // the write goes out at once, beside the read of the old values (a page may close next)
+          items = items || {};
+          const [old] = await Promise.all([get(Object.keys(items)), n.set(Object.fromEntries(Object.entries(items).map(([k, v]) => [wrap(k), v])))]);
+          announce(name, diff(old, items));
+        }),
+        remove: fn(async (keys) => {
+          keys = [].concat(keys);
+          const [old] = await Promise.all([get(keys), n.remove(keys.map(wrap))]);
+          announce(name, gone(old));
+        }),
+        clear: fn(async () => { const old = await get(null); await n.remove(await all()); announce(name, gone(old)); }),
+        getKeys: fn(async () => Object.keys(await get(null))),
+        getBytesInUse: fn(async (keys) => new Blob([JSON.stringify(await get(keys === undefined ? null : keys))]).size),
+        setAccessLevel: fn(nop),
+        onChanged: event(`storage.${name}.onChanged`),
+      };
+    };
+    const native = (o) => ({ get: o.get.bind(o), set: o.set.bind(o), remove: o.remove.bind(o) });
+    const access = S.session && typeof S.session.setAccessLevel === "function" ? S.session.setAccessLevel.bind(S.session) : null;
+    const local = native(L);
+    put(L, { ...area("local", local, (k) => k, (o) => Object.fromEntries(Object.entries(o).filter(([k]) => !isSync(k))), (k) => !isSync(k)),
+      QUOTA_BYTES: 10485760 });
+    put(S, {
+      sync: { ...area("sync", local, (k) => PFX + k, (o) => Object.fromEntries(Object.entries(o).filter(([k]) => isSync(k)).map(([k, v]) => [k.slice(PFX.length), v])), isSync),
+        QUOTA_BYTES: 102400, QUOTA_BYTES_PER_ITEM: 8192, MAX_ITEMS: 512, MAX_WRITE_OPERATIONS_PER_HOUR: 1800, MAX_WRITE_OPERATIONS_PER_MINUTE: 120 },
+      managed: { get: fn(async (keys) => (keys && typeof keys === "object" && !Array.isArray(keys) ? { ...keys } : {})),
+        getKeys: fn(() => []), getBytesInUse: fn(() => 0), onChanged: event("storage.managed.onChanged") },
+      onChanged: event("storage.onChanged"),
+    });
+    if (S.session && !isCS) {  // setAccessLevel stays Qt's: it lets content scripts use storage.session
+      put(S.session, { ...area("session", native(S.session), (k) => k, (o) => o, () => true), QUOTA_BYTES: 10485760,
+        ...(access ? { setAccessLevel: access } : {}) });
+    }
+  }
+
+  // ── messages from a tab (content scripts; extension pages opened in one) carry it: Qt leaves out sender.tab ──
+  if (inTab) {
+    const info = () => ({ tab: tabId(), frame: FRAME, title: typeof document === "object" ? document.title : "" });
+    const sendMessage = function (...args) {
+      const cb = typeof args[args.length - 1] === "function" ? args.pop() : null;
+      if (args.length >= 2 && typeof args[0] === "string" && /^[a-p]{32}$/.test(args[0])) {
+        if (args[0] !== ID) return rtSend(...args, ...(cb ? [cb] : []));  // another extension: untouched
+        args.shift();
+      }
+      const i = info();
+      if (!isCS && typeof i.tab !== "number") return rtSend(...args, ...(cb ? [cb] : []));
+      return rtSend({ __fg: "cs-msg", msg: args[0], ...i }, ...(cb ? [cb] : []));
+    };
+    const connect = rt.connect.bind(rt);
+    put(rt, { sendMessage, connect: function (...args) {
+      if (typeof args[0] === "string" && args[0] !== ID) return connect(...args);
+      const opts = (typeof args[0] === "string" ? args[1] : args[0]) || {}, name = opts.name || "", i = info();
+      if (!isCS && typeof i.tab !== "number") return connect(...args);
+      const port = connect({ ...opts, name: "__fg" + encodeURIComponent(JSON.stringify([i.tab, i.frame, i.title])) + "|" + name });
+      try { Object.defineProperty(port, "name", { value: name, configurable: true }); } catch (err) { /* keep it */ }
+      return port;
+    } });
+  }
+
+  // ── content scripts: tabs.sendMessage() from the extension, web-accessible files ──
+  if (isCS) {
+    if (!chrome.extension) put(chrome, { extension: { inIncognitoContext: false, getURL: (p) => rt.getURL(p) } });
+    if (CFG.war && CFG.war.length) {  // Qt refuses chrome-extension:// files in web pages: Foxglove serves them itself
+      const pats = CFG.war.map((w) => new RegExp("^" + w.replace(/^\//, "").replace(/[.+^${}()|[\]\\?]/g, "\\$&").replace(/\*/g, ".*") + "$"));
+      put(rt, { getURL: (p) => {  // "": the origin of the extension's frames in the page (postMessage's targetOrigin)
+        const path = String(p).replace(/^\//, "");
+        return !path || pats.some((r) => r.test(path.split(/[?#]/)[0])) ? `${CFG.scheme}://${ID}/${path}` : getURL(p);
+      } });
+    }
+    if (CFG.relay && typeof document === "object") {
+      document.addEventListener(CFG.relay, (e) => {
+        let m;
+        try { m = JSON.parse(e.detail); } catch (err) { return; }
+        if (!m) return;
+        if (m.event) { deliver({ __fg: "event", name: m.event, args: m.args }); return; }
+        if ((m.frameId !== undefined && m.frameId !== null && m.frameId !== FRAME) || !csListeners.size) return;
+        e.preventDefault();  // tells Foxglove there is a receiving end
+        let done = false, keep = false;
+        const respond = (value) => { if (!done) { done = true; call("tabs.reply", { callId: m.callId, value }).catch(nop); } };
+        const sender = { id: ID, origin: ORIGIN, url: m.from || ORIGIN + "/" };
+        for (const f of [...csListeners]) {
+          try { if (invoke(f, m.msg, sender, respond) === true) keep = true; } catch (err) { console.error(err); }
+        }
+        if (!keep) respond(undefined);
+      });
+    }
+    return;
+  }
+  if (isBridge) return;
+
+  // ── everything below: the service worker and extension pages ──
+  if (!chrome.extension) {
+    chrome.extension = { inIncognitoContext: false, getURL: (p) => getURL(p), getViews: () => [], getBackgroundPage: () => null,
+      isAllowedIncognitoAccess: fn(() => false), isAllowedFileSchemeAccess: fn(() => false), setUpdateUrlData: nop };
+  }
+  put(rt, {
+    openOptionsPage: fn(() => call("runtime.openOptionsPage")),
+    onInstalled: event("runtime.onInstalled"),  // Qt never fires these (its extensions start disabled)
+    onStartup: event("runtime.onStartup"),
+    OnInstalledReason: { INSTALL: "install", UPDATE: "update", CHROME_UPDATE: "chrome_update", SHARED_MODULE_UPDATE: "shared_module_update" },
+  });
+  if (rt.getContexts) {
+    const getContexts = rt.getContexts.bind(rt);
+    rt.getContexts = fn(async (filter) => {
+      const list = await getContexts(filter || {});
+      const types = filter && filter.contextTypes;
+      const doc = (!types || types.includes("OFFSCREEN_DOCUMENT")) ? await call("offscreen.hasDocument").catch(() => "") : "";
+      if (doc) list.push({ contextType: "OFFSCREEN_DOCUMENT", contextId: "foxglove-offscreen", tabId: -1, windowId: -1, frameId: 0,
+        documentUrl: doc, documentOrigin: ORIGIN, incognito: false });
+      return list;
+    });
+  }
+
+  // ── chrome.action (Qt: missing) - the toolbar button is Foxglove's ──
+  const toPng = async (img) => {
+    if (!img || typeof img !== "object" || typeof OffscreenCanvas !== "function") return undefined;
+    if (typeof ImageData === "function" && img instanceof ImageData) img = { [img.width]: img };
+    const out = {};
+    for (const [size, data] of Object.entries(img)) {
+      const c = new OffscreenCanvas(data.width, data.height);
+      c.getContext("2d").putImageData(data, 0, 0);
+      const bytes = new Uint8Array(await (await c.convertToBlob({ type: "image/png" })).arrayBuffer());
+      let bin = "";
+      for (let i = 0; i < bytes.length; i += 0x8000) bin += String.fromCharCode(...bytes.subarray(i, i + 0x8000));
+      out[size] = "data:image/png;base64," + btoa(bin);
+    }
+    return out;
+  };
+  const paths = (p) => (typeof p === "string" ? { 0: url(p) } : p && typeof p === "object"
+    ? Object.fromEntries(Object.entries(p).map(([k, v]) => [k, url(v)])) : undefined);
+  const color = (c) => (Array.isArray(c) ? `rgba(${c[0]},${c[1]},${c[2]},${(c[3] === undefined ? 255 : c[3]) / 255})` : c);
+  const tabArg = (d) => (d && typeof d.tabId === "number" ? d.tabId : null);
+  const aset = (key, d, value) => ordered("action.set", { key, tabId: tabArg(d), value });
+  const getter = (key) => fn((d) => call("action.get", { key, tabId: tabArg(d) }));
+  const action = put(ns("action"), {
+    setBadgeText: fn((d) => aset("badgeText", d, String((d && d.text) || ""))),
+    getBadgeText: getter("badgeText"),
+    setBadgeBackgroundColor: fn((d) => aset("badgeBackground", d, color(d && d.color))),
+    getBadgeBackgroundColor: getter("badgeBackground"),
+    setBadgeTextColor: fn((d) => aset("badgeTextColor", d, color(d && d.color))),
+    getBadgeTextColor: getter("badgeTextColor"),
+    setTitle: fn((d) => aset("title", d, d && d.title !== undefined && d.title !== null ? String(d.title) : null)),
+    getTitle: getter("title"),
+    setIcon: fn(async (d) => aset("icon", d, (await toPng(d && d.imageData)) || paths(d && d.path))),
+    setPopup: fn((d) => aset("popup", d, d && d.popup ? url(d.popup) : "")),
+    getPopup: getter("popup"),
+    enable: fn((tabId) => ordered("action.set", { key: "enabled", tabId: typeof tabId === "number" ? tabId : null, value: true })),
+    disable: fn((tabId) => ordered("action.set", { key: "enabled", tabId: typeof tabId === "number" ? tabId : null, value: false })),
+    isEnabled: fn((tabId) => call("action.get", { key: "enabled", tabId: typeof tabId === "number" ? tabId : null })),
+    openPopup: fn(() => call("action.openPopup", {})),
+    getUserSettings: fn(() => ({ isOnToolbar: true })),
+    onClicked: event("action.onClicked"),
+    onUserSettingsChanged: event("action.onUserSettingsChanged"),
+  });
+  if (!chrome.browserAction) chrome.browserAction = action;
+
+  // ── chrome.contextMenus: items go into Foxglove's page menu ──
+  if (has("contextMenus") || has("menus")) {
+    let menuSeq = 0;
+    const menus = put(ns("contextMenus"), {
+      create(props, cb) {
+        const { onclick, ...rest } = props || {};
+        const id = rest.id !== undefined ? rest.id : `foxglove-${++menuSeq}`;
+        if (typeof onclick === "function") event("contextMenus.onClicked").addListener((info, tab) => { if (info.menuItemId === id) onclick(info, tab); });
+        ordered("contextMenus.create", { ...rest, id }).then(() => cb && cb(), (err) => (cb ? withError(err.message, cb) : console.warn(err.message)));
+        return id;
+      },
+      update: fn((id, props) => { const { onclick, ...rest } = props || {}; return ordered("contextMenus.update", { id, props: rest }); }),
+      remove: fn((id) => ordered("contextMenus.remove", { id })),
+      removeAll: fn(() => ordered("contextMenus.removeAll", {})),
+      refresh: fn(nop),
+      onClicked: event("contextMenus.onClicked"), onShown: event("contextMenus.onShown"), onHidden: event("contextMenus.onHidden"),
+      ACTION_MENU_TOP_LEVEL_LIMIT: 6,
+      ContextType: { ALL: "all", PAGE: "page", FRAME: "frame", SELECTION: "selection", LINK: "link", EDITABLE: "editable", IMAGE: "image",
+        VIDEO: "video", AUDIO: "audio", LAUNCHER: "launcher", BROWSER_ACTION: "browser_action", PAGE_ACTION: "page_action", ACTION: "action" },
+      ItemType: { NORMAL: "normal", CHECKBOX: "checkbox", RADIO: "radio", SEPARATOR: "separator" },
+    });
+    if (!chrome.menus) chrome.menus = menus;
+  }
+
+  // ── chrome.notifications: shown as Foxglove notices ──
+  if (has("notifications")) {
+    const fix = (o) => ({ ...(o || {}), iconUrl: url(o && o.iconUrl), imageUrl: url(o && o.imageUrl) });
+    put(ns("notifications"), {
+      create: fn(async (id, options) => {
+        if (id && typeof id === "object") { options = id; id = ""; }
+        id = id || (crypto.randomUUID ? crypto.randomUUID() : String(Math.random()).slice(2));
+        await call("notifications.create", { id, options: fix(options) });
+        return id;
+      }),
+      update: fn((id, options) => call("notifications.update", { id, options: fix(options) })),
+      clear: fn((id) => call("notifications.clear", { id })),
+      getAll: fn(() => call("notifications.getAll", {})),
+      getPermissionLevel: fn(() => "granted"),
+      onClicked: event("notifications.onClicked"), onClosed: event("notifications.onClosed"),
+      onButtonClicked: event("notifications.onButtonClicked"), onPermissionLevelChanged: event("notifications.onPermissionLevelChanged"),
+      onShowSettings: event("notifications.onShowSettings"),
+      TemplateType: { BASIC: "basic", IMAGE: "image", LIST: "list", PROGRESS: "progress" },
+      PermissionLevel: { GRANTED: "granted", DENIED: "denied" },
+    });
+  }
+
+  // ── chrome.alarms (Qt: present, but alarms never fire): Foxglove's timers ──
+  if (has("alarms")) {
+    put(ns("alarms"), {
+      create: fn((name, info) => { if (name && typeof name === "object") { info = name; name = ""; } return call("alarms.create", { ...(info || {}), name: name || "" }); }),
+      get: fn((name) => call("alarms.get", { name: name || "" })),
+      getAll: fn(() => call("alarms.getAll", {})),
+      clear: fn((name) => call("alarms.clear", { name: name || "" })),
+      clearAll: fn(() => call("alarms.clearAll", {})),
+      onAlarm: event("alarms.onAlarm"),
+    });
+  }
+
+  // ── chrome.tabs / chrome.windows (Qt: only tabs.update, which navigates the caller itself) ──
+  const port = (name) => {  // tabs.connect(): no connection to content scripts - report it like Chrome does
+    const gone = new Set(), stub = { addListener: nop, removeListener: nop, hasListener: () => false, hasListeners: () => false };
+    const p = { name: name || "", postMessage: nop, disconnect: nop, onMessage: stub,
+      onDisconnect: { ...stub, addListener: (f) => gone.add(f), removeListener: (f) => gone.delete(f), hasListener: (f) => gone.has(f) } };
+    setTimeout(() => { for (const f of gone) withError("Could not establish connection. Receiving end does not exist.", f, p); }, 0);
+    return p;
+  };
+  put(ns("tabs"), {
+    query: fn((q) => call("tabs.query", q || {})),
+    get: fn((tabId) => call("tabs.get", { tabId })),
+    getCurrent: fn(() => { const t = tabId(); return typeof t === "number" ? call("tabs.get", { tabId: t }) : call("tabs.getCurrent", {}); }),
+    create: fn((p) => call("tabs.create", { ...(p || {}), url: url(p && p.url) })),
+    update: fn((tabId, p) => { if (tabId && typeof tabId === "object") { p = tabId; tabId = undefined; } return call("tabs.update", { ...(p || {}), tabId, url: url(p && p.url) }); }),
+    remove: fn((ids) => call("tabs.remove", { tabIds: [].concat(ids) })),
+    reload: fn((tabId, p) => { if (tabId && typeof tabId === "object") { p = tabId; tabId = undefined; } return call("tabs.reload", { tabId, ...(p || {}) }); }),
+    duplicate: fn((tabId) => call("tabs.duplicate", { tabId })),
+    move: fn((ids, p) => call("tabs.move", { tabIds: [].concat(ids), ...(p || {}) })),
+    highlight: fn((p) => call("tabs.highlight", p || {})),
+    discard: fn((tabId) => call("tabs.get", { tabId })),
+    goBack: fn((tabId) => call("tabs.navigate", { tabId, step: -1 })),
+    goForward: fn((tabId) => call("tabs.navigate", { tabId, step: 1 })),
+    captureVisibleTab: fn((windowId, o) => call("tabs.captureVisibleTab", { options: windowId && typeof windowId === "object" ? windowId : o || {} })),
+    detectLanguage: fn(() => "und"),
+    getZoom: fn((tabId) => call("tabs.getZoom", { tabId })),
+    setZoom: fn((tabId, zoomFactor) => { if (zoomFactor === undefined) { zoomFactor = tabId; tabId = undefined; } return call("tabs.setZoom", { tabId, zoomFactor }); }),
+    getZoomSettings: fn(() => ({ mode: "automatic", scope: "per-origin", defaultZoomFactor: 1 })),
+    setZoomSettings: fn(nop),
+    sendMessage: fn((tabId, msg, options) => call("tabs.sendMessage", { tabId, msg, frameId: options && options.frameId })),
+    connect: (tabId, info) => port(info && info.name),
+    group: fn(() => -1), ungroup: fn(nop),
+    onCreated: event("tabs.onCreated"), onUpdated: event("tabs.onUpdated"), onActivated: event("tabs.onActivated"),
+    onRemoved: event("tabs.onRemoved"), onReplaced: event("tabs.onReplaced"), onMoved: event("tabs.onMoved"),
+    onHighlighted: event("tabs.onHighlighted"), onAttached: event("tabs.onAttached"), onDetached: event("tabs.onDetached"),
+    onZoomChange: event("tabs.onZoomChange"), onSelectionChanged: event("tabs.onSelectionChanged"),
+    onActiveChanged: event("tabs.onActiveChanged"),
+    TAB_ID_NONE: -1, TAB_INDEX_NONE: -1, MAX_CAPTURE_VISIBLE_TAB_CALLS_PER_SECOND: 2,
+  });
+  put(ns("windows"), {
+    get: fn((windowId, q) => call("windows.get", { windowId, ...(q || {}) })),
+    getCurrent: fn((q) => call("windows.get", { windowId: -2, ...(q || {}) })),
+    getLastFocused: fn((q) => call("windows.get", { windowId: -2, ...(q || {}) })),
+    getAll: fn((q) => call("windows.getAll", q || {})),
+    create: fn((d) => call("windows.create", { ...(d || {}), url: d && d.url ? [].concat(d.url).map(url) : undefined })),
+    update: fn((windowId, info) => call("windows.update", { windowId, ...(info || {}) })),
+    remove: fn((windowId) => call("windows.remove", { windowId })),
+    onCreated: event("windows.onCreated"), onRemoved: event("windows.onRemoved"), onFocusChanged: event("windows.onFocusChanged"),
+    onBoundsChanged: event("windows.onBoundsChanged"),
+    WINDOW_ID_NONE: -1, WINDOW_ID_CURRENT: -2,
+  });
+
+  // ── chrome.scripting: runs in a Foxglove world of the page (DOM access, no chrome.* there) ──
+  if (has("scripting")) {
+    const css = (inj) => ({ target: inj.target, css: inj.css, files: inj.files });
+    put(ns("scripting"), {
+      executeScript: fn((inj) => call("scripting.executeScript", { target: inj.target, world: inj.world, files: inj.files,
+        func: inj.func ? String(inj.func) : undefined, args: inj.args || [] })),
+      insertCSS: fn((inj) => call("scripting.insertCSS", css(inj || {}))),
+      removeCSS: fn((inj) => call("scripting.removeCSS", css(inj || {}))),
+      registerContentScripts: fn((scripts) => call("scripting.register", { scripts })),
+      updateContentScripts: fn((scripts) => call("scripting.update", { scripts })),
+      getRegisteredContentScripts: fn((filter) => call("scripting.registered", { filter })),
+      unregisterContentScripts: fn((filter) => call("scripting.unregister", { filter })),
+      ExecutionWorld: { ISOLATED: "ISOLATED", MAIN: "MAIN" }, StyleOrigin: { AUTHOR: "AUTHOR", USER: "USER" },
+    });
+  }
+
+  // ── chrome.offscreen (Qt: createDocument crashes the browser): a hidden Foxglove page ──
+  if (has("offscreen")) {
+    put(ns("offscreen"), {
+      createDocument: fn((p) => call("offscreen.createDocument", { url: url(p && p.url) })),
+      closeDocument: fn(() => call("offscreen.closeDocument", {})),
+      hasDocument: fn(async () => Boolean(await call("offscreen.hasDocument", {}))),
+      Reason: new Proxy({}, { get: (t, k) => (typeof k === "string" ? k : undefined) }),
+    });
+  }
+
+  // ── chrome.declarativeNetRequest (Qt: update* hang, updateSessionRules crashes, rules aren't enforced): Foxglove's ──
+  if (chrome.declarativeNetRequest || has("declarativeNetRequest") || has("declarativeNetRequestWithHostAccess")) {
+    put(ns("declarativeNetRequest"), {
+      updateDynamicRules: fn((o) => call("dnr.update", { ...(o || {}), kind: "dynamic" })),
+      updateSessionRules: fn((o) => call("dnr.update", { ...(o || {}), kind: "session" })),
+      getDynamicRules: fn((f) => call("dnr.get", { ...(f || {}), kind: "dynamic" })),
+      getSessionRules: fn((f) => call("dnr.get", { ...(f || {}), kind: "session" })),
+      updateEnabledRulesets: fn((o) => call("dnr.rulesets", o || {})),
+      getEnabledRulesets: fn(() => call("dnr.rulesets", {})),
+      updateStaticRules: fn(nop), getDisabledRuleIds: fn(() => []),
+      setExtensionActionOptions: fn(nop), testMatchOutcome: fn(() => ({ matchedRules: [] })),
+      getMatchedRules: fn(() => ({ rulesMatchedInfo: [] })),
+      onRuleMatchedDebug: event("declarativeNetRequest.onRuleMatchedDebug"),
+    });
+  }
+
+  // ── manifest-based answers: permissions, sidePanel, commands; downloads through Foxglove ──
+  put(ns("permissions"), {
+    getAll: fn(() => call("permissions.getAll", {})),
+    contains: fn((p) => call("permissions.contains", p || {})),
+    request: fn((p) => (typeof navigator === "object" && navigator.userActivation && navigator.userActivation.isActive
+      ? call("permissions.request", p || {}) : Promise.reject(new Error("This function must be called during a user gesture")))),
+    remove: fn((p) => call("permissions.remove", p || {})),
+    addHostAccessRequest: fn(nop), removeHostAccessRequest: fn(nop),
+    onAdded: event("permissions.onAdded"), onRemoved: event("permissions.onRemoved"),
+  });
+  if (has("sidePanel")) {
+    put(ns("sidePanel"), {
+      setOptions: fn(nop), getOptions: fn(() => ({ enabled: true, path: CFG.sidePanel || undefined })),
+      setPanelBehavior: fn(nop), getPanelBehavior: fn(() => ({ openPanelOnActionClick: false })),
+      open: fn(() => call("sidePanel.open", { path: CFG.sidePanel })),
+    });
+  }
+  put(ns("commands"), { getAll: fn(() => CFG.commands || []), onCommand: event("commands.onCommand") });
+  if (has("downloads")) {
+    put(ns("downloads"), {
+      download: fn((o) => call("downloads.download", o || {})),
+      search: fn(() => []), pause: fn(nop), resume: fn(nop), cancel: fn(nop), erase: fn(() => []), removeFile: fn(nop),
+      open: fn(nop), show: fn(nop), showDefaultFolder: fn(nop), getFileIcon: fn(nop), acceptDanger: fn(nop),
+      setShelfEnabled: nop, setUiOptions: fn(nop),
+      onCreated: event("downloads.onCreated"), onChanged: event("downloads.onChanged"), onErased: event("downloads.onErased"),
+      onDeterminingFilename: event("downloads.onDeterminingFilename"),
+    });
+  }
+
+  // ── anything else the manifest asks for: harmless stand-ins, so top-level calls don't throw (some calls are real) ──
+  const NOT_APIS = ["activeTab", "background", "unlimitedStorage", "nativeMessaging", "webRequestBlocking", "clipboardRead",
+    "clipboardWrite", "geolocation", "declarativeNetRequestFeedback", "declarativeNetRequestWithHostAccess", "webRequestAuthProvider"];
+  const emptyish = /^(getAll|query|search|getTree|getRecent|getChildren|getSubTree|getAllFrames|getVisits|getDevices|getAllCookieStores)|^get\w*List$/;
+  const REAL = {
+    webNavigation: { getAllFrames: fn((d) => call("webNavigation.getAllFrames", d || {})), getFrame: fn((d) => call("webNavigation.getFrame", d || {})) },
+    fontSettings: { getFontList: fn(() => call("fontSettings.getFontList", {})) },
+    cookies: { get: fn((d) => call("cookies.get", d || {})), getAll: fn((d) => call("cookies.getAll", d || {})),
+      set: fn((d) => call("cookies.set", d || {})), remove: fn((d) => call("cookies.remove", d || {})),
+      getAllCookieStores: fn(() => call("cookies.getAllCookieStores", {})),
+      OnChangedCause: { EVICTED: "evicted", EXPIRED: "expired", EXPLICIT: "explicit", EXPIRED_OVERWRITE: "expired_overwrite", OVERWRITE: "overwrite" },
+      SameSiteStatus: { NO_RESTRICTION: "no_restriction", LAX: "lax", STRICT: "strict", UNSPECIFIED: "unspecified" } },
+  };
+  for (const perm of [...(CFG.permissions || []), ...(CFG.optional || [])]) {
+    const name = String(perm).split(".")[0];
+    if (chrome[name] !== undefined || !/^[a-z][A-Za-z]+$/.test(name) || NOT_APIS.includes(name)) continue;
+    chrome[name] = new Proxy({ ...(REAL[name] || {}) }, {
+      get(t, k) {
+        if (typeof k !== "string") return undefined;
+        if (!(k in t)) t[k] = /^on[A-Z]/.test(k) ? event(name + "." + k) : /^[A-Z]/.test(k) ? {} : fn(() => (emptyish.test(k) ? [] : undefined));
+        return t[k];
+      },
+    });
+  }
+})();
+"""
+
+
+def ui_locale() -> str:
+    name = QLocale.system().name()
+    return name if re.fullmatch(r"[a-z]{2,3}(_[A-Z]{2})?", name) else "en_US"
+
+
+def _read_json_file(path: Path):
+    raw = path.read_bytes().decode("utf-8-sig")
+    try:
+        return json.loads(raw)
+    except ValueError:
+        return json.loads(_strip_json_comments(raw))
+
+
+def resolve_messages(directory: Path, manifest: dict, locale: str) -> dict[str, str]:
+    """chrome.i18n's messages as Chrome picks them (default locale < language < full locale), placeholders filled in."""
+    default = manifest.get("default_locale")
+    merged: dict[str, str] = {}
+    if not isinstance(default, str) or not default:
+        return merged
+    for loc in dict.fromkeys([default, locale.split("_")[0], locale]):
+        try:
+            data = _read_json_file(directory / "_locales" / loc / "messages.json")
+        except (OSError, ValueError):
+            continue
+        for name, entry in data.items() if isinstance(data, dict) else ():
+            if not isinstance(entry, dict) or not isinstance(entry.get("message"), str):
+                continue
+            holders = {str(k).lower(): str(v.get("content", "")) for k, v in (entry.get("placeholders") or {}).items()
+                       if isinstance(v, dict)} if isinstance(entry.get("placeholders"), dict) else {}
+            merged[name.lower()] = re.sub(r"\$([A-Za-z0-9_@]+)\$", lambda m: holders.get(m.group(1).lower(), m.group(0)), entry["message"])
+    return merged
+
+
+def message_text(value, messages: dict[str, str]) -> str:
+    """A manifest string with its "__MSG_name__" filled in from resolve_messages()."""
+    value = value if isinstance(value, str) else ""
+    m = re.fullmatch(r"__MSG_(\w+)__", value)
+    return messages.get(m.group(1).lower(), value) if m else value
+
+
+def allow_scheme_in_csp(csp: str, scheme: str) -> str:
+    """An extension CSP with connect-src (or default-src) would block fetch() to Foxglove's scheme."""
+    parts = [p.strip() for p in csp.split(";") if p.strip()]
+    names = [p.split()[0].lower() for p in parts]
+    source = scheme + ":"
+    for directive in ("connect-src", "default-src"):
+        if directive in names:
+            values = [v for v in parts[names.index(directive)].split()[1:] if v != "'none'"]
+            if source in values:
+                return csp
+            if directive == "connect-src":
+                parts[names.index(directive)] = " ".join(["connect-src", *values, source])
+            else:
+                parts.append(" ".join(["connect-src", *values, source]))
+            break
+    return "; ".join(parts)
+
+
+def command_shortcut(command: dict) -> str:
+    """A manifest command's suggested key for this platform, in Qt's spelling ("" if none)."""
+    keys = command.get("suggested_key") if isinstance(command, dict) else None
+    if isinstance(keys, str):
+        keys = {"default": keys}
+    if not isinstance(keys, dict):
+        return ""
+    platform = "mac" if IS_MAC else "windows" if sys.platform == "win32" else "linux"
+    key = keys.get(platform) or keys.get("default")
+    if not isinstance(key, str):
+        return ""
+    names = {"Command": "Ctrl", "MacCtrl": "Meta", "Comma": ",", "Period": ".", "PageUp": "PgUp", "PageDown": "PgDown",
+             "Insert": "Ins", "Delete": "Del"}
+    return "+".join(names.get(part.strip(), part.strip()) for part in key.split("+"))
+
+
+def shim_stamp(secret: str, locale: str) -> str:
+    """Identifies the polyfill an extension got: a newer Foxglove (or another UI language) re-wires it at start-up."""
+    return f"v{SHIM_VERSION}-{hashlib.sha256((secret + locale + EXTENSION_SHIM_JS).encode()).hexdigest()[:10]}"
+
+
+def installed_shim_config(directory: Path) -> dict:
+    """The configuration written into an installed extension's shim ({} if it has none)."""
+    try:
+        text = (directory / SHIM_FILE).read_text(encoding="utf-8")
+        start = text.index(SHIM_CFG_MARK) + len(SHIM_CFG_MARK)
+        data = json.loads(text[start:text.index("/*END*/", start)])
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _text(path: Path) -> str:
+    return path.read_bytes().decode("utf-8", "surrogateescape")
+
+
+def _write_text(path: Path, text: str) -> None:
+    path.write_bytes(text.encode("utf-8", "surrogateescape"))
+
+
+def valid_match_pattern(pattern) -> bool:
+    """A match pattern Chrome (and Qt's manifest parser) accepts - a bad one would stop the extension from loading."""
+    return isinstance(pattern, str) and (pattern == "<all_urls>" or re.fullmatch(
+        r"(?:(?:\*|https?|wss?|ftp|urn)://(?:\*|(?:\*\.)?[^/*:\s]+)(?::(?:\*|\d{1,5}))?|file://[^/*:\s]*)/\S*", pattern) is not None)
+
+
+def wire_content_scripts(entries) -> list[dict]:
+    """Manifest content_scripts with the polyfill in front of the extension's own scripts (not in the page's world)."""
+    out = []
+    for entry in entries if isinstance(entries, list) else []:
+        if isinstance(entry, dict):
+            entry = dict(entry)
+            js = [j for j in entry.get("js") or [] if isinstance(j, str)] if isinstance(entry.get("js"), list) else []
+            if js and entry.get("world") != "MAIN":
+                entry["js"] = [SHIM_FILE, *[j for j in js if j.lstrip("/") != SHIM_FILE]]
+            out.append(entry)
+    return out
+
+
+def registered_as_manifest(scripts) -> list[dict]:
+    """chrome.scripting.registerContentScripts() entries in manifest form: Qt applies them when it loads the extension."""
+    keys = {"matches": "matches", "excludeMatches": "exclude_matches", "js": "js", "css": "css", "allFrames": "all_frames",
+            "runAt": "run_at", "matchOriginAsFallback": "match_origin_as_fallback", "world": "world"}
+    return [{keys[k]: v for k, v in s.items() if k in keys and v not in (None, [], False, "ISOLATED")}
+            for s in scripts if isinstance(s, dict)] if isinstance(scripts, list) else []
+
+
+def inject_shim(directory: Path, manifest: dict, secret: str, locale: str, registered: list | None = None) -> dict:
+    """Wire the polyfill into an extension folder: shim file, worker wrapper, <script> in every page, first content
+    script, CSP. Rewrites manifest.json (the untouched one is kept beside it) and returns the new manifest.
+    *registered*: the extension's chrome.scripting content scripts, as manifest entries."""
+    sidecar = directory / SHIM_ORIGINAL
+    try:  # wired once already (an installed copy getting a newer shim): start from the original...
+        kept = _read_json_file(sidecar) if sidecar.is_file() else None
+    except (OSError, ValueError):
+        kept = None
+    if isinstance(kept, dict):  # ... but the ID stays the one checked on *manifest* (a package may bring its own sidecar)
+        kept.pop("key", None)
+        if "key" in manifest:
+            kept["key"] = manifest["key"]
+        manifest = kept
+    original, manifest = json.loads(json.dumps(manifest)), json.loads(json.dumps(manifest))
+    strings = lambda value: [v for v in value if isinstance(v, str)] if isinstance(value, list) else []
+    messages = resolve_messages(directory, manifest, locale)
+    cfg: dict = {
+        "bridge": EXT_BRIDGE_URL, "scheme": EXT_SCHEME, "uiLocale": locale, "messages": messages,
+        "permissions": strings(manifest.get("permissions")),
+        "optional": strings(manifest.get("optional_permissions")) + strings(manifest.get("optional_host_permissions")),
+        "commands": [{"name": k, "description": message_text(v.get("description"), messages), "shortcut": command_shortcut(v)}
+                     for k, v in (manifest.get("commands") or {}).items() if isinstance(v, dict)]
+                    if isinstance(manifest.get("commands"), dict) else [],
+        "sidePanel": (manifest.get("side_panel") or {}).get("default_path") if isinstance(manifest.get("side_panel"), dict) else None,
+        "relay": "__fg" + secrets.token_hex(10), "token": secrets.token_hex(16),  # all three known to this extension alone
+        "tabQuery": "__fg" + secrets.token_hex(10), "tabAnswer": "__fg" + secrets.token_hex(10),
+        "war": [r for w in manifest.get("web_accessible_resources") or [] if isinstance(w, dict) for r in strings(w.get("resources"))]
+               if isinstance(manifest.get("web_accessible_resources"), list) else [],
+        "worker": False, "cs": False,
+        "manifest": {k: original[k] for k in ("background", "content_scripts") if k in original},
+    }
+    background = manifest.get("background") if isinstance(manifest.get("background"), dict) else None
+    worker = background.get("service_worker") if background else None
+    if isinstance(worker, str) and worker.strip("/"):
+        rel, root = Path(worker.lstrip("/")), directory.resolve()
+        wrapper = (root / rel.parent / SHIM_WORKER).resolve()
+        if root != wrapper.parent and root not in wrapper.parent.parents:  # "../" or a drive: never write outside it
+            raise InstallError(f"The extension's service worker ({worker}) is outside the extension.")
+        wrapper.parent.mkdir(parents=True, exist_ok=True)
+        _write_text(wrapper, f'import "/{SHIM_FILE}";\nimport {json.dumps("./" + rel.name)};\n' if background.get("type") == "module"
+                    else f'importScripts("/{SHIM_FILE}", {json.dumps(rel.name)});\n')
+        background["service_worker"] = (rel.parent / SHIM_WORKER).as_posix()
+        cfg["worker"] = True
+    scripts = wire_content_scripts(manifest.get("content_scripts")) + wire_content_scripts(registered)
+    if scripts:
+        manifest["content_scripts"] = scripts
+    cfg["cs"] = any(SHIM_FILE in (e.get("js") or []) for e in scripts) or "scripting" in cfg["permissions"]
+    csp = manifest.get("content_security_policy")
+    if isinstance(csp, dict) and isinstance(csp.get("extension_pages"), str):
+        csp["extension_pages"] = allow_scheme_in_csp(csp["extension_pages"], EXT_SCHEME)
+    for page in sorted([*directory.rglob("*.html"), *directory.rglob("*.htm")]):
+        if page.name == SHIM_BRIDGE or not page.is_file():
+            continue
+        text = _text(page)
+        if SHIM_TAG in text:
+            continue
+        m = re.search(r"<head\b[^>]*>", text, re.I) or re.search(r"<html\b[^>]*>", text, re.I) or re.search(r"<!doctype[^>]*>", text, re.I)
+        _write_text(page, text[:m.end()] + SHIM_TAG + text[m.end():] if m else SHIM_TAG + text)
+    body = json.dumps(cfg, ensure_ascii=False).replace("/", "\\/")  # "\/" keeps "*/" out of the comment markers
+    shim = EXTENSION_SHIM_JS.replace("%(stamp)s", shim_stamp(secret, locale), 1).replace(SHIM_CFG_MARK + "{}", SHIM_CFG_MARK + body, 1)
+    (directory / SHIM_FILE).write_text(shim, encoding="utf-8")
+    (directory / SHIM_BRIDGE).write_text(f'<!doctype html><meta charset="utf-8"><title>{APP_NAME}</title>'
+                                         f'<script src="{SHIM_FILE}"></script>\n', encoding="utf-8")
+    sidecar.write_text(json.dumps(original, ensure_ascii=False, indent=2), encoding="utf-8")
+    (directory / "manifest.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+    return manifest
+
+
+def substitute_css(directory: Path, ext_id: str, locale: str) -> None:
+    """Qt doesn't fill in __MSG_...__ in extension CSS; content-script CSS also needs web-accessible files from Foxglove."""
+    try:
+        manifest = _read_json_file(directory / SHIM_ORIGINAL)
+    except (OSError, ValueError):
+        return
+    messages = {**resolve_messages(directory, manifest, locale), "@@extension_id": ext_id, "@@ui_locale": locale,
+                "@@bidi_dir": "ltr", "@@bidi_reversed_dir": "rtl", "@@bidi_start_edge": "left", "@@bidi_end_edge": "right"}
+    in_pages = {c.lstrip("/") for e in manifest.get("content_scripts") or [] if isinstance(e, dict)
+                for c in e.get("css") or [] if isinstance(c, str)} if isinstance(manifest.get("content_scripts"), list) else set()
+    root = directory.resolve()
+    for sheet in root.rglob("*.css"):
+        try:
+            text = _text(sheet)
+        except OSError:
+            continue
+        new = re.sub(r"__MSG_(@?@?\w+)__", lambda m: messages.get(m.group(1).lower(), m.group(0)), text)
+        if sheet.relative_to(root).as_posix() in in_pages:
+            new = new.replace(f"chrome-extension://{ext_id}/", f"{EXT_SCHEME}://{ext_id}/")
+        if new != text:
+            _write_text(sheet, new)
 
 
 # ══════════════════════════════════════════════════════════════════════════════════════════
@@ -1377,6 +2392,7 @@ class ExtensionEntry:
     popup_url: QUrl
     options_url: QUrl
     icon: QIcon
+    newtab_url: QUrl = dc_field(default_factory=QUrl)
 
 
 class _Relay(QObject):
@@ -1384,34 +2400,69 @@ class _Relay(QObject):
     done = pyqtSignal(object)
 
 
+def _move(source: Path, target: Path) -> None:
+    try:
+        source.rename(target)
+    except OSError as exc:
+        if exc.errno != errno.EXDEV:  # different file systems: copy instead
+            raise
+        shutil.move(str(source), str(target))
+
+
 class ExtensionsController(QObject):
     """Installs and manages Chrome (Manifest V3) extensions through Qt WebEngine's extension system.
 
     Qt keeps installed extensions in the profile and reloads them at start-up - always *disabled*,
-    so we remember which ones the user enabled and switch them back on.
+    so we remember which ones the user enabled and switch them back on. Every extension gets Foxglove's
+    chrome.* polyfill wired in (inject_shim) before its code first runs; ExtensionBridge answers its calls.
     """
 
     changed = pyqtSignal()
-    message = pyqtSignal(str, str)  # text, kind ("info", "success" or "error")
+    message = pyqtSignal(str, str)       # text, kind ("info", "success" or "error")
+    reloaded = pyqtSignal(str)           # an extension was switched on: pages opened while it was off lack chrome.*
+    replace_requested = pyqtSignal(dict)  # a package claims an installed extension's ID: ask before replacing it
 
     def __init__(self, profile: QWebEngineProfile, registry_path: Path, staging_dir: Path, user_agent: str):
         super().__init__()
+        self.profile = profile
         self.manager = profile.extensionManager() if HAS_EXTENSIONS else None
         self.registry_path = registry_path
         raw = read_json(registry_path, {})
         self.registry: dict[str, dict] = raw if isinstance(raw, dict) else {}
         self.staging = staging_dir
+        self.secret = self._load_secret(registry_path.with_name("extension-bridge.key"))
+        self.locale = ui_locale()
+        self.stamp = shim_stamp(self.secret, self.locale)
         restored = self._recover_interrupted_updates()
-        shutil.rmtree(self.staging, ignore_errors=True)
+        self._clean_staging()
         self.user_agent = user_agent
         self._jobs: dict[str, dict] = {}       # staging folder name -> new install in progress
-        self._updates: dict[str, dict] = {}    # extension id -> update in progress
+        self._updates: dict[str, dict] = {}    # extension id -> update (or shim upgrade) in progress
         self._loading: dict[str, dict] = {}    # extension folder -> update waiting for Qt to load it
         self._installing: set[str] = set()     # ids being installed right now (ignore duplicate requests)
+        self._reshim_failed: set[str] = set()  # couldn't get the polyfill: runs as it is
         self._manifests: dict[str, tuple[float, dict]] = {}
+        self._configs: dict[str, tuple[float, dict]] = {}
         self._relays: set[_Relay] = set()
+        self._rejected: set[str] = set()       # installed copies taken out again (their ID wasn't the checked one)
+        self._reloads: dict[str, bytes] = {}   # registered content scripts changed: reload (previous manifest.json)
+        self._reload_timer = QTimer(self)
+        self._reload_timer.setSingleShot(True)
+        self._reload_timer.setInterval(1000)
+        self._reload_timer.timeout.connect(self._reload_for_scripts)
+        self.chromium = qWebEngineChromiumVersion() if HAS_EXTENSIONS else ""
+        self._window = None
         self._nam = QNetworkAccessManager(self)
+        self.bridge = ExtensionBridge(self)
+        self.net = NetRules(self)
+        self.changed.connect(self.net.invalidate)
         if self.manager is not None:
+            self._net_filter = NetFilter(self.net, None, profile)  # the profile's: lives as long as it does
+            profile.setUrlRequestInterceptor(self._net_filter)
+            if not QWebEngineUrlScheme.schemeByName(EXT_SCHEME.encode()).name().isEmpty():
+                profile.installUrlSchemeHandler(EXT_SCHEME.encode(), self.bridge)
+            else:
+                log(f"{EXT_SCHEME}:// isn't registered - extensions run without Foxglove's API polyfill.")
             self.manager.loadFinished.connect(self._on_load_finished)
             self.manager.installFinished.connect(self._on_install_finished)
             self.manager.uninstallFinished.connect(self._on_uninstall_finished)
@@ -1425,17 +2476,92 @@ class ExtensionsController(QObject):
     def available(self) -> bool:
         return self.manager is not None
 
+    @property
+    def window(self):
+        win = self._window() if self._window is not None else None
+        return win if win is not None and not sip.isdeleted(win) else None
+
+    def attach_window(self, win) -> None:
+        self._window = weakref.ref(win)
+
+    TAB_SCRIPT = "foxglove-tab-id"
+
+    def tab_script(self, tab_id: int) -> QWebEngineScript | None:
+        """Tells the polyfill (content scripts, extension pages) which tab it is in. DOM events reach every world of a
+        page, so each extension asks and is answered under event names only it and Foxglove know."""
+        if self.manager is None:
+            return None
+        pairs = {}
+        for info in self._infos():
+            cfg = self.shim_config(info.id())
+            q, a = cfg.get("tabQuery"), cfg.get("tabAnswer")
+            if isinstance(q, str) and isinstance(a, str) and re.fullmatch(r"__fg[0-9a-f]{20}", q) and re.fullmatch(r"__fg[0-9a-f]{20}", a):
+                pairs[q] = a
+        script = QWebEngineScript()
+        script.setName(self.TAB_SCRIPT)
+        script.setWorldId(APP_WORLD)
+        script.setInjectionPoint(QWebEngineScript.InjectionPoint.DocumentCreation)
+        script.setRunsOnSubFrames(True)
+        script.setSourceCode(f"for (const [q, a] of Object.entries({json.dumps(pairs)})) document.addEventListener(q, () => "
+                             f"document.dispatchEvent(new CustomEvent(a, {{detail: '{int(tab_id)}'}})));")
+        return script
+
+    def wire_tab(self, page: QWebEnginePage, tab_id: int) -> None:
+        """Put (or refresh) the tab-id script in a tab's page; it applies from the next page load on. The page also
+        gets a request filter that knows its tab (declarativeNetRequest rules for some tabs only)."""
+        if self.manager is not None and not isinstance(getattr(page, "net_filter", None), NetFilter):
+            page.net_filter = NetFilter(self.net, tab_id, page)
+            page.setUrlRequestInterceptor(page.net_filter)
+        script, scripts = self.tab_script(tab_id), page.scripts()
+        old = scripts.find(self.TAB_SCRIPT)
+        if script is not None and len(old) == 1 and old[0].sourceCode() == script.sourceCode():
+            return
+        for item in old:
+            scripts.remove(item)
+        if script is not None:
+            scripts.insert(script)
+
+    def file_access(self, ext_id: str) -> bool:
+        """Chrome's "Allow access to file URLs" (off unless the user turns it on)."""
+        return bool((self.registry.get(ext_id) or {}).get("file_access"))
+
+    def set_file_access(self, ext_id: str, allowed: bool) -> None:
+        self.registry.setdefault(ext_id, {})["file_access"] = bool(allowed)
+        self.save()
+        self.changed.emit()
+
+    def wants_file_access(self, ext_id: str) -> bool:
+        """Whether the extension's host permissions or content scripts would reach file: pages."""
+        return any(match_pattern(h, "file:///index.html") for h in self.bridge._hosts(ext_id))
+
     def save(self) -> None:
         write_json(self.registry_path, self.registry)
 
+    @staticmethod
+    def _load_secret(path: Path) -> str:
+        try:
+            value = path.read_text(encoding="ascii").strip()
+            if re.fullmatch(r"[0-9a-f]{32}", value):
+                return value
+        except (OSError, UnicodeError):
+            pass
+        value = secrets.token_hex(16)
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(value, encoding="ascii")
+            os.chmod(path, 0o600)
+        except OSError as exc:
+            log(f"Couldn't save {path.name}: {exc}")
+        return value
+
     # Queries
     def _infos(self) -> list:
-        if self.manager is None:
+        if self.manager is None or sip.isdeleted(self.manager):  # (a late timer after the profile went away)
             return []
         return [i for i in self.manager.extensions() if i.isInstalled() and i.id() not in COMPONENT_EXTENSIONS]
 
     def _info(self, ext_id: str):
-        return next((i for i in self._infos() if i.id() == ext_id), None)
+        return next((i for i in self._infos() if i.id() == ext_id), None) if ext_id else None
 
     def _manifest(self, path: str) -> dict:
         try:
@@ -1451,6 +2577,29 @@ class ExtensionsController(QObject):
             manifest = {}
         self._manifests[path] = (mtime, manifest)
         return manifest
+
+    def shim_config(self, ext_id: str) -> dict:
+        """The polyfill configuration of an installed extension ({} if it runs without one)."""
+        info = self._info(ext_id)
+        if info is None:
+            return {}
+        path = info.path()
+        try:
+            mtime = (Path(path) / SHIM_FILE).stat().st_mtime
+        except OSError:
+            return {}
+        cached = self._configs.get(path)
+        if cached is None or cached[0] != mtime:
+            cached = self._configs[path] = (mtime, installed_shim_config(Path(path)))
+        return cached[1]
+
+    def _needs_shim(self, info) -> bool:
+        try:
+            with open(Path(info.path()) / SHIM_FILE, "rb") as fh:
+                head = fh.read(80).decode("utf-8", "replace")
+        except OSError:
+            return True
+        return not head.startswith(f"/* foxglove-shim {self.stamp}\n")
 
     @staticmethod
     def _icon_for(manifest: dict, root: Path) -> QIcon:
@@ -1477,17 +2626,31 @@ class ExtensionsController(QObject):
             options = (manifest.get("options_ui") or {}).get("page") if isinstance(manifest.get("options_ui"), dict) else None
             options = options or manifest.get("options_page")
             options_url = QUrl(f"chrome-extension://{info.id()}/{options.lstrip('/')}") if isinstance(options, str) and options else QUrl()
+            newtab = (manifest.get("chrome_url_overrides") or {}).get("newtab") if isinstance(manifest.get("chrome_url_overrides"), dict) else None
             state = self.registry.get(info.id(), {})
             out.append(ExtensionEntry(
                 id=info.id(), name=info.name() or "Extension", description=info.description(),
                 version=str(manifest.get("version", "")), path=info.path(), enabled=info.isEnabled(),
                 pinned=bool(state.get("pinned", True)), popup_url=info.actionPopupUrl(),
-                options_url=options_url, icon=self._icon_for(manifest, Path(info.path()))))
+                options_url=options_url, icon=self._icon_for(manifest, Path(info.path())),
+                newtab_url=QUrl(f"chrome-extension://{info.id()}/{newtab.lstrip('/')}") if isinstance(newtab, str) and newtab.strip("/") else QUrl()))
         out.sort(key=lambda e: e.name.lower())
+        NEWTAB_OVERRIDES.update(e.newtab_url.toString() for e in out if not e.newtab_url.isEmpty())
         return out
 
     def entry(self, ext_id: str) -> ExtensionEntry | None:
         return next((e for e in self.entries() if e.id == ext_id), None)
+
+    def commands(self, ext_id: str) -> dict[str, dict]:
+        info = self._info(ext_id)
+        commands = self._manifest(info.path()).get("commands") if info is not None else None
+        return {k: v for k, v in commands.items() if isinstance(v, dict)} if isinstance(commands, dict) else {}
+
+    def newtab_override(self) -> QUrl | None:
+        """An enabled extension's New Tab page (chrome_url_overrides) - the most recently installed one wins."""
+        pages = [e for e in self.entries() if e.enabled and not e.newtab_url.isEmpty()]
+        pages.sort(key=lambda e: self.registry.get(e.id, {}).get("installed", 0))
+        return pages[-1].newtab_url if pages else None
 
     # Enable / disable / pin / remove
     def _on_load_finished(self, info) -> None:
@@ -1509,11 +2672,24 @@ class ExtensionsController(QObject):
 
     def _apply_enabled(self, ext_id: str) -> None:
         info = self._info(ext_id)
-        if info is None:
+        if info is None or ext_id in self._updates:
             return
         want = bool(self.registry.get(ext_id, {}).get("enabled", True))
+        if info.isLoaded() and want and ext_id not in self._reshim_failed and self._needs_shim(info):
+            # Wired by an older Foxglove (or for another UI language): give it the current polyfill. Qt only drops a
+            # worker's cached scripts when it unloads an extension that was on - so switch it on first. One the user
+            # turned off waits until they turn it on again.
+            if not info.isEnabled():
+                self.manager.setExtensionEnabled(info, True)
+            self._reshim(info)
+            return
         if info.isEnabled() != want:
             self.manager.setExtensionEnabled(info, want)
+            if want:
+                self.bridge.extension_enabled(ext_id)
+                self.reloaded.emit(ext_id)
+            else:
+                self.bridge.extension_disabled(ext_id)
         self.changed.emit()
 
     def set_enabled(self, ext_id: str, enabled: bool) -> None:
@@ -1527,18 +2703,28 @@ class ExtensionsController(QObject):
         self.changed.emit()
 
     def uninstall(self, ext_id: str) -> None:
-        info = self._info(ext_id)
-        if info is None or ext_id in self._updates:
+        job = self._updates.get(ext_id)
+        if job is not None:  # never drop a removal silently: do it once the update is through
+            job["remove_after"] = True
+            self.message.emit(f"“{job.get('name') or 'The extension'}” will be removed once its update finishes.", "info")
             return
+        info = self._info(ext_id)
+        if info is None:
+            return
+        self.bridge.extension_disabled(ext_id)
         if info.isEnabled():
             self.manager.setExtensionEnabled(info, False)
         self.manager.uninstallExtension(info)
 
     def _on_uninstall_finished(self, info) -> None:
+        if info.path() in self._rejected:
+            self._rejected.discard(info.path())
+            return
         if info.error():
             self.message.emit(f"Couldn't remove the extension: {info.error()}", "error")
         else:
             self.registry.pop(info.id(), None)
+            self.bridge.extension_removed(info.id())
             self.save()
             self.message.emit(f"“{info.name() or 'The extension'}” was removed.", "success")
         self.changed.emit()
@@ -1554,9 +2740,7 @@ class ExtensionsController(QObject):
         if not self.available:
             self.message.emit("Extensions need Qt WebEngine 6.10 or newer: python3 -m pip install --upgrade PyQt6 PyQt6-WebEngine", "error")
             return
-        url = QUrl("https://clients2.google.com/service/update2/crx?response=redirect"
-                   f"&prodversion={qWebEngineChromiumVersion()}&acceptformat=crx2,crx3&x=id%3D{ext_id}%26uc")
-        request = QNetworkRequest(url)
+        request = QNetworkRequest(QUrl(WEBSTORE_CRX_URL.format(version=qWebEngineChromiumVersion(), id=ext_id)))
         request.setAttribute(QNetworkRequest.Attribute.RedirectPolicyAttribute,
                              QNetworkRequest.RedirectPolicy.NoLessSafeRedirectPolicy)
         request.setHeader(QNetworkRequest.KnownHeaders.UserAgentHeader, self.user_agent)
@@ -1578,17 +2762,13 @@ class ExtensionsController(QObject):
             return
         self._stage_in_background(lambda: self._stage(data=data, expected_id=ext_id), source="webstore")
 
-    def _stage_in_background(self, work, source: str) -> None:
+    def _in_background(self, work, done) -> None:
         relay = _Relay()
         self._relays.add(relay)
 
         def finished(result) -> None:
             self._relays.discard(relay)
-            if isinstance(result, Exception):
-                self.message.emit(str(result) or "The extension couldn't be installed.", "error")
-                return
-            result["source"] = source
-            self._on_staged(result)
+            done(result)
 
         relay.done.connect(finished)
 
@@ -1602,6 +2782,16 @@ class ExtensionsController(QObject):
             relay.done.emit(result)
 
         threading.Thread(target=run, daemon=True).start()
+
+    def _stage_in_background(self, work, source: str) -> None:
+        def done(result) -> None:
+            if isinstance(result, Exception):
+                self.message.emit(str(result) or "The extension couldn't be installed.", "error")
+                return
+            result["source"] = source
+            self._on_staged(result)
+
+        self._in_background(work, done)
 
     def _stage(self, path: Path | None = None, data: bytes | None = None, expected_id: str | None = None) -> dict:
         """Prepare a clean copy of the extension for Qt's installer (runs on a worker thread)."""
@@ -1627,14 +2817,16 @@ class ExtensionsController(QObject):
                     raise InstallError("The extension package is damaged or isn't a Chrome extension.") from exc
                 if not (target / "manifest.json").is_file():
                     inner = [p for p in target.iterdir() if p.is_dir() and (p / "manifest.json").is_file()]
-                    if len(inner) != 1:
+                    if len(inner) > 1:
+                        raise InstallError(f"The package contains several extensions ({', '.join(sorted(p.name for p in inner))}); "
+                                           "unpack it and install one folder at a time.")
+                    if not inner:
                         raise InstallError("The package doesn't contain a manifest.json file.")
-                    nested = inner[0]
                     holding = target.with_name(target.name + "-inner")
-                    nested.rename(holding)
+                    inner[0].rename(holding)
                     shutil.rmtree(target)
                     holding.rename(target)
-            shutil.rmtree(target / "_metadata", ignore_errors=True)  # Chrome Web Store signatures (unpacked loads refuse "_" names)
+            shutil.rmtree(target / "_metadata", ignore_errors=True)  # Chrome Web Store signatures: not needed unpacked
             try:
                 manifest = load_manifest(target)
             except (OSError, ValueError) as exc:
@@ -1645,23 +2837,43 @@ class ExtensionsController(QObject):
                 raise InstallError(
                     f"“{name}” uses Manifest V{version}. {APP_NAME}'s engine (Qt WebEngine) only runs Manifest V3 "
                     "extensions - the kind the Chrome Web Store ships today.")
-            ext_id = extension_id_from_key(key) if key else None
-            if key and "key" not in manifest:
-                # Keeping the developer key keeps the official extension ID (some extensions rely on it).
+            source_path = str(path.resolve()) if path is not None else None
+            derived = None
+            if key:  # packed: the signed CRX key decides the ID, as in Chrome
+                ext_id, id_source = extension_id_from_key(key), "crx"
                 manifest["key"] = base64.b64encode(key).decode("ascii")
-                (target / "manifest.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
             elif isinstance(manifest.get("key"), str):
                 try:
-                    ext_id = extension_id_from_key(base64.b64decode(manifest["key"]))
+                    ext_id, id_source = extension_id_from_key(base64.b64decode(manifest["key"])), "manifest"
                 except ValueError:
-                    ext_id = None
-            if expected_id and ext_id and ext_id != expected_id:
+                    ext_id, id_source = None, None
+            else:  # unpacked: a key made from where it came from keeps the ID (and its data) stable, as in Chrome
+                derived = base64.b64encode(hashlib.sha256(f"{APP_NAME}:{source_path or uuid.uuid4()}".encode()).digest()).decode("ascii")
+                ext_id, id_source = None, None
+            if expected_id and ext_id != expected_id:
                 raise InstallError("The downloaded file doesn't match the requested extension.")
-            source_path = str(path.resolve()) if path is not None else None
-            return {"dir": str(target), "name": name, "id": ext_id, "source_path": source_path}
+            inject_shim(target, manifest, self.secret, self.locale)
+            return {"dir": str(target), "name": name, "id": ext_id, "id_source": id_source, "derived_key": derived,
+                    "source_path": source_path, "version": str(manifest.get("version", "")), "unpacked": key is None and data is None,
+                    "needs_chrome": self._needs_newer_engine(manifest.get("minimum_chrome_version"))}
         except BaseException:
             shutil.rmtree(target, ignore_errors=True)
             raise
+
+    def _needs_newer_engine(self, wanted) -> str:
+        """The Chrome version the manifest asks for, if the engine is older ("" otherwise)."""
+        version = lambda text: tuple(int(n) for n in re.findall(r"\d+", str(text))[:4])
+        return str(wanted) if isinstance(wanted, str) and version(wanted) and self.chromium and version(wanted) > version(self.chromium) else ""
+
+    @staticmethod
+    def _set_key(directory: Path, key: str) -> None:
+        for name in ("manifest.json", SHIM_ORIGINAL):
+            try:
+                manifest = _read_json_file(directory / name)
+                manifest["key"] = key
+                (directory / name).write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+            except (OSError, ValueError, TypeError):
+                pass
 
     def _on_staged(self, job: dict) -> None:
         ext_id = job.get("id")
@@ -1671,43 +2883,183 @@ class ExtensionsController(QObject):
             shutil.rmtree(job["dir"], ignore_errors=True)
             self.message.emit(f"“{job.get('name')}” is already being installed.", "info")
             return
-        if not ext_id and source_path:  # re-installing an unpacked folder (or plain .zip) updates the earlier copy
-            ext_id = next((eid for eid, state in self.registry.items()
-                           if state.get("source_path") == source_path and self._info(eid) is not None), None)
-        existing = self._info(ext_id) if ext_id else None
-        if existing is not None:
+        if not ext_id and job.get("derived_key"):
+            derived = extension_id_from_key(base64.b64decode(job["derived_key"]))
+            legacy = next((eid for eid, state in self.registry.items() if isinstance(state, dict)
+                           and state.get("source_path") == source_path and self._info(eid) is not None), None) if source_path else None
+            if self._info(derived) is None and legacy is not None:
+                ext_id = legacy  # installed before IDs were derived: its ID is its folder's, so it must stay keyless
+            else:
+                ext_id = derived
+                self._set_key(Path(job["dir"]), job["derived_key"])
+            if ext_id in self._installing or ext_id in self._updates:
+                shutil.rmtree(job["dir"], ignore_errors=True)
+                self.message.emit(f"“{job.get('name')}” is already being installed.", "info")
+                return
+        job["id"] = ext_id
+        if ext_id:
+            substitute_css(Path(job["dir"]), ext_id, self.locale)
+        existing = self._info(ext_id)
+        if existing is None:
+            self._install_staged(job)
+        elif self._replacing_needs_consent(ext_id, job):
+            if self.receivers(self.replace_requested) == 0:
+                shutil.rmtree(job["dir"], ignore_errors=True)
+                self.message.emit(f"“{existing.name() or job.get('name')}” is already installed from somewhere else. "
+                                  "Remove it first to install this copy.", "error")
+                return
+            self._installing.add(ext_id)
+            job["existing_name"] = existing.name() or "the extension"
+            self.replace_requested.emit(job)
+        else:
+            self._start_update(existing, job)
+
+    def _replacing_needs_consent(self, ext_id: str, job: dict) -> bool:
+        """Anyone can copy a public key into a manifest: only a signed .crx (or the same source) may silently update."""
+        if job.get("id_source") == "crx" or not job.get("id_source"):
+            return False
+        state = self.registry.get(ext_id, {})
+        return state.get("source_path") != job.get("source_path") or state.get("source") != job.get("source")
+
+    def resolve_replace(self, job: dict, accepted: bool) -> None:
+        ext_id = job.get("id") or ""
+        self._installing.discard(ext_id)
+        existing = self._info(ext_id)
+        if accepted and existing is not None and ext_id not in self._updates:
             self._start_update(existing, job)
             return
-        self._install_staged(job)
+        shutil.rmtree(job["dir"], ignore_errors=True)
+        if not accepted:
+            self.message.emit(f"“{job.get('existing_name') or job.get('name')}” was left as it was.", "info")
 
     # Updates replace the files inside the extension's existing folder, so its ID - and with it the
     # extension's saved data - stays the same. The previous version is kept until the new one loads.
     RESTORE_MARKER = ".foxglove-restore-to"
 
     def _start_update(self, info, job: dict) -> None:
-        job.update(ext_id=info.id(), target=info.path(), name=info.name() or job.get("name"), backup=None)
+        job.update(ext_id=info.id(), target=info.path(), name=info.name() or job.get("name"), backup=None,
+                   previous=str(self._manifest(info.path()).get("version", "")))
+        job.pop("unloaded", None)
         self._updates[info.id()] = job
+        self.bridge.extension_disabled(info.id())
         self.manager.unloadExtension(info)  # continues in _on_unload_finished
+
+    def _reshim(self, info) -> None:
+        """Give an extension installed by an older Foxglove the current polyfill (same folder, so the same ID)."""
+        ext_id, source = info.id(), Path(info.path())
+        state = self.registry.get(ext_id, {})
+        job = {"silent": True, "name": info.name(), "source": state.get("source", "file"), "source_path": state.get("source_path")}
+        registered = self.bridge.registered_scripts(ext_id)
+        self._updates[ext_id] = job
+
+        def work() -> dict:
+            target = self.staging / f"ext-{uuid.uuid4().hex[:12]}"
+            target.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                shutil.copytree(source, target)
+                try:
+                    manifest = load_manifest(target)
+                except (OSError, ValueError) as exc:
+                    raise InstallError(str(exc)) from exc
+                inject_shim(target, manifest, self.secret, self.locale, registered)
+                substitute_css(target, ext_id, self.locale)
+            except BaseException:
+                shutil.rmtree(target, ignore_errors=True)
+                raise
+            return {"dir": str(target)}
+
+        def done(result) -> None:
+            current = self._info(ext_id)
+            if isinstance(result, Exception) or current is None or self._updates.get(ext_id) is not job:
+                if not isinstance(result, Exception):
+                    shutil.rmtree(result["dir"], ignore_errors=True)
+                log(f"Couldn't add {APP_NAME}'s API support to {info.path()}: {result}")
+                if self._updates.get(ext_id) is job:
+                    self._updates.pop(ext_id)
+                    if current is not None and current.isEnabled():  # switched on for the update: off, so it's turned on properly
+                        self.manager.setExtensionEnabled(current, False)
+                self._reshim_failed.add(ext_id)
+                QTimer.singleShot(0, lambda: self.uninstall(ext_id) if job.get("remove_after") else self._apply_enabled(ext_id))
+                return
+            job.update(result)
+            self._start_update(current, job)
+
+        self._in_background(work, done)
+
+    def sync_registered(self, ext_id: str) -> None:
+        """Write the extension's registered content scripts into its installed manifest and reload it (Qt reads them
+        when it loads an extension)."""
+        info = self._info(ext_id)
+        if info is None or ext_id in self._updates:  # an update writes them itself
+            return
+        root = Path(info.path())
+        try:
+            original, current = _read_json_file(root / SHIM_ORIGINAL), _read_json_file(root / "manifest.json")
+        except (OSError, ValueError):
+            return
+        if not isinstance(original, dict) or not isinstance(current, dict):
+            return
+        scripts = wire_content_scripts(original.get("content_scripts")) + wire_content_scripts(self.bridge.registered_scripts(ext_id))
+        if scripts == (current.get("content_scripts") or []):
+            return
+        if scripts:
+            current["content_scripts"] = scripts
+        else:
+            current.pop("content_scripts", None)
+        try:
+            previous = (root / "manifest.json").read_bytes()
+            (root / "manifest.json").write_text(json.dumps(current, ensure_ascii=False, indent=2), encoding="utf-8")
+        except OSError as exc:
+            log(f"Couldn't save the content scripts of “{info.name()}”: {exc}")
+            return
+        self._reloads.setdefault(ext_id, previous)  # what to go back to if the new manifest doesn't load
+        self._reload_timer.start()
+
+    def _reload_for_scripts(self) -> None:
+        """Reload the extensions whose registered content scripts changed (Qt reads them when it loads one) - once the
+        calls have settled, and not while the extension's pop-up is open (the reload would close it)."""
+        win = self.window
+        for ext_id, previous in list(self._reloads.items()):
+            info = self._info(ext_id)
+            try:  # back to what it loaded with (unregistered and registered again, as some do at every start): no reload
+                same = info is not None and _read_json_file(Path(info.path()) / "manifest.json") == json.loads(previous)
+            except (OSError, ValueError):
+                same = False
+            if info is None or ext_id in self._updates or same:  # gone, or an update writes them itself
+                self._reloads.pop(ext_id)
+            elif win is None or not any(p.ext_id == ext_id and p.isVisible() for p in win.findChildren(ExtensionPopup)
+                                        if not sip.isdeleted(p)):
+                self._reloads.pop(ext_id)
+                self._updates[ext_id] = {"reload": previous, "silent": True, "name": info.name(), "ext_id": ext_id,
+                                         "target": info.path(), "unloaded": True}
+                self.bridge.extension_disabled(ext_id)
+                self.manager.unloadExtension(info)  # continues in _on_unload_finished
+        if self._reloads:
+            self._reload_timer.start()
 
     def _on_unload_finished(self, info) -> None:
         job = self._updates.get(info.id())
-        if job is not None and "unloaded" not in job:
+        if job is not None and "reload" in job and job.get("target") == info.path():
+            QTimer.singleShot(0, lambda: self._load_update(job, rollback=False))
+        elif job is not None and "target" in job and "unloaded" not in job:
             job["unloaded"] = True
             QTimer.singleShot(0, lambda: self._swap_in_update(job))
 
     def _swap_in_update(self, job: dict) -> None:
         target, staged = Path(job["target"]), Path(job["dir"])
         backup = self.staging / f"previous-{uuid.uuid4().hex[:10]}"
+        note = backup.with_name(backup.name + ".restore")
         try:
-            target.rename(backup)
+            note.write_text(str(target), encoding="utf-8")  # first: a crash between the two moves stays recoverable
+            _move(target, backup)
         except OSError as exc:
+            note.unlink(missing_ok=True)
             job["error"] = str(exc)
             self._load_update(job, rollback=True)  # nothing was moved: just load the old version again
             return
         job["backup"] = str(backup)
         try:
-            (backup / self.RESTORE_MARKER).write_text(str(target), encoding="utf-8")
-            staged.rename(target)
+            _move(staged, target)
         except OSError as exc:
             job["error"] = str(exc)
             self._restore_backup(job)
@@ -1716,25 +3068,51 @@ class ExtensionsController(QObject):
         self._load_update(job, rollback=False)
 
     def _load_update(self, job: dict, rollback: bool) -> None:
+        if sip.isdeleted(self.manager):
+            return
         job["rollback"] = rollback
         self._loading[os.path.realpath(job["target"])] = job
         self.manager.loadExtension(job["target"])
 
-    def _restore_backup(self, job: dict) -> None:
+    def _restore_backup(self, job: dict) -> bool:
+        """Put the previous version back. On failure the backup (and its note) stay for the next start."""
         backup, target = job.get("backup"), Path(job["target"])
-        if not backup or not Path(backup).exists():
-            return
-        shutil.rmtree(target, ignore_errors=True)
+        if not backup:
+            return True
         try:
-            (Path(backup) / self.RESTORE_MARKER).unlink(missing_ok=True)
-            Path(backup).rename(target)
-            job["backup"] = None
+            if target.exists():  # the new version: move it aside first, never delete it in place
+                trash = self.staging / f"failed-{uuid.uuid4().hex[:10]}"
+                _move(target, trash)
+                shutil.rmtree(trash, ignore_errors=True)
+            _move(Path(backup), target)
         except OSError as exc:
             log(f"Couldn't restore the previous version of an extension: {exc}")
+            job["restore_failed"] = True
+            return False
+        Path(backup + ".restore").unlink(missing_ok=True)
+        (target / self.RESTORE_MARKER).unlink(missing_ok=True)
+        job["backup"] = None
+        return True
 
     def _finish_update(self, job: dict, info) -> None:
         ext_id = job["ext_id"]
         loaded = info.isLoaded() and not info.error() and info.id() == ext_id
+        if "reload" in job:  # same files, new registered content scripts
+            if not loaded and not job["rollback"]:  # back to the manifest it loaded with before
+                log(f"“{job['name']}” didn't load with its registered content scripts: {info.error() or 'unknown error'}")
+                try:
+                    (Path(job["target"]) / "manifest.json").write_bytes(job["reload"])
+                except OSError:
+                    pass
+                self._load_update(job, rollback=True)
+                return
+            self._updates.pop(ext_id, None)
+            for delay in (0, 500):
+                QTimer.singleShot(delay, lambda: self._apply_enabled(ext_id))
+            if job.get("remove_after"):
+                QTimer.singleShot(0, lambda: self.uninstall(ext_id))
+            self.changed.emit()
+            return
         if not loaded and not job["rollback"]:
             if info.isLoaded():  # something with a different ID loaded from this folder: take it out again
                 self.manager.unloadExtension(info)
@@ -1744,35 +3122,70 @@ class ExtensionsController(QObject):
             return
         self._updates.pop(ext_id, None)
         shutil.rmtree(job["dir"], ignore_errors=True)
-        if job.get("backup"):
+        if job.get("backup") and not job.get("restore_failed"):  # the note first: a half-deleted backup must never go back
+            Path(job["backup"] + ".restore").unlink(missing_ok=True)
             shutil.rmtree(job["backup"], ignore_errors=True)
-        if not job["rollback"]:
-            state = self.registry.setdefault(ext_id, {})
-            state.update(source=job.get("source", state.get("source", "file")),
-                         source_path=job.get("source_path") or state.get("source_path"), installed=time.time())
-            self.save()
+        silent = job.get("silent")
+        if job["rollback"] and silent:
+            self._reshim_failed.add(ext_id)
+            log(f"Couldn't add {APP_NAME}'s API support to “{job['name']}”: {job.get('error') or 'unknown error'}")
+        elif not job["rollback"]:
+            if silent and self._needs_shim(info):  # never loop on an extension the polyfill can't be added to
+                self._reshim_failed.add(ext_id)
+            if not silent:
+                state = self.registry.setdefault(ext_id, {})
+                state.update(source=job.get("source", state.get("source", "file")),
+                             source_path=job.get("source_path") or state.get("source_path"), installed=time.time(),
+                             unpacked=bool(job.get("unpacked")))
+                self.save()
+            self.bridge.installed(ext_id, {"reason": "chrome_update"} if silent else
+                                  {"reason": "update", "previousVersion": job.get("previous", "")})
         for delay in (0, 500):  # Qt loads extensions disabled; switch it back on if the user had it on
             QTimer.singleShot(delay, lambda: self._apply_enabled(ext_id))
-        if job["rollback"]:
-            self.message.emit(f"Couldn't update “{job['name']}”: {job.get('error') or 'unknown error'}. "
-                              "The previous version was kept.", "error")
-        else:
+        if job["rollback"] and not silent:
+            kept = (f"The previous version couldn't be put back yet - it will be when {APP_NAME} restarts."
+                    if job.get("restore_failed") else "The previous version was kept.")
+            self.message.emit(f"Couldn't update “{job['name']}”: {job.get('error') or 'unknown error'}. {kept}", "error")
+        elif not silent:
             self.message.emit(f"“{info.name() or job['name']}” was updated.", "success")
+        if job.get("remove_after"):
+            QTimer.singleShot(0, lambda: self.uninstall(ext_id))
         self.changed.emit()
 
     def _recover_interrupted_updates(self) -> list[str]:
         """Put back any previous version an interrupted update had moved aside."""
         restored = []
-        for marker in self.staging.glob(f"previous-*/{self.RESTORE_MARKER}"):
+        found = [(m.parent, m) for m in self.staging.glob(f"previous-*/{self.RESTORE_MARKER}")]
+        found += [(n.with_suffix(""), n) for n in self.staging.glob("previous-*.restore")]
+        for backup, note in found:
             try:
-                target = Path(marker.read_text(encoding="utf-8").strip())
-                marker.unlink()
-                if target.parent.name == "Extensions" and not target.exists():
-                    marker.parent.rename(target)
-                    restored.append(str(target))
-            except OSError:
-                pass
+                target = Path(note.read_text(encoding="utf-8").strip())
+                if target.parent.name != "Extensions" or not backup.is_dir():
+                    note.unlink(missing_ok=True)
+                    continue
+                if target.exists():  # a half-installed new version: move it out of the way (staging is cleared next)
+                    _move(target, self.staging / f"failed-{uuid.uuid4().hex[:10]}")
+                _move(backup, target)
+                (target / self.RESTORE_MARKER).unlink(missing_ok=True)
+                note.unlink(missing_ok=True)
+                restored.append(str(target))
+            except OSError as exc:
+                log(f"Couldn't restore an extension's previous version: {exc}")
         return restored
+
+    def _clean_staging(self) -> None:
+        """Empty the staging folder - except previous versions that still have to go back (a failed restore)."""
+        keep = {n.with_suffix("").name for n in self.staging.glob("previous-*.restore")}
+        keep |= {m.parent.name for m in self.staging.glob(f"previous-*/{self.RESTORE_MARKER}")}
+        if not self.staging.is_dir():
+            return
+        for child in self.staging.iterdir():
+            if child.name in keep or (child.suffix == ".restore" and child.with_suffix("").name in keep):
+                continue
+            if child.is_dir() and not child.is_symlink():
+                shutil.rmtree(child, ignore_errors=True)
+            else:
+                child.unlink(missing_ok=True)
 
     def _install_staged(self, job: dict) -> None:
         if job.get("id"):
@@ -1797,15 +3210,2027 @@ class ExtensionsController(QObject):
         if not info.isLoaded() or info.error():
             self.message.emit(f"Couldn't install “{job.get('name')}”: {info.error() or 'unknown error'}", "error")
             return
+        if job.get("id") and info.id() != job["id"]:  # Qt went by something other than the checked key: never keep it
+            log(f"Refused an extension that loaded as {info.id()} instead of {job['id']}.")
+            self._rejected.add(info.path())
+            if any(i.id() == info.id() and i.path() != info.path() for i in self._infos()):
+                self.manager.unloadExtension(info)  # the installed one with that ID (and its data) stays as it is
+                QTimer.singleShot(2000, lambda path=info.path(): shutil.rmtree(path, ignore_errors=True))
+            else:
+                self.manager.uninstallExtension(info)
+            self.message.emit(f"Couldn't install “{job.get('name')}”: the package isn't what it claims to be.", "error")
+            self.changed.emit()
+            return
         state = self.registry.setdefault(info.id(), {})
         state.update(enabled=True, source=job.get("source", "file"), source_path=job.get("source_path"),
-                     installed=time.time())
+                     installed=time.time(), unpacked=bool(job.get("unpacked")))
         state.setdefault("pinned", True)
         self.save()
         ext_id = info.id()
+        self.bridge.installed(ext_id, {"reason": "install"})
         QTimer.singleShot(0, lambda: self._apply_enabled(ext_id))
-        self.message.emit(f"“{info.name()}” was added to {APP_NAME}.", "success")
+        newer = (f" It is made for Chrome {job['needs_chrome']} or newer ({APP_NAME}'s engine is Chromium "
+                 f"{self.chromium.split('.')[0]}), so parts of it may not work.") if job.get("needs_chrome") else ""
+        self.message.emit(f"“{info.name()}” was added to {APP_NAME}.{newer}", "success")
         self.changed.emit()
+
+
+APP_WORLD = QWebEngineScript.ScriptWorldId.ApplicationWorld.value  # Foxglove's own isolated world in web pages
+FIRST_EXTENSION_WORLD = 16           # chrome.scripting: a world per extension from here on (never Foxglove's)
+HOST_SCHEMES = ("http", "https", "ws", "wss", "ftp")  # what host permissions reach (file: only if the user allows it)
+MAIN_WINDOW_ID = 1
+_TAB_IDS = itertools.count(1)        # chrome.tabs ids: stable for a tab's lifetime, never reused
+_WINDOW_IDS = itertools.count(MAIN_WINDOW_ID + 1)
+BADGE_COLOR = [217, 48, 37, 255]
+
+
+class ApiError(Exception):
+    """Reaches the calling extension as a rejected promise / chrome.runtime.lastError."""
+
+
+def _color(value) -> list[int] | None:
+    """chrome.action colours: [r, g, b, a] or any CSS colour string -> [r, g, b, a]."""
+    if isinstance(value, (list, tuple)) and len(value) >= 3:
+        try:
+            return [int(clamp(int(v), 0, 255)) for v in [*value[:4], 255][:4]]
+        except (TypeError, ValueError):
+            return None
+    if isinstance(value, str):
+        m = re.fullmatch(r"\s*rgba?\(\s*([\d.]+)[,\s]+([\d.]+)[,\s]+([\d.]+)(?:[,\s/]+([\d.]+%?))?\s*\)\s*", value)
+        if m:
+            alpha = m.group(4) or "1"
+            a = float(alpha[:-1]) / 100 if alpha.endswith("%") else float(alpha)
+            return [int(clamp(float(m.group(i)), 0, 255)) for i in (1, 2, 3)] + [int(clamp(a * 255, 0, 255))]
+        color = QColor(value.strip())
+        if color.isValid():
+            return [color.red(), color.green(), color.blue(), color.alpha()]
+    return None
+
+
+def _origin(url: QUrl) -> str:
+    return f"{url.scheme()}://{url.authority()}"
+
+
+def _glob(pattern: str) -> re.Pattern:
+    return re.compile(".*".join(map(re.escape, pattern.lstrip("/").split("*"))))
+
+
+def _strings(value) -> list[str]:
+    return [v for v in value if isinstance(v, str)] if isinstance(value, list) else []
+
+
+class ExtensionBridge(QWebEngineUrlSchemeHandler):
+    """The browser half of the chrome.* polyfill.
+
+    Extension pages and service workers fetch() foxglove-ext://bridge/call (Foxglove knows them by their origin;
+    content scripts run in the page's origin and prove themselves with a token from their shim). Events go the
+    other way through a hidden page of the extension (foxglove-bridge.html), which also wakes a stopped worker.
+    foxglove-ext://<id>/<file> serves web_accessible_resources, which Qt refuses to web pages.
+    """
+
+    action_changed = pyqtSignal(str)
+    CS_APIS = {"storage.changed", "tabs.reply"}  # all a content script may call
+    NEEDS = {"contextMenus": ("contextMenus", "menus"), "notifications": ("notifications",), "alarms": ("alarms",),
+             "scripting": ("scripting",), "offscreen": ("offscreen",), "sidePanel": ("sidePanel",), "downloads": ("downloads",),
+             "dnr": ("declarativeNetRequest", "declarativeNetRequestWithHostAccess"), "webNavigation": ("webNavigation",),
+             "fontSettings": ("fontSettings",), "cookies": ("cookies",)}  # namespace -> any of these permissions
+    EVENT_NEEDS = {"webNavigation": "webNavigation", "cookies": "cookies"}  # events that report what the user does
+    MENU_KEYS = ("type", "title", "checked", "contexts", "visible", "parentId", "documentUrlPatterns", "targetUrlPatterns", "enabled")
+    PAGE_IDLE_MS = 60_000
+    MAX_PARTS, MAX_PENDING = 700, 8  # ~8 MB calls; calls in parts at once, per extension
+    REFUSED_PAUSE = 20.0  # s
+    NO_RECEIVER = "Could not establish connection. Receiving end does not exist."
+    NO_HOST = "Cannot access contents of the page. Extension manifest must request permission to access the respective host."
+
+    def __init__(self, controller: "ExtensionsController"):
+        super().__init__(controller)
+        self.c = controller
+        self.action: dict[str, dict[int, dict]] = {}    # ext id -> {tab id (0: every tab) -> {key: value}}
+        self._pages: dict[str, dict] = {}               # ext id -> its bridge page {"page", "ready", "queue", "timer"}
+        self._pending: dict[str, list] = {}             # events waiting for the extension to be switched on
+        self._replies: dict[str, tuple] = {}            # tabs.sendMessage call id -> (ext id, reply, timer)
+        self._alarms: dict[str, dict[str, QTimer]] = {}
+        self._offscreen: dict[str, QWebEnginePage] = {}
+        self._session_rules: dict[str, list] = {}
+        self._notes: dict[str, dict[str, dict]] = {}
+        self._grants: dict[str, tuple[int, str]] = {}   # activeTab: ext id -> (tab id, origin)
+        self._worlds: dict[str, int] = {}               # ext id -> its chrome.scripting world
+        self._asking: set[str] = set()                  # permissions.request: a question is open
+        self._refused: dict[str, float] = {}            # ... the user said no: not again before this time
+        self._page_listeners: dict[str, set[str]] = {}  # events extension pages (not the worker) listen to
+        self._started: set[str] = set()
+        self._downloads = itertools.count(1)
+        self._parts: dict[tuple, dict] = {}             # calls arriving in parts: (ext id, id) -> {"sender", "count", "parts", "time"}
+        self._cookies: dict[tuple, QNetworkCookie] = {}  # the profile's cookies (chrome.cookies), kept current by the store
+        self._removed: dict[tuple, QNetworkCookie] = {}  # just removed: an overwrite if it comes right back
+        self._cookie_waiters: dict[tuple, list] = {}     # cookies.set calls waiting for the store
+        self._cookies_ready = False
+        if controller.manager is not None:
+            store = controller.profile.cookieStore()
+            store.cookieAdded.connect(self._cookie_added)
+            store.cookieRemoved.connect(self._cookie_removed)
+            store.loadAllCookies()
+            QTimer.singleShot(1500, lambda: setattr(self, "_cookies_ready", True))  # loading reports every cookie as added
+
+    # ── requests ─────────────────────────────────────────────────────────────────────────
+    def requestStarted(self, job: QWebEngineUrlRequestJob) -> None:
+        try:
+            if job.requestUrl().host() == "bridge":
+                self._call(job)
+            else:
+                self._serve(job)
+        except Exception as exc:  # an exception escaping here would take the browser down
+            log(f"Extension bridge error: {exc!r}")
+            try:
+                job.fail(QWebEngineUrlRequestJob.Error.RequestFailed)
+            except RuntimeError:
+                pass
+
+    def _enabled(self, ext_id: str) -> bool:
+        info = self.c._info(ext_id)
+        return info is not None and info.isEnabled()
+
+    def _token_owner(self, token) -> str:
+        if not isinstance(token, str) or len(token) < 16:
+            return ""
+        return next((i.id() for i in self.c._infos() if i.isEnabled()
+                     and hmac.compare_digest(str(self.c.shim_config(i.id()).get("token", "")), token)), "")
+
+    @staticmethod
+    def _body(job: QWebEngineUrlRequestJob) -> bytes:
+        """The request body - read with a bound: past 16 KiB Qt's device starts over instead of ending (the shim
+        sends bigger calls in parts)."""
+        body, data = job.requestBody(), bytearray()
+        if body is None:
+            return b""
+        if not body.isOpen():
+            body.open(QIODevice.OpenModeFlag.ReadOnly)
+        while len(data) < 16384:
+            chunk = bytes(body.read(16384 - len(data)))
+            data += chunk
+            if not chunk or body.atEnd():
+                break
+        return bytes(data)
+
+    def _part(self, job: QWebEngineUrlRequestJob, data: bytes) -> bytes | None:
+        """One part of a call too big for a single request: None until the last one, then the whole body. Each part
+        starts with a line naming the caller (a content script's token; empty for the extension's own pages), so
+        nothing is kept for web pages - and each extension has a few slots of its own."""
+        m = re.fullmatch(r"part=([a-z0-9]{8,40})\.(\d+)\.(\d+)", job.requestUrl().query())
+        initiator = job.initiator()
+        if m is None or not 1 < int(m.group(3)) <= self.MAX_PARTS or int(m.group(2)) >= int(m.group(3)):
+            raise ValueError("bad part")
+        auth, newline, data = data.partition(b"\n")
+        owner = initiator.host() if initiator.scheme() == "chrome-extension" and self._enabled(initiator.host()) else ""
+        owner = owner or (self._token_owner(auth.decode("ascii", "replace")) if newline else "")
+        if not owner:
+            raise ValueError("unknown caller")
+        key, index, count = (owner, m.group(1)), int(m.group(2)), int(m.group(3))
+        now = time.monotonic()
+        for stale in [k for k, v in self._parts.items() if now - v["time"] > 60]:
+            del self._parts[stale]
+        if key not in self._parts and sum(k[0] == owner for k in self._parts) >= self.MAX_PENDING:
+            raise ValueError("too many calls in parts")
+        entry = self._parts.setdefault(key, {"sender": initiator.toString(), "count": count, "parts": {}, "time": now})
+        if entry["sender"] != initiator.toString() or entry["count"] != count:
+            self._parts.pop(key, None)
+            raise ValueError("bad part")
+        entry["parts"][index] = data
+        entry["time"] = now
+        if len(entry["parts"]) < count:
+            return None
+        del self._parts[key]
+        return b"".join(entry["parts"][i] for i in range(count))
+
+    def _call(self, job: QWebEngineUrlRequestJob) -> None:
+        data = self._body(job)
+        try:
+            if job.requestUrl().hasQuery():
+                data = self._part(job, data)
+                if data is None:
+                    self._reply(job)
+                    return
+            req = json.loads(data or b"{}")
+            if not isinstance(req, dict):
+                raise ValueError("not an object")
+        except ValueError:
+            job.fail(QWebEngineUrlRequestJob.Error.RequestDenied)
+            return
+        initiator, api = job.initiator(), str(req.get("api") or "")
+        ext_id = initiator.host() if initiator.scheme() == "chrome-extension" else ""
+        ctx = {"from": str(req.get("from") or ""), "cs": False, "tab": None}
+        if not self._enabled(ext_id):  # a content script - or a web page, which gets nothing
+            ext_id = self._token_owner(req.get("token"))
+            if not ext_id or api not in self.CS_APIS:
+                job.fail(QWebEngineUrlRequestJob.Error.RequestDenied)
+                return
+            ctx.update(cs=True, tab=req.get("tab"))
+        handler = getattr(self, "api_" + api.replace(".", "_"), None) if re.fullmatch(r"[A-Za-z]+\.[A-Za-z]+", api) else None
+        if handler is None:
+            self._reply(job, error=f"{APP_NAME} doesn't support chrome.{api}.")
+            return
+        needs = self.NEEDS.get(api.split(".")[0])
+        if needs and not any(self.has_permission(ext_id, p) for p in needs):  # the shim hides these; don't trust it
+            self._reply(job, error=f"The extension needs the “{needs[0]}” permission for chrome.{api}.")
+            return
+        args = req.get("args")
+        try:
+            result = handler(ext_id, args if isinstance(args, dict) else {}, ctx)
+            if callable(result):  # answered later
+                result(self._later(job))
+                return
+        except ApiError as exc:
+            self._reply(job, error=str(exc))
+            return
+        except (TypeError, ValueError, KeyError, AttributeError) as exc:
+            self._reply(job, error=f"Invalid arguments for chrome.{api}: {exc}")
+            return
+        self._reply(job, result)
+
+    @staticmethod
+    def _reply(job: QWebEngineUrlRequestJob, value=None, error: str | None = None) -> None:
+        payload = {"ok": False, "error": str(error)} if error is not None else {"ok": True} if value is None else {"ok": True, "value": value}
+        buffer = QBuffer(job)
+        buffer.setData(json.dumps(payload, default=str).encode("utf-8"))
+        buffer.open(QIODevice.OpenModeFlag.ReadOnly)
+        job.setAdditionalResponseHeaders({b"Access-Control-Allow-Origin": [b"*"], b"Cache-Control": [b"no-store"]})
+        job.reply(b"application/json", buffer)
+
+    def _later(self, job: QWebEngineUrlRequestJob):
+        """A reply(value=None, error=None) that is safe to call after the caller went away."""
+        alive = [True]
+        job.destroyed.connect(lambda *_: alive.__setitem__(0, False))
+
+        def reply(value=None, error: str | None = None) -> None:
+            if alive[0] and not sip.isdeleted(job):
+                alive[0] = False
+                self._reply(job, value, error)
+        return reply
+
+    @staticmethod
+    def _extension_file(root: Path, url: QUrl) -> tuple[Path, str] | None:
+        """The extension file a foxglove-ext:// URL names, and its path inside the extension - decoded one segment at
+        a time (Chromium already removed "..": an encoded "/" or ".." must not bring it back)."""
+        parts = [unquote(p, errors="strict") for p in url.path(QUrl.ComponentFormattingOption.FullyEncoded).split("/") if p]
+        if not parts or any(p in (".", "..") or re.search(r"[/\\:\0]", p) for p in parts):
+            return None
+        target = (root / "/".join(parts)).resolve()
+        if root not in target.parents or not target.is_file():
+            return None
+        rel = target.relative_to(root).as_posix()
+        return None if Path(rel).name.lower().startswith("foxglove-") else (target, rel)  # the polyfill's files: never
+
+    def _serve(self, job: QWebEngineUrlRequestJob) -> None:
+        url = job.requestUrl()
+        ext_id = url.host()
+        info = self.c._info(ext_id)
+        found = None
+        if info is not None and info.isEnabled():
+            try:
+                found = self._extension_file(Path(info.path()).resolve(), url)
+            except (UnicodeError, ValueError, OSError):
+                found = None
+        if found is None or not self._war_allowed(ext_id, found[1], job.initiator()):
+            job.fail(QWebEngineUrlRequestJob.Error.UrlNotFound)
+            return
+        target = found[0]
+        mime = "text/javascript" if target.suffix in (".js", ".mjs") else mimetypes.guess_type(target.name)[0] or "application/octet-stream"
+        buffer = QBuffer(job)
+        buffer.setData(target.read_bytes())
+        buffer.open(QIODevice.OpenModeFlag.ReadOnly)
+        job.setAdditionalResponseHeaders({b"Access-Control-Allow-Origin": [b"*"]})
+        job.reply(mime.encode(), buffer)
+
+    def _war_allowed(self, ext_id: str, rel: str, initiator: QUrl) -> bool:
+        opaque = not initiator.isEmpty() and not (initiator.isValid() and initiator.scheme())  # sandboxed frames, data: ...
+        origin = "" if opaque or initiator.isEmpty() else _origin(initiator)
+        if origin in (f"chrome-extension://{ext_id}", f"{EXT_SCHEME}://{ext_id}"):  # the extension itself: all its files
+            return True
+        for entry in self._manifest(ext_id).get("web_accessible_resources") or []:
+            if not isinstance(entry, dict) or not any(_glob(r).fullmatch(rel) for r in _strings(entry.get("resources"))):
+                continue
+            matches = _strings(entry.get("matches"))
+            if opaque:
+                if "<all_urls>" in matches or "*://*/*" in matches:
+                    return True
+                continue
+            if not origin:  # the browser itself (a typed address)
+                return True
+            if any(match_pattern(m, origin + "/") for m in matches):
+                return True
+            ids = _strings(entry.get("extension_ids"))
+            if initiator.scheme() == "chrome-extension" and ("*" in ids or initiator.host() in ids):
+                return True
+        return False
+
+    # ── events: Foxglove -> extension ────────────────────────────────────────────────────
+    def emit(self, ext_id: str, name: str, args: list, eid: str | None = None, worker_only: bool = False) -> None:
+        """Deliver an event to the extension's worker (waking it) and its open pages (not with *worker_only*)."""
+        if not self._enabled(ext_id) or not self.c.shim_config(ext_id):
+            return
+        slot = self._pages.get(ext_id)
+        if slot is None:
+            page = WebPage(self.c.profile, self)  # WebPage: keeps the extension's console messages out of the terminal
+            timer = QTimer(self)
+            timer.setSingleShot(True)
+            timer.setInterval(self.PAGE_IDLE_MS)  # costs a renderer process: close it when it's been quiet a while
+            timer.timeout.connect(lambda e=ext_id: self.close_page(e))
+            slot = self._pages[ext_id] = {"page": page, "ready": False, "queue": [], "timer": timer}
+            page.loadFinished.connect(lambda ok, e=ext_id, p=page: self._page_loaded(e, p, ok))
+            page.load(QUrl(f"chrome-extension://{ext_id}/{SHIM_BRIDGE}"))
+        slot["timer"].start()
+        script = (f"window.__foxgloveEmit && __foxgloveEmit({json.dumps(name)}, {json.dumps(args, default=str)}, "
+                  f"{json.dumps(eid)}, {json.dumps(worker_only)})")
+        if slot["ready"]:
+            slot["page"].runJavaScript(script, 0)
+        else:
+            slot["queue"].append(script)
+
+    def _page_loaded(self, ext_id: str, page: QWebEnginePage, ok: bool) -> None:
+        slot = self._pages.get(ext_id)
+        if slot is None or slot["page"] is not page or slot["ready"]:
+            return
+        if not ok:
+            self.close_page(ext_id)
+            return
+        slot["ready"] = True
+        for script in slot["queue"]:
+            page.runJavaScript(script, 0)
+        slot["queue"].clear()
+
+    def close_page(self, ext_id: str) -> None:
+        slot = self._pages.pop(ext_id, None)
+        if slot is not None:
+            slot["timer"].stop()
+            slot["timer"].deleteLater()
+            slot["page"].deleteLater()
+
+    def listens(self, ext_id: str, name: str) -> bool:
+        state = self.c.registry.get(ext_id)
+        return (isinstance(state, dict) and name in (state.get("listeners") or [])) or name in self._page_listeners.get(ext_id, ())
+
+    def listeners(self, name: str) -> list[str]:
+        return [i.id() for i in self.c._infos() if i.isEnabled() and self.listens(i.id(), name)]
+
+    def relay(self, page: QWebEnginePage, ext_id: str, payload: dict, done=None) -> bool:
+        """Hand something to the extension's content scripts in *page* (a DOM event only they know the name of)."""
+        name = self.c.shim_config(ext_id).get("relay")
+        if not name or sip.isdeleted(page):
+            return False
+        page.runJavaScript(f"!document.dispatchEvent(new CustomEvent({json.dumps(name)}, "
+                           f"{{detail: {json.dumps(json.dumps(payload, default=str))}, cancelable: true}}))",
+                           APP_WORLD, done or (lambda _result: None))
+        return True
+
+    # ── extension life cycle (called by ExtensionsController) ───────────────────────────
+    def installed(self, ext_id: str, details: dict) -> None:
+        state = self.c.registry.setdefault(ext_id, {})
+        state.pop("listeners", None)  # its worker registers them again
+        if details.get("reason") != "chrome_update":  # a new Foxglove (polyfill) keeps them, as a Chrome update does
+            for key in ("menus", "alarms", "scripts"):  # menus are re-created in onInstalled; alarms and registered scripts end
+                state.pop(key, None)
+            self._started.add(ext_id)  # no onStartup right after installing or updating
+        self.c.save()
+        self._pending.setdefault(ext_id, []).append(("runtime.onInstalled", [details]))
+
+    def extension_enabled(self, ext_id: str) -> None:
+        for name in list((self.c.registry.get(ext_id) or {}).get("alarms") or {}):
+            self._arm(ext_id, name)
+        events = self._pending.pop(ext_id, [])
+        if ext_id not in self._started:
+            self._started.add(ext_id)
+            if self.listens(ext_id, "runtime.onStartup"):
+                events.append(("runtime.onStartup", []))
+        for name, args in events:
+            self.emit(ext_id, name, args)
+
+    def extension_disabled(self, ext_id: str) -> None:
+        for timer in self._alarms.pop(ext_id, {}).values():
+            timer.stop()
+            timer.deleteLater()
+        self.close_page(ext_id)
+        page = self._offscreen.pop(ext_id, None)
+        if page is not None:
+            page.deleteLater()
+        self._page_listeners.pop(ext_id, None)
+        for call_id, (owner, reply, timer) in list(self._replies.items()):
+            if owner == ext_id:
+                self._replies.pop(call_id)
+                timer.stop()
+                reply(error=self.NO_RECEIVER)
+        win = self.c.window
+        if win is not None:
+            win.close_extension_popups(ext_id)
+
+    def extension_removed(self, ext_id: str) -> None:
+        self.extension_disabled(ext_id)
+        for store in (self.action, self._session_rules, self._notes, self._grants, self._pending):
+            store.pop(ext_id, None)
+        self.c.net.invalidate()
+        self.action_changed.emit(ext_id)
+
+    # ── helpers ─────────────────────────────────────────────────────────────────────────
+    def _manifest(self, ext_id: str) -> dict:
+        info = self.c._info(ext_id)
+        return self.c._manifest(info.path()) if info is not None else {}
+
+    def _granted(self, ext_id: str) -> dict:
+        granted = (self.c.registry.get(ext_id) or {}).get("granted")
+        return granted if isinstance(granted, dict) else {}
+
+    def has_permission(self, ext_id: str, perm: str) -> bool:
+        return perm in _strings(self._manifest(ext_id).get("permissions")) or perm in _strings(self._granted(ext_id).get("permissions"))
+
+    def _hosts(self, ext_id: str) -> list[str]:
+        m = self._manifest(ext_id)
+        hosts = _strings(m.get("host_permissions")) + [p for p in _strings(m.get("permissions")) if "://" in p or p == "<all_urls>"]
+        declared = self.c.shim_config(ext_id).get("manifest")  # content scripts as declared - not registered ones
+        declared = declared if isinstance(declared, dict) else m
+        for entry in declared.get("content_scripts") or [] if isinstance(declared.get("content_scripts"), list) else []:
+            hosts += _strings(entry.get("matches")) if isinstance(entry, dict) else []
+        return hosts + _strings(self._granted(ext_id).get("origins"))
+
+    def covers(self, ext_id: str, pattern: str) -> bool:
+        """Whether the extension's host access includes everything a match pattern does (roughly, as Chrome's check)."""
+        hosts = self._hosts(ext_id)
+        if "<all_urls>" in hosts or pattern in hosts:
+            return True
+        m = re.fullmatch(r"(\*|[a-z][a-z0-9+.-]*)://(\*|\*\.)?([^/]*)(/.*)", pattern)
+        if pattern == "<all_urls>" or m is None:
+            return False
+        host = m.group(3) if m.group(2) != "*" else "any-host.invalid"
+        sample = f"{'https' if m.group(1) == '*' else m.group(1)}://{host}{m.group(4).replace('*', 'x')}"
+        return any(match_pattern(h, sample) for h in hosts) and (m.group(1) != "*" or any(match_pattern(h, "http" + sample[5:]) for h in hosts))
+
+    def can_access(self, ext_id: str, url: str, tab_id: int | None = None) -> bool:
+        """Host access as in Chrome: web pages - never another extension's or Foxglove's own pages, and file: pages
+        only once the user allowed it for this extension."""
+        scheme = QUrl(url).scheme().lower()
+        if scheme not in HOST_SCHEMES and not (scheme == "file" and self.c.file_access(ext_id)):
+            return False
+        if any(match_pattern(h, url) for h in self._hosts(ext_id)):
+            return True
+        grant = self._grants.get(ext_id)
+        return grant is not None and grant[0] == tab_id and grant[1] == _origin(QUrl(url))
+
+    def grant_active_tab(self, ext_id: str, tab) -> None:
+        """The user invoked the extension on this tab (toolbar button, menu item): activeTab gives it access."""
+        if tab is not None and self.has_permission(ext_id, "activeTab"):
+            self._grants[ext_id] = (tab.tab_id, _origin(tab.url()))
+
+    def _win(self):
+        win = self.c.window
+        if win is None:
+            raise ApiError("No browser window is open.")
+        return win
+
+    def tabs(self) -> list:
+        win = self.c.window
+        return [] if win is None else [*win.tabs(), *(p for p in list(win.popups) if not sip.isdeleted(p))]
+
+    def _tab(self, tab_id, current: bool = False):
+        if tab_id is None and current:
+            tab = self._win().current_tab()
+            if tab is not None:
+                return tab
+        tab = (next((t for t in self.tabs() if t.tab_id == tab_id), None)
+               if isinstance(tab_id, int) and not isinstance(tab_id, bool) else None)
+        if tab is None:
+            raise ApiError(f"No tab with id: {tab_id}.")
+        return tab
+
+    def tab_info(self, ext_id: str, tab) -> dict:
+        win = self.c.window
+        popup = isinstance(tab, PopupWindow)
+        page, url = tab.page, tab.url().toString()
+        active = popup or (win is not None and tab is win.current_tab())
+        info = {"id": tab.tab_id, "index": 0 if popup or win is None else win.index_of(tab), "windowId": tab.window_id,
+                "active": active, "highlighted": active, "selected": active, "pinned": False, "incognito": False,
+                "audible": page.recentlyAudible(), "mutedInfo": {"muted": page.isAudioMuted()},
+                "discarded": tab.pending is not None, "autoDiscardable": True, "frozen": False, "groupId": -1,
+                "status": "unloaded" if tab.pending is not None else "loading" if tab.loading else "complete",
+                "width": tab.width(), "height": tab.height()}
+        opener = getattr(tab, "opener", None)
+        if opener is not None:
+            info["openerTabId"] = opener.tab_id
+        if self.has_permission(ext_id, "tabs") or self.can_access(ext_id, url, tab.tab_id):
+            info.update(url=url, title=tab.title())
+            if not page.iconUrl().isEmpty():
+                info["favIconUrl"] = page.iconUrl().toString()
+        return info
+
+    def _url(self, raw) -> QUrl | None:
+        if raw in (None, ""):
+            return None
+        url = QUrl(str(raw))
+        if not url.isValid() or url.scheme().lower() in ("javascript", "", "file"):  # file: needs the user's consent in Chrome
+            raise ApiError(f"Invalid url: \"{raw}\".")
+        if url.scheme() == "chrome" and url.host() == "newtab":
+            return QUrl(NEWTAB)
+        return url
+
+    def _files(self, ext_id: str, files) -> str:
+        info = self.c._info(ext_id)
+        root = Path(info.path()).resolve() if info is not None else None
+        parts = []
+        for name in _strings(files):
+            target = (root / name.lstrip("/")).resolve() if root is not None else None
+            if target is None or root not in target.parents or not target.is_file():
+                raise ApiError(f"Could not load file: '{name}'.")
+            parts.append(target.read_text(encoding="utf-8", errors="replace"))
+        if not parts:
+            raise ApiError("Either 'files' or 'func' (or 'css') must be specified.")
+        return "\n;\n".join(parts)
+
+    def _script_tab(self, ext_id: str, target) -> "Tab":
+        tab = self._tab((target or {}).get("tabId") if isinstance(target, dict) else None)
+        if tab.pending is not None:
+            raise ApiError("Cannot access contents of a tab that hasn't been loaded yet.")
+        if not self.can_access(ext_id, tab.url().toString(), tab.tab_id):
+            raise ApiError(self.NO_HOST)
+        return tab
+
+    def tab_event(self, name: str, tab, make_args) -> None:
+        """A tabs.* / webNavigation.* event, for the extensions that listen to it (make_args -> None: skip it)."""
+        needs = self.EVENT_NEEDS.get(name.split(".")[0])
+        for ext_id in self.listeners(name):
+            if needs and not self.has_permission(ext_id, needs):  # anyone may listen; only these may hear
+                continue
+            args = make_args(ext_id)
+            if args is not None:
+                self.emit(ext_id, name, args)
+
+    def tab_closed(self, tab) -> None:
+        for state in self.action.values():
+            state.pop(tab.tab_id, None)
+        for ext_id, grant in list(self._grants.items()):
+            if grant[0] == tab.tab_id:
+                self._grants.pop(ext_id)
+
+    # ── listeners ───────────────────────────────────────────────────────────────────────
+    def api_events_listen(self, ext_id: str, a: dict, ctx: dict):
+        name = str(a.get("name") or "")
+        if not a.get("worker"):
+            self._page_listeners.setdefault(ext_id, set()).add(name)
+            return None
+        names = self.c.registry.setdefault(ext_id, {}).setdefault("listeners", [])
+        if name not in names:  # remembered like Chrome's lazy listeners: the worker is woken only for these
+            names.append(name)
+            self.c.save()
+        return None
+
+    # ── storage.onChanged: for content scripts, and for a worker that has stopped ───────
+    def api_storage_changed(self, ext_id: str, a: dict, ctx: dict):
+        area, changes, src = str(a.get("area") or ""), a.get("changes") if isinstance(a.get("changes"), dict) else {}, a.get("src")
+        if area != "session" and (ctx["cs"] or self.c.shim_config(ext_id).get("cs")):
+            payload = {"event": "storage.changed", "args": [area, changes, src]}
+            for tab in self.tabs():
+                if tab.pending is None:
+                    self.relay(tab.page, ext_id, payload)
+        worker = (self.c.registry.get(ext_id) or {}).get("listeners") or []
+        if not ctx["cs"] and ctx["from"] and ("storage.onChanged" in worker or f"storage.{area}.onChanged" in worker):
+            eid = a.get("eid") if isinstance(a.get("eid"), str) else None  # a running worker already has it: dropped there
+            self.emit(ext_id, "storage.changed", [area, changes, src], eid=eid, worker_only=True)
+        return None
+
+    # ── chrome.action ───────────────────────────────────────────────────────────────────
+    def action_value(self, ext_id: str, key: str, tab_id: int | None = None):
+        state = self.action.get(ext_id, {})
+        for slot in (tab_id, 0):
+            if slot is not None and key in state.get(slot, {}):
+                return state[slot][key]
+        return None
+
+    def action_icon(self, ext_id: str, tab_id: int | None = None) -> QIcon | None:
+        value = self.action_value(ext_id, "icon", tab_id)
+        info = self.c._info(ext_id)
+        if not isinstance(value, dict) or info is None:
+            return None
+        result, root = QIcon(), Path(info.path()).resolve()
+        for src in value.values():
+            if not isinstance(src, str):
+                continue
+            if src.startswith("data:image/") and "," in src:
+                pixmap = QPixmap()
+                try:
+                    if pixmap.loadFromData(base64.b64decode(src.split(",", 1)[1])):
+                        result.addPixmap(pixmap)
+                except ValueError:
+                    pass
+            elif QUrl(src).scheme() == "chrome-extension" and QUrl(src).host() == ext_id:
+                target = (root / QUrl(src).path().lstrip("/")).resolve()
+                if root in target.parents and target.is_file():
+                    result.addFile(str(target))
+        return None if result.isNull() else result
+
+    def api_action_set(self, ext_id: str, a: dict, ctx: dict):
+        key, value, tab_id = a.get("key"), a.get("value"), a.get("tabId")
+        if key not in ("badgeText", "badgeBackground", "badgeTextColor", "title", "icon", "popup", "enabled"):
+            raise ApiError(f"Unknown action property {key!r}.")
+        if isinstance(tab_id, int) and not isinstance(tab_id, bool):
+            self._tab(tab_id)
+        slot = self.action.setdefault(ext_id, {}).setdefault(tab_id if isinstance(tab_id, int) and tab_id > 0 else 0, {})
+        if key in ("badgeBackground", "badgeTextColor"):
+            value = _color(value)
+            if value is None:
+                raise ApiError("The color specification could not be parsed.")
+        elif key == "popup" and value and not str(value).startswith(f"chrome-extension://{ext_id}/"):
+            raise ApiError("The pop-up must be a page of the extension.")
+        if value is None:
+            slot.pop(key, None)
+        else:
+            slot[key] = value
+        self.action_changed.emit(ext_id)
+        return None
+
+    def text(self, ext_id: str, value) -> str:
+        """A manifest string in the user's language (as chrome.i18n has it)."""
+        messages = self.c.shim_config(ext_id).get("messages")
+        if isinstance(messages, dict):
+            return message_text(value, messages)
+        info = self.c._info(ext_id)
+        return localized(Path(info.path()), self._manifest(ext_id), value) if info is not None else ""
+
+    def default_title(self, ext_id: str) -> str:
+        action = self._manifest(ext_id).get("action")
+        return self.text(ext_id, action.get("default_title")) if isinstance(action, dict) else ""
+
+    def api_action_get(self, ext_id: str, a: dict, ctx: dict):
+        key, tab_id = a.get("key"), a.get("tabId")
+        value = self.action_value(ext_id, key, tab_id if isinstance(tab_id, int) else None)
+        if value is not None:
+            return value
+        manifest = self._manifest(ext_id)
+        action = manifest.get("action") if isinstance(manifest.get("action"), dict) else {}
+        popup = action.get("default_popup")
+        return {"badgeText": "", "badgeBackground": BADGE_COLOR, "badgeTextColor": [255, 255, 255, 255], "enabled": True,
+                "title": self.default_title(ext_id) or self.text(ext_id, manifest.get("name")),
+                "popup": f"chrome-extension://{ext_id}/{popup.lstrip('/')}" if isinstance(popup, str) and popup else ""}.get(key)
+
+    def api_action_openPopup(self, ext_id: str, a: dict, ctx: dict):
+        """Only the pop-up: no activeTab and no action.onClicked - those come from the user alone, never the API."""
+        win = self._win()
+        if not win.open_extension(ext_id, invoked=False):
+            raise ApiError("Extension does not have a popup on the active tab.")
+        return None
+
+    def action_clicked(self, ext_id: str, tab) -> None:
+        self.emit(ext_id, "action.onClicked", [self.tab_info(ext_id, tab)] if tab is not None else [])
+
+    # ── chrome.contextMenus ─────────────────────────────────────────────────────────────
+    def menus(self, ext_id: str) -> list[dict]:
+        items = (self.c.registry.get(ext_id) or {}).get("menus")
+        return items if isinstance(items, list) else []
+
+    def _menu(self, ext_id: str, item_id) -> dict:
+        item = next((m for m in self.menus(ext_id) if m.get("id") == item_id), None)
+        if item is None:
+            raise ApiError(f"Cannot find menu item with id {item_id}")
+        return item
+
+    def api_contextMenus_create(self, ext_id: str, a: dict, ctx: dict):
+        items = self.c.registry.setdefault(ext_id, {}).setdefault("menus", [])
+        item_id = a.get("id")
+        if not isinstance(item_id, (str, int)) or isinstance(item_id, bool):
+            raise ApiError("Menu items need an id.")
+        if any(m.get("id") == item_id for m in items):
+            raise ApiError(f"Cannot create item with duplicate id {item_id}")
+        if a.get("parentId") is not None:
+            self._menu(ext_id, a["parentId"])
+        items.append({"id": item_id, **{k: a[k] for k in self.MENU_KEYS if k in a}})
+        self.c.save()
+        return None
+
+    def api_contextMenus_update(self, ext_id: str, a: dict, ctx: dict):
+        item = self._menu(ext_id, a.get("id"))
+        props = a.get("props") if isinstance(a.get("props"), dict) else {}
+        if props.get("parentId") is not None:
+            self._menu(ext_id, props["parentId"])
+        item.update({k: props[k] for k in self.MENU_KEYS if k in props})
+        self.c.save()
+        return None
+
+    def api_contextMenus_remove(self, ext_id: str, a: dict, ctx: dict):
+        self._menu(ext_id, a.get("id"))
+        items, doomed = self.menus(ext_id), {a.get("id")}
+        while True:  # the item and everything below it
+            more = {m.get("id") for m in items if m.get("parentId") in doomed} - doomed
+            if not more:
+                break
+            doomed |= more
+        items[:] = [m for m in items if m.get("id") not in doomed]
+        self.c.save()
+        return None
+
+    def api_contextMenus_removeAll(self, ext_id: str, a: dict, ctx: dict):
+        self.c.registry.setdefault(ext_id, {})["menus"] = []
+        self.c.save()
+        return None
+
+    def menu_clicked(self, ext_id: str, item: dict, info: dict, tab) -> None:
+        kind = item.get("type")
+        if kind in ("checkbox", "radio"):
+            info["wasChecked"] = bool(item.get("checked"))
+            if kind == "checkbox":
+                item["checked"] = not info["wasChecked"]
+            else:  # a radio group: neighbouring radio items under the same parent
+                items = [m for m in self.menus(ext_id) if m.get("parentId") == item.get("parentId")]
+                at = next(i for i, m in enumerate(items) if m is item)
+                start, end = at, at
+                while start > 0 and items[start - 1].get("type") == "radio":
+                    start -= 1
+                while end + 1 < len(items) and items[end + 1].get("type") == "radio":
+                    end += 1
+                for m in items[start:end + 1]:
+                    m["checked"] = m is item
+            info["checked"] = bool(item["checked"])
+            self.c.save()
+        self.grant_active_tab(ext_id, tab)
+        self.emit(ext_id, "contextMenus.onClicked", [info, self.tab_info(ext_id, tab)] if tab is not None else [info])
+
+    # ── chrome.notifications ────────────────────────────────────────────────────────────
+    def api_notifications_create(self, ext_id: str, a: dict, ctx: dict):
+        note_id = str(a.get("id") or uuid.uuid4())
+        options = a.get("options") if isinstance(a.get("options"), dict) else {}
+        self._notes.setdefault(ext_id, {})[note_id] = options
+        win = self.c.window
+        if win is not None:
+            win.show_extension_notification(ext_id, note_id, options)
+        return note_id
+
+    def api_notifications_update(self, ext_id: str, a: dict, ctx: dict):
+        notes = self._notes.get(ext_id, {})
+        note_id = str(a.get("id"))
+        if note_id not in notes:
+            return False
+        notes[note_id].update(a.get("options") or {})
+        win = self.c.window
+        if win is not None:
+            win.show_extension_notification(ext_id, note_id, notes[note_id])
+        return True
+
+    def api_notifications_clear(self, ext_id: str, a: dict, ctx: dict):
+        return self._notes.get(ext_id, {}).pop(str(a.get("id")), None) is not None
+
+    def api_notifications_getAll(self, ext_id: str, a: dict, ctx: dict):
+        return {note_id: True for note_id in self._notes.get(ext_id, {})}
+
+    def notification_clicked(self, ext_id: str, note_id: str) -> None:
+        self._notes.get(ext_id, {}).pop(note_id, None)
+        self.emit(ext_id, "notifications.onClicked", [note_id])
+        self.emit(ext_id, "notifications.onClosed", [note_id, True])
+
+    # ── chrome.alarms ───────────────────────────────────────────────────────────────────
+    def _alarm_store(self, ext_id: str) -> dict:
+        state = self.c.registry.setdefault(ext_id, {})
+        if not isinstance(state.get("alarms"), dict):
+            state["alarms"] = {}
+        return state["alarms"]
+
+    def api_alarms_create(self, ext_id: str, a: dict, ctx: dict):
+        name, now = str(a.get("name") or ""), time.time() * 1000
+        least = 0.0 if (self.c.registry.get(ext_id) or {}).get("unpacked") else 0.5  # Chrome's 30 s (not for unpacked ones)
+        period = a.get("periodInMinutes")
+        period = max(float(period), least) if isinstance(period, (int, float)) and period > 0 else None
+        if isinstance(a.get("when"), (int, float)):
+            when = float(a["when"])
+        elif isinstance(a.get("delayInMinutes"), (int, float)):
+            when = now + max(float(a["delayInMinutes"]), least) * 60000
+        elif period:
+            when = now + period * 60000
+        else:
+            raise ApiError("An alarm needs 'when', 'delayInMinutes' or 'periodInMinutes'.")
+        alarm = {"name": name, "scheduledTime": when}
+        if period:
+            alarm["periodInMinutes"] = period
+        self._alarm_store(ext_id)[name] = alarm
+        self.c.save()
+        self._arm(ext_id, name)
+        return None
+
+    def _arm(self, ext_id: str, name: str) -> None:
+        timers = self._alarms.setdefault(ext_id, {})
+        old = timers.pop(name, None)
+        if old is not None:
+            old.stop()
+            old.deleteLater()
+        alarm = self._alarm_store(ext_id).get(name)
+        if not isinstance(alarm, dict):
+            return
+        timer = QTimer(self)
+        timer.setSingleShot(True)
+        timer.timeout.connect(lambda e=ext_id, n=name: self._fire_alarm(e, n))
+        timer.start(int(clamp(float(alarm.get("scheduledTime", 0)) - time.time() * 1000, 0, 2 ** 31 - 1)))
+        timers[name] = timer
+
+    def _fire_alarm(self, ext_id: str, name: str) -> None:
+        store = self._alarm_store(ext_id)
+        alarm = store.get(name)
+        if not isinstance(alarm, dict) or not self._enabled(ext_id):
+            return
+        now = time.time() * 1000
+        if float(alarm.get("scheduledTime", 0)) > now + 1000:  # a far-off alarm (timers top out at ~24 days)
+            self._arm(ext_id, name)
+            return
+        self.emit(ext_id, "alarms.onAlarm", [dict(alarm)])
+        if alarm.get("periodInMinutes"):  # not saved each time: after a restart an overdue alarm fires once, as in Chrome
+            alarm["scheduledTime"] = now + float(alarm["periodInMinutes"]) * 60000
+            self._arm(ext_id, name)
+        else:
+            store.pop(name, None)
+            self._alarms.get(ext_id, {}).pop(name, None)
+            self.c.save()
+
+    def api_alarms_get(self, ext_id: str, a: dict, ctx: dict):
+        return self._alarm_store(ext_id).get(str(a.get("name") or ""))
+
+    def api_alarms_getAll(self, ext_id: str, a: dict, ctx: dict):
+        return list(self._alarm_store(ext_id).values())
+
+    def api_alarms_clear(self, ext_id: str, a: dict, ctx: dict):
+        name = str(a.get("name") or "")
+        timer = self._alarms.get(ext_id, {}).pop(name, None)
+        if timer is not None:
+            timer.stop()
+            timer.deleteLater()
+        found = self._alarm_store(ext_id).pop(name, None) is not None
+        self.c.save()
+        return found
+
+    def api_alarms_clearAll(self, ext_id: str, a: dict, ctx: dict):
+        for timer in self._alarms.pop(ext_id, {}).values():
+            timer.stop()
+            timer.deleteLater()
+        self._alarm_store(ext_id).clear()
+        self.c.save()
+        return True
+
+    # ── chrome.tabs ─────────────────────────────────────────────────────────────────────
+    def api_tabs_query(self, ext_id: str, q: dict, ctx: dict):
+        out = []
+        for tab in self.tabs():
+            info = self.tab_info(ext_id, tab)
+            if self._matches_query(q, tab, info):
+                out.append(info)
+        return out
+
+    @staticmethod
+    def _matches_query(q: dict, tab, info: dict) -> bool:
+        for key in ("active", "highlighted", "pinned", "audible", "discarded", "status", "index", "groupId", "autoDiscardable"):
+            if q.get(key) is not None and info.get(key) != q[key]:
+                return False
+        if q.get("muted") is not None and info["mutedInfo"]["muted"] != q["muted"]:
+            return False
+        for key in ("currentWindow", "lastFocusedWindow"):
+            if q.get(key) is not None and (info["windowId"] == MAIN_WINDOW_ID) != bool(q[key]):
+                return False
+        window = q.get("windowId")
+        if isinstance(window, int) and window != -1 and info["windowId"] != (MAIN_WINDOW_ID if window == -2 else window):
+            return False
+        if q.get("windowType") and q["windowType"] != ("popup" if isinstance(tab, PopupWindow) else "normal"):
+            return False
+        patterns = [q["url"]] if isinstance(q.get("url"), str) else _strings(q.get("url"))
+        if patterns and not ("url" in info and any(match_pattern(p, info["url"]) for p in patterns)):
+            return False
+        if isinstance(q.get("title"), str) and not ("title" in info and _glob(q["title"]).fullmatch(info["title"])):
+            return False
+        return True
+
+    def api_tabs_get(self, ext_id: str, a: dict, ctx: dict):
+        return self.tab_info(ext_id, self._tab(a.get("tabId")))
+
+    def api_tabs_getCurrent(self, ext_id: str, a: dict, ctx: dict):
+        caller = ctx.get("from")
+        tab = next((t for t in self.tabs() if caller and t.pending is None and t.url().toString() == caller), None)
+        return self.tab_info(ext_id, tab) if tab is not None else None
+
+    def api_tabs_create(self, ext_id: str, a: dict, ctx: dict):
+        win = self._win()
+        url = self._url(a.get("url")) or win._home_url()
+        active = a.get("active", a.get("selected", True)) is not False
+        opener = next((t for t in win.tabs() if t.tab_id == a.get("openerTabId")), None)
+        index = a.get("index") if isinstance(a.get("index"), int) and a.get("index") >= 0 else None
+        tab = win.new_tab(url, background=not active, index=index, opener=opener)
+        if active:
+            win.close_extension_popups()
+        return self.tab_info(ext_id, tab)
+
+    def api_tabs_update(self, ext_id: str, a: dict, ctx: dict):
+        win = self._win()
+        tab = self._tab(a.get("tabId"), current=True)
+        url = self._url(a.get("url"))
+        if url is not None:
+            tab.load(url)
+            if tab is win.current_tab():  # the pop-up belonged to the page it just sent away
+                win.close_extension_popups(ext_id)
+        if (a.get("active") or a.get("highlighted") or a.get("selected")) and win.index_of(tab) >= 0:
+            win.tab_bar.setCurrentIndex(win.index_of(tab))
+            win.close_extension_popups()
+        if isinstance(a.get("muted"), bool):
+            tab.page.setAudioMuted(a["muted"])
+            if win.index_of(tab) >= 0:
+                win._refresh_tab(tab)
+        return self.tab_info(ext_id, tab)
+
+    def api_tabs_remove(self, ext_id: str, a: dict, ctx: dict):
+        win = self._win()
+        for tab in [self._tab(t) for t in (a.get("tabIds") or [])]:
+            if isinstance(tab, PopupWindow):
+                tab.close()
+            else:
+                win._remove_tab(tab)
+        return None
+
+    def api_tabs_reload(self, ext_id: str, a: dict, ctx: dict):
+        tab = self._tab(a.get("tabId"), current=True)
+        if tab.pending is not None:
+            tab.ensure_loaded()
+        else:
+            WA = QWebEnginePage.WebAction
+            tab.page.triggerAction(WA.ReloadAndBypassCache if a.get("bypassCache") else WA.Reload)
+        return None
+
+    def api_tabs_duplicate(self, ext_id: str, a: dict, ctx: dict):
+        win, tab = self._win(), self._tab(a.get("tabId"))
+        if isinstance(tab, PopupWindow):
+            raise ApiError("Pop-up windows can't be duplicated.")
+        win.duplicate_tab(tab)
+        return self.tab_info(ext_id, win.tab_at(win.index_of(tab) + 1))
+
+    def api_tabs_move(self, ext_id: str, a: dict, ctx: dict):
+        win = self._win()
+        tabs = [self._tab(t) for t in (a.get("tabIds") or [])]
+        index = a.get("index") if isinstance(a.get("index"), int) else -1
+        for offset, tab in enumerate(t for t in tabs if not isinstance(t, PopupWindow)):
+            target = win.tab_bar.count() - 1 if index < 0 else clamp(index + offset, 0, win.tab_bar.count() - 1)
+            win.tab_bar.moveTab(win.index_of(tab), target)
+        return [self.tab_info(ext_id, t) for t in tabs]
+
+    def api_tabs_highlight(self, ext_id: str, a: dict, ctx: dict):
+        win = self._win()
+        indices = [a.get("tabs")] if isinstance(a.get("tabs"), int) else [i for i in a.get("tabs") or [] if isinstance(i, int)]
+        if not indices or win.tab_at(indices[0]) is None:
+            raise ApiError("No tab at the given index.")
+        win.tab_bar.setCurrentIndex(indices[0])
+        return self._window_info(ext_id, win, populate=True)
+
+    def api_tabs_navigate(self, ext_id: str, a: dict, ctx: dict):
+        tab = self._tab(a.get("tabId"), current=True)
+        tab.page.triggerAction(QWebEnginePage.WebAction.Back if a.get("step", -1) < 0 else QWebEnginePage.WebAction.Forward)
+        return None
+
+    def api_tabs_captureVisibleTab(self, ext_id: str, a: dict, ctx: dict):
+        tab = self._win().current_tab()
+        if tab is None or not self.can_access(ext_id, tab.url().toString(), tab.tab_id):
+            raise ApiError("Either the '<all_urls>' or 'activeTab' permission is required.")
+        options = a.get("options") if isinstance(a.get("options"), dict) else {}
+        jpeg = options.get("format") == "jpeg"
+        buffer = QBuffer()
+        buffer.open(QIODevice.OpenModeFlag.WriteOnly)
+        tab.view.grab().save(buffer, "JPEG" if jpeg else "PNG", int(options.get("quality", 92)) if jpeg else -1)
+        return f"data:image/{'jpeg' if jpeg else 'png'};base64," + base64.b64encode(bytes(buffer.data())).decode("ascii")
+
+    def api_tabs_getZoom(self, ext_id: str, a: dict, ctx: dict):
+        return self._tab(a.get("tabId"), current=True).page.zoomFactor()
+
+    def api_tabs_setZoom(self, ext_id: str, a: dict, ctx: dict):
+        factor = float(a.get("zoomFactor") or 0)
+        self._tab(a.get("tabId"), current=True).page.setZoomFactor(clamp(factor, 0.25, 5.0) if factor > 0 else 1.0)
+        return None
+
+    def api_tabs_sendMessage(self, ext_id: str, a: dict, ctx: dict):
+        try:
+            tab = self._tab(a.get("tabId"))
+        except ApiError:
+            raise ApiError(self.NO_RECEIVER) from None
+        if tab.pending is not None:
+            raise ApiError(self.NO_RECEIVER)
+        call_id = secrets.token_hex(8)
+        payload = {"msg": a.get("msg"), "callId": call_id, "frameId": a.get("frameId"),
+                   "from": ctx.get("from") or f"chrome-extension://{ext_id}/"}
+
+        def later(reply) -> None:
+            timer = QTimer(self)
+            timer.setSingleShot(True)
+            timer.timeout.connect(lambda: self._replies.pop(call_id, None) and reply(error="The message port closed before a response was received."))
+            timer.start(300_000)
+            self._replies[call_id] = (ext_id, reply, timer)  # before delivering: the answer can beat the callback
+
+            def delivered(ok) -> None:
+                if ok is not True and self._replies.pop(call_id, None):
+                    timer.stop()
+                    reply(error=self.NO_RECEIVER)
+            if not self.relay(tab.page, ext_id, payload, delivered):
+                delivered(False)
+        return later
+
+    def api_tabs_reply(self, ext_id: str, a: dict, ctx: dict):
+        entry = self._replies.get(str(a.get("callId")))
+        if entry is not None and entry[0] == ext_id:
+            self._replies.pop(str(a.get("callId")))
+            entry[2].stop()
+            entry[1](a.get("value"))
+        return None
+
+    # ── chrome.windows ──────────────────────────────────────────────────────────────────
+    def _window(self, window_id):
+        win = self._win()
+        if window_id in (None, -2, MAIN_WINDOW_ID):
+            return win
+        popup = next((p for p in list(win.popups) if not sip.isdeleted(p) and p.window_id == window_id), None)
+        if popup is None:
+            raise ApiError(f"No window with id: {window_id}.")
+        return popup
+
+    def _window_info(self, ext_id: str, window, populate: bool = False) -> dict:
+        popup = isinstance(window, PopupWindow)
+        geometry = window.geometry()
+        state = ("fullscreen" if window.isFullScreen() else "maximized" if window.isMaximized()
+                 else "minimized" if window.isMinimized() else "normal")
+        info = {"id": window.window_id if popup else MAIN_WINDOW_ID, "type": "popup" if popup else "normal",
+                "focused": window.isActiveWindow(), "state": state, "incognito": False, "alwaysOnTop": False,
+                "top": geometry.y(), "left": geometry.x(), "width": geometry.width(), "height": geometry.height()}
+        if populate:
+            info["tabs"] = [self.tab_info(ext_id, t) for t in ([window] if popup else window.tabs())]
+        return info
+
+    def api_windows_get(self, ext_id: str, a: dict, ctx: dict):
+        return self._window_info(ext_id, self._window(a.get("windowId")), bool(a.get("populate")))
+
+    def api_windows_getAll(self, ext_id: str, a: dict, ctx: dict):
+        win = self.c.window
+        if win is None:
+            return []
+        types = _strings(a.get("windowTypes"))
+        windows = [w for w in [win, *(p for p in list(win.popups) if not sip.isdeleted(p))]
+                   if not types or ("popup" if isinstance(w, PopupWindow) else "normal") in types]
+        return [self._window_info(ext_id, w, bool(a.get("populate"))) for w in windows]
+
+    def api_windows_create(self, ext_id: str, a: dict, ctx: dict):
+        win = self._win()
+        urls = [u for u in (self._url(raw) for raw in (a.get("url") or [])) if u is not None]
+        if a.get("type") in ("popup", "panel"):
+            number = lambda key: int(a[key]) if isinstance(a.get(key), (int, float)) else 0
+            popup = PopupWindow(win, QRect(number("left"), number("top"), number("width"), number("height")))
+            popup.page.load(urls[0] if urls else QUrl("about:blank"))
+            popup.show()
+            if a.get("focused") is not False:
+                popup.activateWindow()
+            return self._window_info(ext_id, popup, populate=True)
+        for url in urls or [win._home_url()]:  # Foxglove has one browser window: new windows become tabs
+            win.new_tab(url)
+        win.close_extension_popups()
+        return self._window_info(ext_id, win, populate=True)
+
+    def api_windows_update(self, ext_id: str, a: dict, ctx: dict):
+        window = self._window(a.get("windowId"))
+        state = a.get("state")
+        if state == "maximized":
+            window.showMaximized()
+        elif state == "minimized":
+            window.showMinimized()
+        elif state == "fullscreen":
+            window.showFullScreen()
+        elif state == "normal":
+            window.showNormal()
+        geometry = window.geometry()
+        if any(isinstance(a.get(k), (int, float)) for k in ("left", "top", "width", "height")):
+            window.setGeometry(int(a.get("left", geometry.x())), int(a.get("top", geometry.y())),
+                               int(a.get("width", geometry.width())), int(a.get("height", geometry.height())))
+        if a.get("focused") is True:
+            window.raise_()
+            window.activateWindow()
+        return self._window_info(ext_id, window)
+
+    def api_windows_remove(self, ext_id: str, a: dict, ctx: dict):
+        window = self._window(a.get("windowId"))
+        if not isinstance(window, PopupWindow):
+            raise ApiError(f"Extensions can't close the main {APP_NAME} window.")
+        window.close()
+        return None
+
+    # ── chrome.scripting (in Foxglove's world of the page: DOM access, no chrome.* there) ──
+    def _world(self, ext_id: str) -> int:
+        """The extension's own isolated world in pages: its injected code can't reach Foxglove's (or another extension's)."""
+        if ext_id not in self._worlds:
+            self._worlds[ext_id] = FIRST_EXTENSION_WORLD + len(self._worlds)
+        return self._worlds[ext_id]
+
+    def api_scripting_executeScript(self, ext_id: str, a: dict, ctx: dict):
+        tab = self._script_tab(ext_id, a.get("target"))
+        world = 0 if a.get("world") == "MAIN" else self._world(ext_id)
+        key = None
+        if isinstance(a.get("func"), str) and a["func"].strip():
+            key = "__fg" + secrets.token_hex(6)
+            code = (f"(() => {{ try {{ const r = ({a['func']})(...{json.dumps(a.get('args') or [], default=str)});"
+                    f" if (r && typeof r.then === 'function') {{ window.{key} = null; r.then((v) => {{ window.{key} = {{v}}; }},"
+                    f" (e) => {{ window.{key} = {{e: String((e && e.message) || e)}}; }}); return {{p: 1}}; }}"
+                    f" return {{v: r}}; }} catch (e) {{ return {{e: String((e && e.message) || e)}}; }} }})()")
+        else:
+            code = self._files(ext_id, a.get("files"))
+
+        def later(reply) -> None:
+            page, deadline = tab.page, time.monotonic() + 30
+
+            def answer(value) -> None:
+                reply([{"frameId": 0, "documentId": "", "result": value}])
+
+            def settled(result) -> None:  # a promise the function returned
+                if isinstance(result, dict) and "e" in result:
+                    reply(error=result["e"])
+                elif isinstance(result, dict) or time.monotonic() > deadline or sip.isdeleted(page):
+                    answer(result.get("v") if isinstance(result, dict) else None)
+                else:
+                    QTimer.singleShot(50, lambda: page.runJavaScript(f"window.{key}", world, settled) if not sip.isdeleted(page) else answer(None))
+
+            def ran(result) -> None:
+                if key is None:
+                    answer(result)
+                elif isinstance(result, dict) and "e" in result:
+                    reply(error=result["e"])
+                elif isinstance(result, dict) and result.get("p"):
+                    settled(None)
+                else:
+                    answer(result.get("v") if isinstance(result, dict) else None)
+            page.runJavaScript(code, world, ran)
+        return later
+
+    def _css(self, ext_id: str, a: dict, remove: bool):
+        tab = self._script_tab(ext_id, a.get("target"))
+        css = a["css"] if isinstance(a.get("css"), str) else self._files(ext_id, a.get("files"))
+        key = hashlib.sha256(f"{ext_id}\0{css}".encode()).hexdigest()[:16]
+        # A constructed style sheet: the page's CSP (style-src) doesn't apply to it, as it doesn't to Chrome's insertCSS.
+        # Kept in the extension's own world, so only it can find the sheet again.
+        tab.page.runJavaScript(
+            f"(() => {{ const m = window.__foxgloveCss || (window.__foxgloveCss = new Map()), s = m.get('{key}');"
+            " if (s) { m.delete('" + key + "'); document.adoptedStyleSheets = document.adoptedStyleSheets.filter((x) => x !== s); } })()"
+            if remove else
+            f"(() => {{ const m = window.__foxgloveCss || (window.__foxgloveCss = new Map()); if (m.has('{key}')) return;"
+            f" const s = new CSSStyleSheet(); s.replaceSync({json.dumps(css)}); m.set('{key}', s);"
+            " document.adoptedStyleSheets = [...document.adoptedStyleSheets, s]; })()", self._world(ext_id))
+        return None
+
+    def api_scripting_insertCSS(self, ext_id: str, a: dict, ctx: dict):
+        return self._css(ext_id, a, remove=False)
+
+    def api_scripting_removeCSS(self, ext_id: str, a: dict, ctx: dict):
+        return self._css(ext_id, a, remove=True)
+
+    # ── chrome.scripting content scripts: Qt reads content scripts from the manifest when it loads an extension, so
+    #    registered ones are written there and run from the extension's next start on (getRegistered... at once) ──
+    RUN_AT = ("document_start", "document_end", "document_idle")
+
+    def _registered(self, ext_id: str) -> list[dict]:
+        state = self.c.registry.setdefault(ext_id, {})
+        if not isinstance(state.get("scripts"), list):
+            state["scripts"] = []
+        return state["scripts"]
+
+    def _script_entry(self, ext_id: str, raw, old: dict | None = None) -> dict:
+        if not isinstance(raw, dict) or not isinstance(raw.get("id"), str) or not raw["id"]:
+            raise ApiError("Each content script needs an 'id'.")
+        sid = raw["id"]
+        if sid.startswith("_"):
+            raise ApiError(f"Script's ID '{sid}' must not start with '_'.")
+        entry = dict(old or {"id": sid, "allFrames": False, "runAt": "document_idle", "persistAcrossSessions": True,
+                             "matchOriginAsFallback": False, "world": "ISOLATED"})
+        for key in ("matches", "excludeMatches", "js", "css"):
+            if key in raw and raw[key] is not None:
+                if not isinstance(raw[key], list) or not all(isinstance(v, str) for v in raw[key]):
+                    raise ApiError(f"Script with ID '{sid}' has an invalid '{key}'.")
+                entry[key] = list(raw[key])
+        for key in ("allFrames", "persistAcrossSessions", "matchOriginAsFallback"):
+            if key in raw and raw[key] is not None:
+                entry[key] = bool(raw[key])
+        if raw.get("runAt") is not None:
+            if raw["runAt"] not in self.RUN_AT:
+                raise ApiError(f"Script with ID '{sid}' has an invalid 'runAt'.")
+            entry["runAt"] = raw["runAt"]
+        if raw.get("world") is not None:
+            if raw["world"] not in ("ISOLATED", "MAIN"):
+                raise ApiError(f"Script with ID '{sid}' has an invalid 'world'.")
+            entry["world"] = raw["world"]
+        if not entry.get("matches"):
+            raise ApiError(f"Script with ID '{sid}' must specify 'matches'.")
+        for pattern in entry.get("matches", []) + entry.get("excludeMatches", []):
+            if not valid_match_pattern(pattern):  # Qt would refuse to load the whole extension
+                raise ApiError(f"Script with ID '{sid}' has an invalid match pattern: '{pattern}'.")
+        if not entry.get("js") and not entry.get("css"):
+            raise ApiError(f"Script with ID '{sid}' must specify at least one 'css' or 'js' file.")
+        info = self.c._info(ext_id)
+        root = Path(info.path()).resolve() if info is not None else None
+        for kind, names in (("javascript", entry.get("js", [])), ("css", entry.get("css", []))):
+            for name in names:
+                target = (root / name.lstrip("/")).resolve() if root is not None and name.strip("/") else None
+                if target is None or root not in target.parents or not target.is_file():
+                    raise ApiError(f"Could not load {kind} '{name}' for script.")
+        return entry
+
+    def _scripts_changed(self, ext_id: str) -> None:
+        self.c.save()
+        self.c.sync_registered(ext_id)
+
+    def api_scripting_register(self, ext_id: str, a: dict, ctx: dict):
+        scripts, have = self._registered(ext_id), {s.get("id") for s in self._registered(ext_id)}
+        new = [self._script_entry(ext_id, raw) for raw in (a.get("scripts") if isinstance(a.get("scripts"), list) else [])]
+        for entry in new:
+            if entry["id"] in have:
+                raise ApiError(f"Duplicate script ID '{entry['id']}'.")
+            have.add(entry["id"])
+        scripts.extend(new)
+        self._scripts_changed(ext_id)
+        return None
+
+    def api_scripting_update(self, ext_id: str, a: dict, ctx: dict):
+        scripts = self._registered(ext_id)
+        index = {s.get("id"): i for i, s in enumerate(scripts)}
+        updated = {}
+        for raw in a.get("scripts") if isinstance(a.get("scripts"), list) else []:
+            sid = raw.get("id") if isinstance(raw, dict) else None
+            if sid not in index:
+                raise ApiError(f"Script with ID '{sid}' does not exist or is not fully registered.")
+            updated[index[sid]] = self._script_entry(ext_id, raw, scripts[index[sid]])
+        for i, entry in updated.items():
+            scripts[i] = entry
+        self._scripts_changed(ext_id)
+        return None
+
+    def api_scripting_registered(self, ext_id: str, a: dict, ctx: dict):
+        ids = (a.get("filter") or {}).get("ids") if isinstance(a.get("filter"), dict) else None
+        return [dict(s) for s in self._registered(ext_id) if not isinstance(ids, list) or s.get("id") in ids]
+
+    def api_scripting_unregister(self, ext_id: str, a: dict, ctx: dict):
+        scripts = self._registered(ext_id)
+        ids = (a.get("filter") or {}).get("ids") if isinstance(a.get("filter"), dict) else None
+        if isinstance(ids, list):
+            missing = [i for i in ids if i not in {s.get("id") for s in scripts}]
+            if missing:
+                raise ApiError(f"Nonexistent script ID '{missing[0]}'.")
+        scripts[:] = [s for s in scripts if isinstance(ids, list) and s.get("id") not in ids]
+        self._scripts_changed(ext_id)
+        return None
+
+    def registered_scripts(self, ext_id: str) -> list[dict]:
+        """The registered content scripts in manifest form, kept to the hosts the extension may reach."""
+        out = []
+        for entry in self._registered(ext_id) if ext_id in self.c.registry else []:
+            matches = [p for p in _strings(entry.get("matches")) if self.covers(ext_id, p)]
+            if matches:
+                out += registered_as_manifest([{**entry, "matches": matches}])
+        return out
+
+    # ── chrome.webNavigation (frames: Foxglove only knows each tab's top frame) / fontSettings ──
+    def _frame(self, tab) -> dict:
+        return {"frameId": 0, "parentFrameId": -1, "processId": 0, "url": tab.url().toString(), "errorOccurred": False,
+                "documentId": "", "documentLifecycle": "active", "frameType": "outermost_frame"}
+
+    def api_webNavigation_getAllFrames(self, ext_id: str, a: dict, ctx: dict):
+        try:
+            return [self._frame(self._tab(a.get("tabId")))]
+        except ApiError:
+            return None
+
+    def api_webNavigation_getFrame(self, ext_id: str, a: dict, ctx: dict):
+        try:
+            tab = self._tab(a.get("tabId"))
+        except ApiError:
+            return None
+        return self._frame(tab) if a.get("frameId") in (0, None) else None
+
+    def api_fontSettings_getFontList(self, ext_id: str, a: dict, ctx: dict):
+        return [{"fontId": f, "displayName": f} for f in sorted(set(QFontDatabase.families()), key=str.lower)]
+
+    # ── chrome.cookies, on the profile's cookie store (Foxglove keeps a copy current: the store has no lookup) ──
+    @staticmethod
+    def _cookie_key(cookie: QNetworkCookie) -> tuple:
+        return bytes(cookie.name()).decode("utf-8", "replace"), cookie.domain().lower(), cookie.path() or "/"
+
+    @staticmethod
+    def _cookie_info(cookie: QNetworkCookie) -> dict:
+        same = {QNetworkCookie.SameSite.None_: "no_restriction", QNetworkCookie.SameSite.Lax: "lax",
+                QNetworkCookie.SameSite.Strict: "strict"}.get(cookie.sameSitePolicy(), "unspecified")
+        info = {"name": bytes(cookie.name()).decode("utf-8", "replace"), "value": bytes(cookie.value()).decode("utf-8", "replace"),
+                "domain": cookie.domain(), "hostOnly": not cookie.domain().startswith("."), "path": cookie.path() or "/",
+                "secure": cookie.isSecure(), "httpOnly": cookie.isHttpOnly(), "sameSite": same,
+                "session": cookie.isSessionCookie(), "storeId": "0"}
+        if not cookie.isSessionCookie():
+            info["expirationDate"] = cookie.expirationDate().toMSecsSinceEpoch() / 1000
+        return info
+
+    @staticmethod
+    def _cookie_applies(cookie: dict, url: QUrl) -> bool:
+        host, domain, path = url.host().lower(), cookie["domain"].lower(), url.path() or "/"
+        if cookie["hostOnly"] and host != domain.lstrip("."):
+            return False
+        if not cookie["hostOnly"] and not (host == domain[1:] or host.endswith(domain)):
+            return False
+        if cookie["secure"] and url.scheme() not in ("https", "wss"):
+            return False
+        return path == cookie["path"] or path.startswith(cookie["path"].rstrip("/") + "/") or cookie["path"] == "/"
+
+    def _cookie_url(self, ext_id: str, raw) -> QUrl:
+        url = QUrl(str(raw or ""))
+        if url.scheme() not in ("http", "https") or not url.host():
+            raise ApiError(f"Invalid url: \"{raw}\".")
+        if not self.can_access(ext_id, url.toString()):
+            raise ApiError(f"No host permissions for cookies at url: \"{raw}\".")
+        return url
+
+    def _cookie_visible(self, ext_id: str, cookie: dict) -> bool:
+        host = cookie["domain"].lstrip(".")
+        return any(self.can_access(ext_id, f"{scheme}://{host}{cookie['path']}") for scheme in ("https", "http"))
+
+    def api_cookies_get(self, ext_id: str, a: dict, ctx: dict):
+        url = self._cookie_url(ext_id, a.get("url"))
+        found = [c for c in map(self._cookie_info, self._cookies.values()) if c["name"] == a.get("name") and self._cookie_applies(c, url)]
+        return max(found, key=lambda c: len(c["path"])) if found else None
+
+    def api_cookies_getAll(self, ext_id: str, a: dict, ctx: dict):
+        url = self._cookie_url(ext_id, a["url"]) if a.get("url") else None
+        domain = str(a.get("domain") or "").lower().lstrip(".")
+        out = []
+        for c in map(self._cookie_info, self._cookies.values()):
+            host = c["domain"].lower().lstrip(".")
+            if ((url is not None and not self._cookie_applies(c, url)) or (domain and host != domain and not host.endswith("." + domain))
+                    or any(a.get(k) is not None and c[k] != a[k] for k in ("name", "path", "secure", "session"))
+                    or not self._cookie_visible(ext_id, c)):
+                continue
+            out.append(c)
+        return out
+
+    def api_cookies_getAllCookieStores(self, ext_id: str, a: dict, ctx: dict):
+        return [{"id": "0", "tabIds": [t.tab_id for t in self.tabs()]}]
+
+    def api_cookies_set(self, ext_id: str, a: dict, ctx: dict):
+        url = self._cookie_url(ext_id, a.get("url"))
+        cookie = QNetworkCookie(str(a.get("name") or "").encode(), str(a.get("value") or "").encode())
+        if a.get("domain"):
+            cookie.setDomain("." + str(a["domain"]).lstrip("."))
+        cookie.setPath(str(a.get("path") or url.path() or "/"))
+        cookie.setSecure(bool(a.get("secure")))
+        cookie.setHttpOnly(bool(a.get("httpOnly")))
+        same = {"no_restriction": QNetworkCookie.SameSite.None_, "lax": QNetworkCookie.SameSite.Lax,
+                "strict": QNetworkCookie.SameSite.Strict}.get(a.get("sameSite"))
+        if same is not None:
+            cookie.setSameSitePolicy(same)
+        if isinstance(a.get("expirationDate"), (int, float)) and not isinstance(a.get("expirationDate"), bool):
+            cookie.setExpirationDate(QDateTime.fromMSecsSinceEpoch(int(a["expirationDate"] * 1000)))
+        key = self._cookie_key(cookie) if a.get("domain") else (self._cookie_key(cookie)[0], url.host().lower(), cookie.path())
+
+        def later(reply) -> None:
+            timer = QTimer(self)
+            timer.setSingleShot(True)
+            waiter = [reply, timer]
+            self._cookie_waiters.setdefault(key, []).append(waiter)
+
+            def gave_up() -> None:
+                if waiter in self._cookie_waiters.get(key, []):
+                    self._cookie_waiters[key].remove(waiter)
+                    reply(error=f"Failed to parse or set cookie named \"{key[0]}\".")
+            timer.timeout.connect(gave_up)
+            timer.start(3000)
+            self.c.profile.cookieStore().setCookie(cookie, url)
+        return later
+
+    def api_cookies_remove(self, ext_id: str, a: dict, ctx: dict):
+        url = self._cookie_url(ext_id, a.get("url"))
+        for key, cookie in list(self._cookies.items()):
+            if key[0] == a.get("name") and self._cookie_applies(self._cookie_info(cookie), url):
+                self.c.profile.cookieStore().deleteCookie(cookie, url)
+        return {"url": url.toString(), "name": str(a.get("name") or ""), "storeId": "0"}
+
+    def _cookie_added(self, cookie) -> None:
+        cookie = QNetworkCookie(cookie)
+        key = self._cookie_key(cookie)
+        self._cookies[key] = cookie
+        replaced = self._removed.pop(key, None)
+        if replaced is not None:
+            self._cookie_event(replaced, True, "overwrite")
+        self._cookie_event(cookie, False, "explicit")
+        for reply, timer in self._cookie_waiters.pop(key, []):
+            timer.stop()
+            reply(self._cookie_info(cookie))
+
+    def _cookie_removed(self, cookie) -> None:
+        cookie = QNetworkCookie(cookie)
+        key = self._cookie_key(cookie)
+        self._cookies.pop(key, None)
+        self._removed[key] = cookie  # an overwrite comes back at once (removed, then added)
+
+        def settle() -> None:
+            if not sip.isdeleted(self) and self._removed.get(key) is cookie:
+                del self._removed[key]
+                expired = not cookie.isSessionCookie() and cookie.expirationDate() <= QDateTime.currentDateTime()
+                self._cookie_event(cookie, True, "expired" if expired else "explicit")
+        QTimer.singleShot(50, settle)
+
+    def _cookie_event(self, cookie: QNetworkCookie, removed: bool, cause: str) -> None:
+        if not self._cookies_ready:
+            return
+        info = self._cookie_info(cookie)
+        for ext_id in self.listeners("cookies.onChanged"):
+            if self.has_permission(ext_id, "cookies") and self._cookie_visible(ext_id, info):
+                self.emit(ext_id, "cookies.onChanged", [{"removed": removed, "cookie": info, "cause": cause}])
+
+    # ── chrome.runtime / sidePanel ──────────────────────────────────────────────────────
+    def open_extension_page(self, ext_id: str, url: QUrl) -> None:
+        win = self._win()
+        tab = next((t for t in win.tabs() if t.url() == url), None)
+        if tab is not None:
+            win.tab_bar.setCurrentIndex(win.index_of(tab))
+        else:
+            win.open_url(url, "tab")
+        win.close_extension_popups()
+
+    def api_runtime_openOptionsPage(self, ext_id: str, a: dict, ctx: dict):
+        entry = self.c.entry(ext_id)
+        if entry is None or entry.options_url.isEmpty():
+            raise ApiError("Could not create an options page.")
+        self.open_extension_page(ext_id, entry.options_url)
+        return None
+
+    def api_sidePanel_open(self, ext_id: str, a: dict, ctx: dict):
+        path = a.get("path")
+        if not isinstance(path, str) or not path.strip("/"):
+            raise ApiError("No side panel is set for the extension.")
+        self.open_extension_page(ext_id, QUrl(f"chrome-extension://{ext_id}/{path.lstrip('/')}"))  # no side panels: a tab
+        return None
+
+    # ── chrome.offscreen (a hidden page; Qt's own crashes the browser) ──────────────────
+    def api_offscreen_createDocument(self, ext_id: str, a: dict, ctx: dict):
+        if ext_id in self._offscreen:
+            raise ApiError("Only a single offscreen document may be created.")
+        url = QUrl(str(a.get("url") or ""))
+        if url.scheme() != "chrome-extension" or url.host() != ext_id:
+            raise ApiError("The offscreen document must be a page of the extension.")
+        page = self._offscreen[ext_id] = WebPage(self.c.profile, self)
+
+        def later(reply) -> None:
+            def loaded(ok: bool) -> None:
+                if page.property("foxglove-loaded"):
+                    return
+                page.setProperty("foxglove-loaded", True)
+                reply() if ok else reply(error="The offscreen document couldn't be loaded.")
+            page.loadFinished.connect(loaded)
+            page.load(url)
+        return later
+
+    def api_offscreen_closeDocument(self, ext_id: str, a: dict, ctx: dict):
+        page = self._offscreen.pop(ext_id, None)
+        if page is None:
+            raise ApiError("No current offscreen document.")
+        page.deleteLater()
+        return None
+
+    def api_offscreen_hasDocument(self, ext_id: str, a: dict, ctx: dict):
+        page = self._offscreen.get(ext_id)
+        return page.url().toString() or page.requestedUrl().toString() if page is not None else ""
+
+    # ── chrome.declarativeNetRequest: kept here, enforced by NetRules ──────────────────
+    def _rules(self, ext_id: str, kind: str) -> list:
+        if kind == "session":
+            return self._session_rules.setdefault(ext_id, [])
+        state = self.c.registry.setdefault(ext_id, {})
+        if not isinstance(state.get("dnr"), list):
+            state["dnr"] = []
+        return state["dnr"]
+
+    def api_dnr_update(self, ext_id: str, a: dict, ctx: dict):
+        rules = self._rules(ext_id, a.get("kind"))
+        doomed = set(a.get("removeRuleIds") or [])
+        kept = [r for r in rules if r.get("id") not in doomed]
+        ids = {r.get("id") for r in kept}
+        for rule in a.get("addRules") or []:
+            if not isinstance(rule, dict) or not isinstance(rule.get("id"), int) or rule["id"] < 1:
+                raise ApiError("Rules need a positive integer id.")
+            if rule["id"] in ids:
+                raise ApiError(f"Rule with id {rule['id']} does not have a unique ID.")
+            ids.add(rule["id"])
+            kept.append(rule)
+        rules[:] = kept
+        if a.get("kind") != "session":
+            self.c.save()
+        self.c.net.invalidate()
+        return None
+
+    def api_dnr_get(self, ext_id: str, a: dict, ctx: dict):
+        wanted = a.get("ruleIds")
+        return [r for r in self._rules(ext_id, a.get("kind")) if not isinstance(wanted, list) or r.get("id") in wanted]
+
+    def api_dnr_rulesets(self, ext_id: str, a: dict, ctx: dict):
+        manifest = self._manifest(ext_id)
+        dnr = manifest.get("declarative_net_request")
+        known = [r.get("id") for r in dnr.get("rule_resources") or [] if isinstance(r, dict)] if isinstance(dnr, dict) else []
+        enabled = list(self.c.net.enabled_rulesets(ext_id, manifest))
+        if "enableRulesetIds" not in a and "disableRulesetIds" not in a:
+            return enabled
+        for rid in _strings(a.get("enableRulesetIds")) + _strings(a.get("disableRulesetIds")):
+            if rid not in known:
+                raise ApiError(f"Invalid ruleset id: {rid}.")
+        off = set(_strings(a.get("disableRulesetIds")))
+        self.c.registry.setdefault(ext_id, {})["rulesets"] = [r for r in dict.fromkeys(enabled + _strings(a.get("enableRulesetIds"))) if r not in off]
+        self.c.save()
+        self.c.net.invalidate()
+        return None
+
+    # ── chrome.permissions ──────────────────────────────────────────────────────────────
+    def api_permissions_getAll(self, ext_id: str, a: dict, ctx: dict):
+        m, granted = self._manifest(ext_id), self._granted(ext_id)
+        perms = [p for p in _strings(m.get("permissions")) if "://" not in p and p != "<all_urls>"]
+        return {"permissions": list(dict.fromkeys(perms + _strings(granted.get("permissions")))),
+                "origins": list(dict.fromkeys(_strings(m.get("host_permissions")) + _strings(granted.get("origins"))))}
+
+    def _covered(self, ext_id: str, origin: str) -> bool:
+        hosts = self._hosts(ext_id)
+        sample = re.sub(r"\*\.", "", origin).replace("*", "x")
+        return origin in hosts or any(match_pattern(h, sample) for h in hosts)
+
+    def api_permissions_contains(self, ext_id: str, a: dict, ctx: dict):
+        return (all(self.has_permission(ext_id, p) for p in _strings(a.get("permissions")))
+                and all(self._covered(ext_id, o) for o in _strings(a.get("origins"))))
+
+    def api_permissions_request(self, ext_id: str, a: dict, ctx: dict):
+        m = self._manifest(ext_id)
+        optional = _strings(m.get("optional_permissions")) + _strings(m.get("optional_host_permissions"))
+        perms = [p for p in _strings(a.get("permissions")) if not self.has_permission(ext_id, p)]
+        origins = [o for o in _strings(a.get("origins")) if not self._covered(ext_id, o)]
+        if any(p not in optional for p in perms) or any(o not in optional and not any(match_pattern(x, re.sub(r"\*\.", "", o).replace("*", "x"))
+                                                                                       for x in optional if "://" in x or x == "<all_urls>")
+                                                        for o in origins):
+            raise ApiError("Only permissions specified in the manifest may be requested.")
+        if not perms and not origins:
+            return True
+        if ext_id in self._asking:  # one question at a time - and none for a while after a "no" (no dialog loops)
+            raise ApiError("A permission request is already in progress.")
+        if time.monotonic() < self._refused.get(ext_id, 0):
+            return False
+        win = self.c.window
+        self._asking.add(ext_id)
+
+        def later(reply) -> None:
+            def ask() -> None:
+                name = (self.c.entry(ext_id).name if self.c.entry(ext_id) else "The extension")
+                try:
+                    allowed = win is not None and not sip.isdeleted(win) and ask_question(
+                        win, "Extension Permissions", f"“{name}” asks for more access:\n\n" + "\n".join(perms + origins), "Allow")
+                finally:
+                    self._asking.discard(ext_id)
+                if allowed:
+                    granted = self.c.registry.setdefault(ext_id, {}).setdefault("granted", {})
+                    granted["permissions"] = list(dict.fromkeys(_strings(granted.get("permissions")) + perms))
+                    granted["origins"] = list(dict.fromkeys(_strings(granted.get("origins")) + origins))
+                    self.c.save()
+                    self.c.net.invalidate()
+                    self.emit(ext_id, "permissions.onAdded", [{"permissions": perms, "origins": origins}])
+                else:
+                    self._refused[ext_id] = time.monotonic() + self.REFUSED_PAUSE
+                reply(bool(allowed))
+            QTimer.singleShot(0, ask)
+        return later
+
+    def api_permissions_remove(self, ext_id: str, a: dict, ctx: dict):
+        granted = self._granted(ext_id)
+        perms, origins = _strings(a.get("permissions")), _strings(a.get("origins"))
+        granted["permissions"] = [p for p in _strings(granted.get("permissions")) if p not in perms]
+        granted["origins"] = [o for o in _strings(granted.get("origins")) if o not in origins]
+        if granted:
+            self.c.registry.setdefault(ext_id, {})["granted"] = granted
+            self.c.save()
+            self.c.net.invalidate()
+        return True
+
+    # ── chrome.downloads ────────────────────────────────────────────────────────────────
+    def api_downloads_download(self, ext_id: str, a: dict, ctx: dict):
+        url = QUrl(str(a.get("url") or ""))
+        if not url.isValid() or url.scheme() in ("", "javascript"):
+            raise ApiError("Invalid URL.")
+        filename = Path(str(a.get("filename") or "")).name
+        own = url.scheme() in ("blob", "chrome-extension") and f"chrome-extension://{ext_id}" in url.toString()
+        win = self.c.window
+        tab = win.current_tab() if win is not None and not own else None
+        if tab is not None and tab.pending is None:
+            tab.page.download(url, filename)
+        else:  # the extension's own (blob) data: download it from a page of the extension
+            page = WebPage(self.c.profile, self)
+            page.load(QUrl(f"chrome-extension://{ext_id}/{SHIM_BRIDGE}"))
+            page.loadFinished.connect(lambda _ok: page.download(url, filename))
+            QTimer.singleShot(60_000, page.deleteLater)
+        return next(self._downloads)
+
+
+# ══════════════════════════════════════════════════════════════════════════════════════════
+#  chrome.declarativeNetRequest, enforced: Qt keeps an extension's rules but never applies them
+# ══════════════════════════════════════════════════════════════════════════════════════════
+DNR_ACTIONS = ("allow", "allowAllRequests", "block", "upgradeScheme", "redirect")  # at equal priority the first one wins
+DNR_TYPES = frozenset(("main_frame", "sub_frame", "stylesheet", "script", "image", "font", "object", "xmlhttprequest", "ping",
+                       "csp_report", "media", "websocket", "webtransport", "webbundle", "other"))
+_RT = QWebEngineUrlRequestInfo.ResourceType
+DNR_TYPE_OF = {getattr(_RT, "ResourceType" + qt): dnr for qt, dnr in (
+    ("MainFrame", "main_frame"), ("NavigationPreloadMainFrame", "main_frame"), ("SubFrame", "sub_frame"),
+    ("NavigationPreloadSubFrame", "sub_frame"), ("Stylesheet", "stylesheet"), ("Script", "script"), ("Worker", "script"),
+    ("SharedWorker", "script"), ("ServiceWorker", "script"), ("Image", "image"), ("Favicon", "image"), ("FontResource", "font"),
+    ("Object", "object"), ("PluginResource", "object"), ("Media", "media"), ("Xhr", "xmlhttprequest"), ("Ping", "ping"),
+    ("CspReport", "csp_report"), ("WebSocket", "websocket")) if hasattr(_RT, "ResourceType" + qt)}
+_SECOND_LEVEL = {"co", "com", "net", "org", "gov", "edu", "ac", "or", "ne", "go", "gob", "mil"}
+_COMMON_WORDS = {"http", "https", "www", "com"}  # in nearly every URL: no use for finding rules
+
+
+def _site(host: str) -> str:
+    """Roughly the registrable domain ("news.bbc.co.uk" -> "bbc.co.uk"): first or third party."""
+    labels = host.split(".")
+    if len(labels) < 3 or re.fullmatch(r"[\d.]+|\[.*\]", host):
+        return host
+    return ".".join(labels[-3:] if len(labels[-1]) == 2 and labels[-2] in _SECOND_LEVEL else labels[-2:])
+
+
+def _suffixes(host: str) -> list[str]:
+    """"a.b.com" -> ["a.b.com", "b.com", "com"]: what a rule's domain list is checked against."""
+    labels = host.split(".") if host else []
+    return [".".join(labels[i:]) for i in range(len(labels))]
+
+
+def url_filter_regex(text: str, case: bool = False) -> re.Pattern:
+    """A declarativeNetRequest urlFilter ("||ads.example^", "|https://*/x.js|") as a regular expression."""
+    out = []
+    if text.startswith("||"):
+        out.append(r"^[a-z][a-z0-9+.-]*://(?:[^/?#@]*@)?(?:[^/?#]*\.)?")  # where a domain name starts
+        text = text[2:]
+    elif text.startswith("|"):
+        out.append("^")
+        text = text[1:]
+    end = text.endswith("|")
+    for ch in text[:-1] if end else text:
+        out.append(".*" if ch == "*" else r"(?:[^A-Za-z0-9_\-.%]|$)" if ch == "^" else re.escape(ch))
+    return re.compile("".join(out) + ("$" if end else ""), 0 if case else re.I)
+
+
+def _filter_keys(text: str) -> list[str]:
+    """Where a urlFilter rule is filed: the domain of "||domain^", else its longest whole word (one a URL splits out
+    as it is - not cut by a "*" or an open end)."""
+    low = text.lower()
+    m = re.match(r"\|\|([a-z0-9-]+(?:\.[a-z0-9-]+)+)(?:[\^/:]|\|$)", low)
+    if m:
+        return ["d:" + m.group(1)]
+    start, end = low.startswith("|"), low.endswith("|")
+    pieces, best = low.lstrip("|")[:-1 if end else None].split("*"), ""
+    for i, piece in enumerate(pieces):
+        for w in re.finditer(r"[a-z0-9]+", piece):
+            whole = (w.start() > 0 or (i == 0 and start)) and (w.end() < len(piece) or (i == len(pieces) - 1 and end))
+            if whole and len(w.group()) > len(best) and w.group() not in _COMMON_WORDS:
+                best = w.group()
+    return ["t:" + best] if best else []
+
+
+class NetRule:
+    """One declarativeNetRequest rule, ready to test against requests (its pattern compiles on first use)."""
+    __slots__ = ("id", "ruleset", "priority", "kind", "rank", "action", "text", "is_regex", "case", "regex", "types",
+                 "domains", "not_domains", "initiators", "not_initiators", "methods", "not_methods", "party", "tabs",
+                 "not_tabs", "keys")
+
+    def __init__(self, raw: dict, ruleset: str):
+        cond, action = raw.get("condition"), raw.get("action")
+        if not isinstance(cond, dict) or not isinstance(action, dict) or not isinstance(raw.get("id"), int):
+            raise ValueError("not a rule")
+        if cond.get("responseHeaders") or cond.get("excludedResponseHeaders"):
+            raise ValueError("matches responses")  # decided once the response is in: not something Qt lets us see
+        self.kind = action.get("type")
+        if self.kind not in DNR_ACTIONS and self.kind != "modifyHeaders":
+            raise ValueError("unknown action")
+        if self.kind == "modifyHeaders" and not action.get("requestHeaders"):
+            raise ValueError("response headers only")  # Qt can't change those
+        self.id, self.ruleset, self.action = raw["id"], ruleset, action
+        self.priority = raw.get("priority") if isinstance(raw.get("priority"), int) else 1
+        self.rank = DNR_ACTIONS.index(self.kind) if self.kind in DNR_ACTIONS else len(DNR_ACTIONS)
+        value = lambda key, alias=None: cond.get(key, cond.get(alias) if alias else None)  # "domains": the old name
+        words = lambda key, alias=None: frozenset(s.lower() for s in _strings(value(key, alias)))
+        listed = lambda key, alias=None: words(key, alias) if isinstance(value(key, alias), list) else None
+        self.text = cond.get("regexFilter") if isinstance(cond.get("regexFilter"), str) else cond.get("urlFilter")
+        self.text = self.text if isinstance(self.text, str) and self.text else ""
+        self.is_regex, self.regex = isinstance(cond.get("regexFilter"), str), None
+        self.case = cond.get("isUrlFilterCaseSensitive") is True
+        types, excluded = listed("resourceTypes"), listed("excludedResourceTypes")
+        self.types = types if types else DNR_TYPES - (excluded if excluded is not None else {"main_frame"})
+        if self.kind == "allowAllRequests":
+            self.types &= {"main_frame", "sub_frame"}
+        self.domains, self.not_domains = listed("requestDomains"), words("excludedRequestDomains")
+        self.initiators = listed("initiatorDomains", "domains")
+        self.not_initiators = words("excludedInitiatorDomains", "excludedDomains")
+        self.methods, self.not_methods = listed("requestMethods"), words("excludedRequestMethods")
+        self.party = cond.get("domainType") if cond.get("domainType") in ("firstParty", "thirdParty") else None
+        ids = lambda key: frozenset(v for v in cond.get(key) if isinstance(v, int)) if isinstance(cond.get(key), list) else None
+        self.tabs, self.not_tabs = ids("tabIds"), ids("excludedTabIds") or frozenset()
+        self.keys = (["d:" + d for d in self.domains] if self.domains else
+                     (_filter_keys(self.text) if self.text and not self.is_regex else []) or
+                     (["i:" + d for d in self.initiators] if self.initiators else []))
+
+    def matches(self, req: "NetRequest") -> bool | None:
+        """None: it depends on the tab, which this request doesn't know."""
+        if req.type not in self.types or (self.domains is not None and self.domains.isdisjoint(req.hosts)):
+            return False
+        if self.not_domains and not self.not_domains.isdisjoint(req.hosts):
+            return False
+        if (self.methods is not None and req.method not in self.methods) or req.method in self.not_methods:
+            return False
+        if self.initiators is not None and self.initiators.isdisjoint(req.initiators):
+            return False
+        if (self.not_initiators and not self.not_initiators.isdisjoint(req.initiators)) or (self.party and (self.party == "thirdParty") != req.third):
+            return False
+        if self.text:
+            if self.regex is None:
+                try:
+                    self.regex = (re.compile(self.text, 0 if self.case else re.I) if self.is_regex
+                                  else url_filter_regex(self.text, self.case))
+                except re.error:
+                    self.text, self.types = "", frozenset()  # Chrome refuses such a rule when it loads
+                    return False
+            if not self.regex.search(req.url):
+                return False
+        if self.tabs is None and not self.not_tabs:
+            return True
+        if req.tab is None:
+            return None
+        return (self.tabs is None or req.tab in self.tabs) and req.tab not in self.not_tabs
+
+
+class RuleIndex:
+    """A rule set filed by domain, word and initiator, so a request is only tested against rules that might match."""
+
+    def __init__(self, raw_rules, ruleset: str):
+        self.keyed: dict[str, list[NetRule]] = {}
+        self.generic: list[NetRule] = []
+        self.tabbed = self.allow_all = False
+        for raw in raw_rules if isinstance(raw_rules, list) else []:
+            try:
+                rule = NetRule(raw, ruleset)
+            except (ValueError, TypeError, AttributeError):
+                continue
+            self.tabbed = self.tabbed or rule.tabs is not None or bool(rule.not_tabs)
+            self.allow_all = self.allow_all or rule.kind == "allowAllRequests"
+            for key in rule.keys:
+                self.keyed.setdefault(key, []).append(rule)
+            if not rule.keys:
+                self.generic.append(rule)
+
+    def candidates(self, keys: list[str]):
+        yield from self.generic
+        for key in keys:
+            yield from self.keyed.get(key, ())
+
+
+@dataclass
+class NetRequest:
+    url: str                 # without the fragment, percent-encoded
+    type: str                # declarativeNetRequest's resource type
+    method: str
+    hosts: list[str]         # the host and the domains above it
+    initiators: list[str]    # the same for the initiator ([] if none)
+    third: bool
+    tab: int | None          # None: not known here
+    keys: list[str] = dc_field(default_factory=list)
+
+
+@dataclass
+class NetExtension:
+    id: str
+    indexes: list
+    hosts: list[str]         # host permissions: redirects and header changes need them
+    needs_hosts: bool        # declarativeNetRequestWithHostAccess only: every action needs them
+
+    def may(self, url: str) -> bool:
+        return any(match_pattern(h, url) for h in self.hosts)
+
+
+class NetFilter(QWebEngineUrlRequestInterceptor):
+    """Qt asks the profile's filter (tab_id None) about every request, then - unless it was blocked or redirected -
+    the filter of the tab it belongs to."""
+
+    def __init__(self, rules: "NetRules", tab_id: int | None = None, parent: QObject | None = None):
+        super().__init__(parent)
+        self.rules, self.tab_id = rules, tab_id
+
+    def interceptRequest(self, info) -> None:
+        try:
+            self.rules.apply(info, self.tab_id)
+        except Exception as exc:  # a rule must never take a request (or the browser) down
+            log(f"Request filter error: {exc!r}")
+
+
+class NetRules:
+    """Applies the enabled extensions' declarativeNetRequest rules - their rule sets, dynamic and session rules - to
+    every request: block, allow, allowAllRequests, redirect, upgradeScheme and request-header changes. Response
+    headers can't be changed from here, and allowAllRequests counts for the top page of a tab, not each frame."""
+
+    def __init__(self, controller: "ExtensionsController"):
+        self.c = controller
+        self._exts: list[NetExtension] | None = None
+        self._static: dict[str, tuple[float, RuleIndex]] = {}  # rule set file -> (mtime, index)
+        self._documents: dict[tuple[str, str], int | None] = {}  # (ext id, page URL) -> its allowAllRequests priority
+        self._deferred = None    # the request the profile's filter left to the tab's (a rule needs the tab)
+        self.tabbed = False
+
+    def invalidate(self) -> None:
+        self._exts = None
+        self._documents.clear()
+
+    def enabled_rulesets(self, ext_id: str, manifest: dict) -> list[str]:
+        dnr = manifest.get("declarative_net_request")
+        resources = [r for r in dnr.get("rule_resources") or [] if isinstance(r, dict)] if isinstance(dnr, dict) else []
+        state = self.c.registry.get(ext_id) or {}
+        return state["rulesets"] if isinstance(state.get("rulesets"), list) else [r.get("id") for r in resources if r.get("enabled")]
+
+    def _ruleset(self, root: Path, rel: str, ruleset: str) -> RuleIndex | None:
+        path = (root / rel.lstrip("/")).resolve()
+        try:
+            mtime = path.stat().st_mtime
+            if root not in path.parents:
+                return None
+            cached = self._static.get(str(path))
+            if cached is None or cached[0] != mtime:
+                cached = self._static[str(path)] = (mtime, RuleIndex(_read_json_file(path), ruleset))
+        except (OSError, ValueError) as exc:
+            log(f"Couldn't read the rule set {path}: {exc}")
+            return None
+        return cached[1]
+
+    def extensions(self) -> list[NetExtension]:
+        """The enabled extensions with rules, oldest first (a newer one's redirect wins, as in Chrome)."""
+        if self._exts is not None:
+            return self._exts
+        bridge, exts = self.c.bridge, []
+        infos = [i for i in self.c._infos() if i.isEnabled() and i.isLoaded()]
+        for info in sorted(infos, key=lambda i: (self.c.registry.get(i.id()) or {}).get("installed", 0)):
+            ext_id, root = info.id(), Path(info.path()).resolve()
+            manifest = self.c._manifest(info.path())
+            dnr = bridge.has_permission(ext_id, "declarativeNetRequest")
+            if not dnr and not bridge.has_permission(ext_id, "declarativeNetRequestWithHostAccess"):
+                continue
+            indexes = [RuleIndex(bridge._session_rules.get(ext_id), "_session"),
+                       RuleIndex((self.c.registry.get(ext_id) or {}).get("dnr"), "_dynamic")]
+            dnr_key = manifest.get("declarative_net_request")
+            resources = dnr_key.get("rule_resources") if isinstance(dnr_key, dict) else None
+            paths = {r.get("id"): r.get("path") for r in resources if isinstance(r, dict)} if isinstance(resources, list) else {}
+            for ruleset in self.enabled_rulesets(ext_id, manifest):
+                if isinstance(paths.get(ruleset), str):
+                    indexes.append(self._ruleset(root, paths[ruleset], str(ruleset)))
+            indexes = [i for i in indexes if i is not None and (i.keyed or i.generic)]
+            if indexes:
+                exts.append(NetExtension(ext_id, indexes, bridge._hosts(ext_id), not dnr))
+        self._exts = exts
+        self.tabbed = any(i.tabbed for e in exts for i in e.indexes)
+        return exts
+
+    def _request(self, url: QUrl, kind: str, method: str, initiator: QUrl, first_party: QUrl, tab: int | None) -> NetRequest:
+        text = url.adjusted(QUrl.UrlFormattingOption.RemoveFragment).toString(QUrl.ComponentFormattingOption.FullyEncoded)
+        host, source = url.host().lower(), initiator.host().lower()
+        party = source or first_party.host().lower()
+        third = kind != "main_frame" and bool(party) and _site(host) != _site(party)
+        req = NetRequest(text, kind, method, _suffixes(host), _suffixes(source), third, tab)
+        req.keys = (["d:" + h for h in req.hosts] + ["t:" + w for w in set(re.findall(r"[a-z0-9]+", text.lower()))]
+                    + ["i:" + h for h in req.initiators])
+        return req
+
+    def _frame_allowed(self, ext: NetExtension, page: QUrl) -> int | None:
+        """The priority of the extension's allowAllRequests rule for the tab's page, if one matched it."""
+        key = (ext.id, page.toString())
+        if key not in self._documents:
+            if len(self._documents) > 500:
+                self._documents.clear()
+            req = self._request(page, "main_frame", "get", QUrl(), page, -1)
+            hits = [r.priority for i in ext.indexes if i.allow_all for r in i.candidates(req.keys)
+                    if r.kind == "allowAllRequests" and r.matches(req)]
+            self._documents[key] = max(hits) if hits else None
+        return self._documents[key]
+
+    def decide(self, ext: NetExtension, req: NetRequest, page: QUrl):
+        """(winning rule or None, header rules to apply) - or None if it depends on the tab."""
+        best, headers = None, []
+        for index in ext.indexes:
+            for rule in index.candidates(req.keys):
+                hit = rule.matches(req)
+                if hit is None:
+                    return None
+                if hit and rule.kind == "modifyHeaders":
+                    headers.append(rule)
+                elif hit and (best is None or (rule.priority, -rule.rank) > (best.priority, -best.rank)):
+                    best = rule
+        if req.type not in ("main_frame", "sub_frame") and page.isValid() and any(i.allow_all for i in ext.indexes):
+            allowed = self._frame_allowed(ext, page)
+            if allowed is not None and (best is None or best.priority <= allowed):  # the page is allowed: so is this
+                return None, [h for h in headers if h.priority > allowed]
+        if best is not None and best.kind in ("block", "redirect", "upgradeScheme"):
+            return best, []
+        return best, [h for h in headers if best is None or h.priority > best.priority]
+
+    def apply(self, info, tab: int | None) -> None:
+        url = info.requestUrl()
+        if url.scheme() not in ("http", "https", "ws", "wss") or sip.isdeleted(self.c):
+            return
+        exts = self.extensions()
+        if not exts:
+            return
+        kind = DNR_TYPE_OF.get(info.resourceType(), "other")
+        key = (url.toString(), kind)
+        if tab is not None:  # a tab's filter only finishes what the profile's left to it
+            if not self.tabbed or self._deferred != key:
+                return
+        self._deferred = None
+        initiator, page = info.initiator(), info.firstPartyUrl()
+        req = self._request(url, kind, bytes(info.requestMethod()).decode("latin-1").lower(), initiator, page, tab)
+        block, redirect, headers = False, None, []
+        for ext in exts:
+            if initiator.scheme() == "chrome-extension" and initiator.host() != ext.id:  # other extensions' requests: not theirs
+                continue
+            decided = self.decide(ext, req, page)
+            if decided is None:
+                if tab is None:
+                    self._deferred = key
+                return
+            best, rules = decided
+            action = best.kind if best is not None else ""
+            if action in ("block", "upgradeScheme") and (not ext.needs_hosts or ext.may(req.url)):  # no host access needed
+                block, redirect = block or action == "block", (ext, best) if action == "upgradeScheme" else redirect
+            elif action == "redirect" and ext.may(req.url):
+                redirect = (ext, best)
+            headers += [r for r in sorted(rules, key=lambda r: r.priority) if ext.may(req.url)]
+        if block:
+            info.block(True)
+            return
+        target = self._target(*redirect, req, url) if redirect else None
+        if target is not None and target.isValid() and target != url:
+            info.redirect(target)
+            return
+        for rule in headers:
+            self._headers(info, rule)
+
+    @staticmethod
+    def _target(ext: NetExtension, rule: NetRule, req: NetRequest, url: QUrl) -> QUrl | None:
+        if rule.kind == "upgradeScheme":
+            target = QUrl(url)
+            target.setScheme({"http": "https", "ws": "wss"}.get(url.scheme(), url.scheme()))
+            return target
+        how = rule.action.get("redirect") if isinstance(rule.action.get("redirect"), dict) else {}
+        if isinstance(how.get("url"), str):
+            return QUrl(how["url"])
+        if isinstance(how.get("extensionPath"), str) and how["extensionPath"].startswith("/"):
+            scheme = "chrome-extension" if req.type == "main_frame" else EXT_SCHEME  # Qt refuses chrome-extension:// in pages
+            return QUrl(f"{scheme}://{ext.id}{how['extensionPath']}")
+        if isinstance(how.get("regexSubstitution"), str) and rule.is_regex and rule.regex is not None:
+            m = rule.regex.search(req.url)
+            if m is None:
+                return None
+            group = lambda d: (m.group(int(d.group(1))) or "") if int(d.group(1)) <= rule.regex.groups else ""
+            return QUrl(req.url[:m.start()] + re.sub(r"\\(\d)", group, how["regexSubstitution"]) + req.url[m.end():])
+        change = how.get("transform")
+        if not isinstance(change, dict):
+            return None
+        target = QUrl(url)
+        for key, setter in (("scheme", target.setScheme), ("host", target.setHost), ("username", target.setUserName),
+                            ("password", target.setPassword)):
+            if isinstance(change.get(key), str):
+                setter(change[key])
+        if "port" in change:
+            target.setPort(int(change["port"]) if str(change["port"]).isdigit() else -1)
+        if isinstance(change.get("path"), str):
+            target.setPath(change["path"])
+        if isinstance(change.get("query"), str):
+            target.setQuery(change["query"][1:] if change["query"].startswith("?") else None)
+        elif isinstance(change.get("queryTransform"), dict):
+            target.setQuery(NetRules._query(url.query(QUrl.ComponentFormattingOption.FullyEncoded), change["queryTransform"]) or None)
+        if isinstance(change.get("fragment"), str):
+            target.setFragment(change["fragment"][1:] if change["fragment"].startswith("#") else None)
+        return target
+
+    @staticmethod
+    def _query(query: str, change: dict) -> str:
+        name = lambda pair: pair.split("=", 1)[0]
+        doomed = set(_strings(change.get("removeParams")))
+        pairs = [p for p in query.split("&") if p and name(p) not in doomed and unquote(name(p)) not in doomed]
+        for item in change.get("addOrReplaceParams") or []:
+            if isinstance(item, dict) and isinstance(item.get("key"), str):
+                pair = f"{quote(item['key'], safe='')}={quote(str(item.get('value', '')), safe='')}"
+                at = next((i for i, p in enumerate(pairs) if unquote(name(p)) == item["key"]), None)
+                if at is not None:
+                    pairs[at] = pair
+                elif not item.get("replaceOnly"):
+                    pairs.append(pair)
+        return "&".join(pairs)
+
+    @staticmethod
+    def _headers(info, rule: NetRule) -> None:
+        current = {bytes(k).decode("latin-1").lower(): bytes(v) for k, v in info.httpHeaders().items()}
+        for change in rule.action.get("requestHeaders") or []:
+            name = change.get("header") if isinstance(change, dict) else None
+            if not isinstance(name, str) or not re.fullmatch(r"[!#$%&'*+.^_`|~0-9A-Za-z-]+", name):
+                continue
+            value = str(change.get("value", "")).encode("utf-8")
+            if change.get("operation") == "set":
+                info.setHttpHeader(name.encode(), value)
+            elif change.get("operation") == "append":
+                old = current.get(name.lower())
+                info.setHttpHeader(name.encode(), old + b", " + value if old else value)
+            elif change.get("operation") == "remove":
+                info.setHttpHeader(name.encode(), b"")  # Qt can't drop a header: an empty one is the closest
+            current[name.lower()] = value
 
 
 # ══════════════════════════════════════════════════════════════════════════════════════════
@@ -1884,7 +5309,8 @@ class WebPage(QWebEnginePage):
         self.proxyAuthenticationRequired.connect(lambda url, auth, host: self._on_authentication(url, auth, proxy=host))
 
     def javaScriptConsoleMessage(self, level, message, line, source) -> None:  # keep the terminal quiet
-        pass
+        if VERBOSE:
+            log(f"console {source}:{line}: {message}")
 
     def _dialog_parent(self) -> QWidget | None:
         view = QWebEngineView.forPage(self)
@@ -1973,6 +5399,8 @@ class Tab(QWidget):
         self.view = WebView(self)
         self.page = WebPage(win.profile, self.view)
         self.view.setPage(self.page)
+        self.tab_id, self.window_id = next(_TAB_IDS), MAIN_WINDOW_ID  # what chrome.tabs calls this tab
+        win.extensions.wire_tab(self.page, self.tab_id)
         self.splitter = QSplitter(Qt.Orientation.Vertical)
         self.splitter.setChildrenCollapsible(False)
         self.splitter.addWidget(self.view)
@@ -2653,10 +6081,13 @@ class Toast(QFrame):
         self.timer = QTimer(self)
         self.timer.setSingleShot(True)
         self.timer.timeout.connect(self.hide)
+        self.on_click = None
         self.hide()
 
-    def show_message(self, text: str, kind: str = "success", timeout: int = 4500) -> None:
-        """kind: "success", "info" or "error"."""
+    def show_message(self, text: str, kind: str = "success", timeout: int = 4500, on_click=None) -> None:
+        """kind: "success", "info" or "error". on_click runs if the message is clicked."""
+        self.on_click = on_click
+        self.setCursor(Qt.CursorShape.PointingHandCursor if on_click else Qt.CursorShape.ArrowCursor)
         error = kind == "error"
         self.setProperty("error", error)
         self.style().unpolish(self)
@@ -2672,7 +6103,10 @@ class Toast(QFrame):
         self.timer.start(timeout if not error else max(timeout, 7000))
 
     def mousePressEvent(self, _event) -> None:
+        callback, self.on_click = self.on_click, None
         self.hide()
+        if callback is not None:
+            callback()
 
 
 class ContentArea(QWidget):
@@ -3108,23 +6542,46 @@ class DownloadButton(QToolButton):
 # ══════════════════════════════════════════════════════════════════════════════════════════
 #  Extension pop-ups and pop-up windows
 # ══════════════════════════════════════════════════════════════════════════════════════════
+# The pop-up's preferred size, measured like Chrome's auto-resize: laid out at its narrowest (min-content) width,
+# with scroll bars off, so the current viewport can't feed back into the result.
 POPUP_MEASURE_JS = """(() => {
   const b = document.body, d = document.documentElement;
   if (!b) return [0, 0];
+  const pw = d.style.width, po = d.style.overflow;
+  d.style.overflow = 'hidden'; d.style.width = 'min-content';
   const cs = getComputedStyle(b), r = b.getBoundingClientRect();
-  const mx = parseFloat(cs.marginLeft) + parseFloat(cs.marginRight);
-  const my = parseFloat(cs.marginTop) + parseFloat(cs.marginBottom);
-  const h = Math.max(r.height + my, b.scrollHeight + my, d.scrollHeight > innerHeight ? d.scrollHeight : 0);
-  return [Math.ceil(r.width + mx), Math.ceil(h)];
+  const mx = parseFloat(cs.marginLeft) + parseFloat(cs.marginRight), my = parseFloat(cs.marginTop) + parseFloat(cs.marginBottom);
+  const w = Math.max(d.getBoundingClientRect().width, r.width + mx, b.scrollWidth + mx);
+  let h = Math.max(r.height, b.scrollHeight) + my;
+  // A last child's bottom margin can collapse through the body's (no padding or border between): it isn't in the
+  // body's box, but the page needs the room.
+  const shown = (e) => { for (let c = e.lastElementChild; c; c = c.previousElementSibling) { const s = getComputedStyle(c);
+    if (s.display !== 'none' && s.position !== 'absolute' && s.position !== 'fixed') return c; } return null; };
+  const last = shown(b);
+  let tail = 0;
+  for (let e = b, c = last; c; e = c, c = shown(c)) {
+    const es = getComputedStyle(e);
+    if (parseFloat(es.paddingBottom) || parseFloat(es.borderBottomWidth)) break;
+    tail = Math.max(tail, parseFloat(getComputedStyle(c).marginBottom) || 0);
+  }
+  if (tail) h = Math.max(h, last.getBoundingClientRect().bottom + scrollY + Math.max(tail, parseFloat(cs.marginBottom)));
+  if (document.compatMode === 'BackCompat') {  // quirks mode: an auto-height body fills the viewport - use its content
+    const range = document.createRange();
+    range.selectNodeContents(b);
+    h = range.getBoundingClientRect().bottom + scrollY + parseFloat(cs.paddingBottom) + parseFloat(cs.marginBottom);
+  }
+  d.style.width = pw; d.style.overflow = po;
+  return [Math.ceil(w), Math.ceil(h)];
 })()"""
 
 
 class ExtensionPopup(Panel):
     """Shows an extension's toolbar pop-up page, sized to its content like Chrome does."""
 
-    def __init__(self, win: "BrowserWindow", url: QUrl):
+    def __init__(self, win: "BrowserWindow", url: QUrl, ext_id: str = ""):
         super().__init__(win, translucent=False)
         self.win = win
+        self.ext_id = ext_id or url.host()
         layout = QVBoxLayout(self)
         layout.setContentsMargins(1, 1, 1, 1)
         self.view = QWebEngineView(self)
@@ -3134,8 +6591,26 @@ class ExtensionPopup(Panel):
         layout.addWidget(self.view)
         self.page.windowCloseRequested.connect(self.close)
         self.page.newWindowRequested.connect(self._open_elsewhere)
+        self.page.urlChanged.connect(self._on_url)
+        self.page.permissionRequested.connect(self._on_permission)
         self.page.loadFinished.connect(lambda *_: self._measure_soon())
+        self._resize_timer = QTimer(self)  # content that changes later (data arriving, sections opening) resizes it too
+        self._resize_timer.setSingleShot(True)
+        self._resize_timer.setInterval(100)
+        self._resize_timer.timeout.connect(self._measure)
+        self.page.contentsSizeChanged.connect(lambda *_: self._resize_timer.start())
+        self._poll = QTimer(self)  # contentsSizeChanged never reports shrinking content
+        self._poll.setInterval(500)
+        self._poll.timeout.connect(self._measure)
         self.page.load(url)
+
+    def showEvent(self, event) -> None:
+        super().showEvent(event)
+        self._poll.start()
+
+    def hideEvent(self, event) -> None:
+        self._poll.stop()
+        super().hideEvent(event)
 
     def _measure_soon(self) -> None:
         for delay in (0, 250, 800, 2000):
@@ -3152,13 +6627,28 @@ class ExtensionPopup(Panel):
             width, height = int(result[0]), int(result[1])
         except (TypeError, ValueError):
             return
-        if width < 20 or height < 20:
+        if width < 1 or height < 1:
             return
-        size = QSize(clamp(width, 120, 800), clamp(height, 40, 600))
+        size = QSize(clamp(width, 25, 800), clamp(height, 25, 600))  # Chrome's limits
         if size != self.view.size():
             self.view.setFixedSize(size)
             self.adjustSize()
             self.reposition()
+
+    def _on_url(self, url: QUrl) -> None:
+        # chrome.tabs.update({url}) without the polyfill navigates the pop-up itself: send it to the tab instead.
+        if (url.isEmpty() or url.toString() == "about:blank" or (url.scheme() == "chrome-extension" and url.host() == self.ext_id)
+                or url.toString().startswith(f"blob:chrome-extension://{self.ext_id}/")):
+            return
+        self.page.blockSignals(True)
+        self.page.triggerAction(QWebEnginePage.WebAction.Stop)
+        self.win.open_url(url, "current")
+        self.close()
+
+    def _on_permission(self, permission: QWebEnginePermission) -> None:
+        permission = QWebEnginePermission(permission)  # PyQt's argument dies with this call
+        self.close()  # a modal dialog would dismiss the pop-up anyway; ask on the window
+        QTimer.singleShot(0, lambda: self.win.ask_permission_modal(self.win, permission))
 
     def _open_elsewhere(self, request) -> None:
         self.win.handle_new_window(request, None)
@@ -3179,6 +6669,11 @@ class PopupWindow(QWidget):
         self.view = QWebEngineView(self)
         self.page = WebPage(win.profile, self.view)
         self.view.setPage(self.page)
+        self.tab_id, self.window_id = next(_TAB_IDS), next(_WINDOW_IDS)  # a window of its own for chrome.windows
+        self.pending, self.loading = None, False
+        win.extensions.wire_tab(self.page, self.tab_id)
+        self.page.loadStarted.connect(lambda: setattr(self, "loading", True))
+        self.page.loadFinished.connect(lambda *_: setattr(self, "loading", False))
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
@@ -3205,6 +6700,16 @@ class PopupWindow(QWidget):
         secure = url.scheme() == "https"
         prefix = "🔒 " if secure else ""
         self.header.setText(prefix + elide(url.toDisplayString(), 90))
+
+    def url(self) -> QUrl:
+        url = self.page.url()
+        return url if not url.isEmpty() else self.page.requestedUrl()
+
+    def title(self) -> str:
+        return self.page.title() or display_url(self.url())
+
+    def load(self, url: QUrl) -> None:
+        self.page.load(url)
 
     def closeEvent(self, event) -> None:
         self.page.blockSignals(True)
@@ -3610,12 +7115,20 @@ class ExtensionRow(QFrame):
         pinned.setChecked(entry.pinned)
         pinned.toggled.connect(lambda on: controller.set_pinned(entry.id, on))
         controls.addWidget(pinned)
+        if controller.wants_file_access(entry.id):  # off by default, as in Chrome: local files can be private
+            files = QCheckBox("Allow access to file URLs")
+            files.setChecked(controller.file_access(entry.id))
+            files.toggled.connect(lambda on: controller.set_file_access(entry.id, on))
+            controls.addWidget(files)
         layout.addLayout(controls)
         buttons = QVBoxLayout()
         buttons.setSpacing(6)
         if not entry.options_url.isEmpty():
             options = make_button("Options")
             options.clicked.connect(lambda *_: win.open_url(entry.options_url, "tab"))
+            options.setEnabled(entry.enabled)  # a disabled extension's pages get no chrome.* APIs
+            if not entry.enabled:
+                options.setToolTip("Turn the extension on to change its options")
             buttons.addWidget(options)
         remove = make_button("Remove", danger=True)
         remove.clicked.connect(lambda *_: win.confirm_remove_extension(entry.id, entry.name))
@@ -3652,8 +7165,9 @@ class ExtensionsDialog(QDialog):
         layout.addLayout(actions)
         note = tone_label(
             "Open an extension's page in the Chrome Web Store and click <b>Add to " + APP_NAME + "</b> in the bar "
-            "that appears. Only Manifest V3 extensions are supported. Qt WebEngine provides a subset of Chrome's "
-            "extension APIs, so extensions built on content scripts, pop-ups and storage work best.",
+            "that appears. Only Manifest V3 extensions are supported. " + APP_NAME + " fills in the extension APIs its "
+            "engine lacks (toolbar badges, context menus, notifications, alarms, tabs, scripting), but some still don't "
+            "work - ad blockers' network rules, for example, aren't enforced.",
             "dim", wrap=True, rich=True)
         layout.addWidget(note)
         self.area = QScrollArea()
@@ -4222,6 +7736,46 @@ class BookmarksBar(QWidget):
 # ══════════════════════════════════════════════════════════════════════════════════════════
 #  The browser window
 # ══════════════════════════════════════════════════════════════════════════════════════════
+class ExtensionButton(QToolButton):
+    """An extension's toolbar button, with the badge chrome.action gives it."""
+
+    def __init__(self, entry: ExtensionEntry):
+        super().__init__()
+        self.ext_id, self.name, self.default_icon = entry.id, entry.name, entry.icon
+        self.badge, self.badge_colors = "", (QColor(*BADGE_COLOR), QColor("white"))
+        self.setIcon(entry.icon)
+        self.setIconSize(QSize(16, 16))
+        self.setToolTip(plain_tip(entry.name))
+        self.setAutoRaise(True)
+        self.setFixedSize(32, 32)
+        self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+
+    def set_badge(self, text: str, background: QColor, foreground: QColor) -> None:
+        if (text, background, foreground) != (self.badge, *self.badge_colors):
+            self.badge, self.badge_colors = text, (background, foreground)
+            self.update()
+
+    def paintEvent(self, event) -> None:
+        super().paintEvent(event)
+        if not self.badge:
+            return
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        font = QFont(self.font())
+        font.setPixelSize(9)
+        font.setBold(True)
+        painter.setFont(font)
+        text = self.badge[:4]
+        width = min(self.width() - 2, max(13, painter.fontMetrics().horizontalAdvance(text) + 6))
+        rect = QRectF(self.width() - width - 1, self.height() - 14, width, 12)
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(self.badge_colors[0])
+        painter.drawRoundedRect(rect, 3, 3)
+        painter.setPen(self.badge_colors[1])
+        painter.drawText(rect, Qt.AlignmentFlag.AlignCenter, text)
+        painter.end()
+
+
 class BrowserWindow(QMainWindow):
     def __init__(self, profile: QWebEngineProfile, settings: Settings, bookmarks: BookmarkStore,
                  history: HistoryStore, favicons: FaviconCache, extensions: ExtensionsController,
@@ -4248,6 +7802,7 @@ class BrowserWindow(QMainWindow):
         self._state_before_fullscreen = Qt.WindowState.WindowNoState
         self._printer: QPrinter | None = None
         self._dialogs: dict[str, QDialog] = {}
+        self._command_actions: list[QAction] = []
         self._last_session = ""
         self.setWindowTitle(APP_NAME)
         self.setWindowIcon(icons().logo())
@@ -4288,8 +7843,13 @@ class BrowserWindow(QMainWindow):
         if IS_MAC:
             self._build_mac_menubar()
         bookmarks.changed.connect(self._update_star)
+        extensions.attach_window(self)
         extensions.changed.connect(self._rebuild_extension_buttons)
+        extensions.changed.connect(self._rewire_tabs)
         extensions.message.connect(lambda text, kind: self.toast(text, kind))
+        extensions.reloaded.connect(self._on_extension_reloaded)
+        extensions.replace_requested.connect(self._confirm_replace_extension)
+        extensions.bridge.action_changed.connect(lambda ext_id: self._refresh_extension_buttons(ext_id))
         profile.downloadRequested.connect(self._on_download_requested)
         self._session_timer = QTimer(self)
         self._session_timer.setSingleShot(True)
@@ -4555,6 +8115,8 @@ class BrowserWindow(QMainWindow):
         elif url is not None:
             tab.load(url)
         self._refresh_tab(tab)
+        bridge = self.extensions.bridge
+        bridge.tab_event("tabs.onCreated", tab, lambda ext_id: [bridge.tab_info(ext_id, tab)])
         if activate and (not background or self.tab_bar.count() == 1):
             self.tab_bar.setCurrentIndex(position)
             self._on_current_changed(position)
@@ -4571,7 +8133,8 @@ class BrowserWindow(QMainWindow):
             url = url_from_input(home, self.settings.search_template())
             if url.isValid():
                 return url
-        return QUrl(NEWTAB)
+        override = self.extensions.newtab_override()  # a New Tab extension (chrome_url_overrides)
+        return override if override is not None else QUrl(NEWTAB)
 
     def open_url(self, url: QUrl, where: str = "current", opener: Tab | None = None) -> None:
         if url.isEmpty():
@@ -4616,7 +8179,7 @@ class BrowserWindow(QMainWindow):
         if tab is self._fullscreen_tab:
             self._leave_html_fullscreen()
         entry = tab.session_entry()
-        if not is_newtab(QUrl(entry.get("url", ""))) or entry.get("history"):
+        if display_url(QUrl(entry.get("url", ""))) or entry.get("history"):
             self.closed_tabs.append(entry)
             del self.closed_tabs[:-MAX_CLOSED_TABS]
         if self.tab_bar.count() == 1:  # keep the window open with a fresh New Tab, like Firefox can
@@ -4632,6 +8195,9 @@ class BrowserWindow(QMainWindow):
             THROBBER.watch(label, False)
         self.tab_bar.removeTab(index)
         self.stack.removeWidget(tab)
+        bridge = self.extensions.bridge
+        bridge.tab_closed(tab)
+        bridge.tab_event("tabs.onRemoved", tab, lambda _ext: [tab.tab_id, {"windowId": MAIN_WINDOW_ID, "isWindowClosing": self._closing}])
         tab.deleteLater()
         current = self.current_tab()
         if current is not None:
@@ -4683,6 +8249,9 @@ class BrowserWindow(QMainWindow):
         page.recentlyAudibleChanged.connect(lambda *_, t=tab: self._refresh_tab(t))
         page.audioMutedChanged.connect(lambda *_, t=tab: self._refresh_tab(t))
         page.windowCloseRequested.connect(lambda *_, t=tab: self._remove_tab(t))
+        page.iconUrlChanged.connect(lambda url, t=tab: self._tab_updated(t, {"favIconUrl": url.toString()}) if not url.isEmpty() else None)
+        page.recentlyAudibleChanged.connect(lambda audible, t=tab: self._tab_updated(t, {"audible": audible}))
+        page.audioMutedChanged.connect(lambda muted, t=tab: self._tab_updated(t, {"mutedInfo": {"muted": muted}}))
         page.renderProcessTerminated.connect(lambda status, _code, t=tab: self._on_crashed(t, status))
         page.findTextFinished.connect(lambda result, t=tab: self._on_find_result(t, result))
         page.certificateAccepted.connect(self._on_certificate_accepted)
@@ -4693,6 +8262,8 @@ class BrowserWindow(QMainWindow):
         tab = self.tab_at(index)
         if tab is not None:
             self._activate(tab)
+            self._refresh_extension_buttons()
+            self.extensions.bridge.tab_event("tabs.onActivated", tab, lambda _ext: [{"tabId": tab.tab_id, "windowId": MAIN_WINDOW_ID}])
 
     def _activate(self, tab: Tab) -> None:
         if self._closing:
@@ -4781,8 +8352,26 @@ class BrowserWindow(QMainWindow):
             self.url_bar.star.setToolTip(f"Bookmark this page ({shortcut_text('Ctrl+D')})")
 
     # ── page events ─────────────────────────────────────────────────────────────────────
+    def _tab_updated(self, tab: Tab, change: dict) -> None:
+        """tabs.onUpdated - url, title and icon only for extensions that may see them."""
+        bridge = self.extensions.bridge
+
+        def args(ext_id: str):
+            info = bridge.tab_info(ext_id, tab)
+            visible = {k: v for k, v in change.items() if k not in ("url", "title", "favIconUrl") or k in info}
+            return [tab.tab_id, visible, info] if visible else None
+        bridge.tab_event("tabs.onUpdated", tab, args)
+
+    def _navigation_event(self, tab: Tab, name: str, url: QUrl) -> None:
+        details = {"tabId": tab.tab_id, "url": url.toString(), "frameId": 0, "parentFrameId": -1, "processId": -1,
+                   "timeStamp": time.time() * 1000, "documentLifecycle": "active", "frameType": "outermost_frame"}
+        if name in ("onCommitted", "onHistoryStateUpdated"):
+            details.update(transitionType="link", transitionQualifiers=[])
+        self.extensions.bridge.tab_event("webNavigation." + name, tab, lambda _ext: [details])
+
     def _on_title_changed(self, tab: Tab, title: str) -> None:
         self._refresh_tab(tab)
+        self._tab_updated(tab, {"title": title})
         if tab is self.current_tab():
             self.setWindowTitle(APP_NAME if is_newtab(tab.url()) else f"{tab.title()} — {APP_NAME}")
         url = tab.page.url()
@@ -4796,6 +8385,8 @@ class BrowserWindow(QMainWindow):
         self._refresh_tab(tab)
 
     def _on_url_changed(self, tab: Tab, url: QUrl) -> None:
+        self._tab_updated(tab, {"url": url.toString()})
+        self._navigation_event(tab, "onCommitted" if tab.loading else "onHistoryStateUpdated", url)
         if tab is self.current_tab():
             self._sync_chrome(tab)
         self._apply_site_zoom(tab)
@@ -4813,6 +8404,8 @@ class BrowserWindow(QMainWindow):
 
     def _on_load_started(self, tab: Tab) -> None:
         tab.loading, tab.progress, tab.crashed = True, 0, False
+        self._tab_updated(tab, {"status": "loading"})
+        self._navigation_event(tab, "onBeforeNavigate", tab.page.requestedUrl())
         if tab.crash_bar is not None and not sip.isdeleted(tab.crash_bar):
             tab.crash_bar.dismiss()
         tab.crash_bar = None
@@ -4829,6 +8422,10 @@ class BrowserWindow(QMainWindow):
     def _on_load_finished(self, tab: Tab, ok: bool) -> None:
         tab.loading, tab.progress = False, 100
         self._refresh_tab(tab)
+        self._tab_updated(tab, {"status": "complete"})
+        if ok:
+            self._navigation_event(tab, "onDOMContentLoaded", tab.page.url())
+            self._navigation_event(tab, "onCompleted", tab.page.url())
         url = tab.page.url()
         if ok and HistoryStore.recordable(url):
             tab.last_recorded = url.toString()
@@ -5348,19 +8945,83 @@ class BrowserWindow(QMainWindow):
         for entry in self.extensions.entries():
             if not (entry.enabled and entry.pinned):
                 continue
-            button = tool_button(entry.icon, entry.name)
+            button = ExtensionButton(entry)
             button.clicked.connect(lambda *_, e=entry.id, b=button: self.open_extension(e, b))
             button.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
             button.customContextMenuRequested.connect(lambda pos, e=entry.id, n=entry.name, b=button: self._extension_button_menu(e, n, b.mapToGlobal(pos)))
             self.extension_buttons.addWidget(button)
+        self._refresh_extension_buttons()
+        self._rebuild_extension_commands()
         tab = self.current_tab()
         if tab is not None:
             self._update_webstore_bar(tab, tab.url())
 
+    def _rebuild_extension_commands(self) -> None:
+        """Extensions' keyboard shortcuts (manifest "commands") - never one Foxglove already uses."""
+        for action in self._command_actions:
+            self.removeAction(action)
+            action.deleteLater()
+        self._command_actions = []
+        taken = {seq.toString() for action in self.actions() for seq in action.shortcuts()}
+        for entry in self.extensions.entries():
+            for name, command in self.extensions.commands(entry.id).items() if entry.enabled else ():
+                sequence = QKeySequence(command_shortcut(command))
+                if sequence.isEmpty() or sequence.count() != 1 or sequence.toString() in taken:
+                    continue
+                taken.add(sequence.toString())
+                action = QAction(self)
+                action.setShortcut(sequence)
+                action.triggered.connect(lambda *_, e=entry.id, n=name: self.run_extension_command(e, n))
+                self.addAction(action)
+                self._command_actions.append(action)
+
+    def run_extension_command(self, ext_id: str, name: str) -> None:
+        if name in ("_execute_action", "_execute_browser_action", "_execute_page_action"):
+            self.open_extension(ext_id)
+            return
+        tab = self.current_tab()
+        bridge = self.extensions.bridge
+        bridge.grant_active_tab(ext_id, tab)
+        bridge.emit(ext_id, "commands.onCommand", [name, bridge.tab_info(ext_id, tab)] if tab is not None else [name])
+
+    def extension_button(self, ext_id: str) -> ExtensionButton | None:
+        for i in range(self.extension_buttons.count()):
+            button = self.extension_buttons.itemAt(i).widget()
+            if isinstance(button, ExtensionButton) and button.ext_id == ext_id:
+                return button
+        return None
+
+    def _refresh_extension_buttons(self, ext_id: str | None = None) -> None:
+        """Badge, title, icon and on/off state from chrome.action, for the current tab."""
+        tab = self.current_tab()
+        tab_id = tab.tab_id if tab is not None else None
+        bridge = self.extensions.bridge
+        for i in range(self.extension_buttons.count()):
+            button = self.extension_buttons.itemAt(i).widget()
+            if not isinstance(button, ExtensionButton) or (ext_id and button.ext_id != ext_id):
+                continue
+            state = {key: bridge.action_value(button.ext_id, key, tab_id)
+                     for key in ("title", "enabled", "badgeText", "badgeBackground", "badgeTextColor")}
+            title = state["title"] or bridge.default_title(button.ext_id) or button.name
+            button.setToolTip(plain_tip(str(title)))
+            icon_ = bridge.action_icon(button.ext_id, tab_id) or button.default_icon
+            enabled = state["enabled"] is not False
+            button.setIcon(icon_ if enabled else QIcon(icon_.pixmap(QSize(16, 16), QIcon.Mode.Disabled)))
+            button.set_badge(str(state["badgeText"] or ""), QColor(*(state["badgeBackground"] or BADGE_COLOR)),
+                             QColor(*(state["badgeTextColor"] or [255, 255, 255, 255])))
+
     def _extension_button_menu(self, ext_id: str, name: str, pos: QPoint) -> None:
         menu = Menu("", self)
         entry = self.extensions.entry(ext_id)
-        if entry is not None and not entry.options_url.isEmpty():
+        tab = self.current_tab()
+        items = [m for m in self.extensions.bridge.menus(ext_id) if m.get("visible") is not False]
+        fits = lambda m: bool(set(_strings(m.get("contexts"))) & {"action", "browser_action", "page_action"})
+        top = [m for m in items if m.get("parentId") is None and fits(m)]
+        if top and entry is not None:  # the extension's own items for its button (contexts: ["action"])
+            info = {"editable": False, **({"pageUrl": tab.url().toString()} if tab is not None else {})}
+            self._add_extension_menu_items(menu, entry, items, top, fits, info, tab)
+            menu.addSeparator()
+        if entry is not None and entry.enabled and not entry.options_url.isEmpty():
             menu.addAction("Options", lambda: self.open_url(entry.options_url, "tab"))
         menu.addAction("Unpin from Toolbar", lambda: self.extensions.set_pinned(ext_id, False))
         menu.addAction("Manage Extensions", self.show_extensions)
@@ -5369,17 +9030,139 @@ class BrowserWindow(QMainWindow):
         menu.exec(pos)
         menu.deleteLater()
 
-    def open_extension(self, ext_id: str, anchor: QWidget | None = None) -> None:
+    def open_extension(self, ext_id: str, anchor: QWidget | None = None, invoked: bool = True) -> bool:
+        """The extension's toolbar button: its pop-up, else chrome.action.onClicked, else its options page.
+        *invoked*: by the user (button, menu, shortcut), which grants activeTab; chrome.action.openPopup() isn't."""
         entry = self.extensions.entry(ext_id)
         if entry is None:
-            return
-        if not entry.popup_url.isEmpty():
-            popup = ExtensionPopup(self, entry.popup_url)
-            popup.popup_at(anchor if anchor is not None and anchor.isVisible() else self.extensions_button)
+            return False
+        bridge = self.extensions.bridge
+        tab = self.current_tab()
+        tab_id = tab.tab_id if tab is not None else None
+        if bridge.action_value(ext_id, "enabled", tab_id) is False:
+            return False
+        popup = bridge.action_value(ext_id, "popup", tab_id)
+        popup_url = entry.popup_url if popup is None else QUrl(popup) if popup else QUrl()
+        if not invoked and popup_url.isEmpty():
+            return False
+        if invoked:
+            bridge.grant_active_tab(ext_id, tab)  # the user invoked it on this tab: activeTab
+        if not popup_url.isEmpty():
+            self.close_extension_popups()
+            if anchor is None or not anchor.isVisible():
+                anchor = self.extension_button(ext_id)
+            panel = ExtensionPopup(self, popup_url, ext_id)
+            panel.popup_at(anchor if anchor is not None and anchor.isVisible() else self.extensions_button)
+        elif bridge.listens(ext_id, "action.onClicked"):
+            bridge.action_clicked(ext_id, tab)
         elif not entry.options_url.isEmpty():
             self.open_url(entry.options_url, "tab")
         else:
             self.toast(f"“{entry.name}” has no pop-up — it works on web pages automatically.", "info")
+        return True
+
+    def close_extension_popups(self, ext_id: str | None = None) -> None:
+        for popup in self.findChildren(ExtensionPopup):
+            if not sip.isdeleted(popup) and popup.isVisible() and (ext_id is None or popup.ext_id == ext_id):
+                popup.close()
+
+    def _rewire_tabs(self) -> None:
+        """Installed extensions changed: every tab's tab-id script must know the current ones (from the next load)."""
+        for tab in [*self.tabs(), *(p for p in list(self.popups) if not sip.isdeleted(p))]:
+            self.extensions.wire_tab(tab.page, tab.tab_id)
+
+    def _on_extension_reloaded(self, ext_id: str) -> None:
+        """Pages of an extension opened while it was off (or an older version) have no chrome.* APIs: reload them."""
+        self.close_extension_popups(ext_id)
+        for tab in self.tabs():
+            url = tab.url()
+            if tab.pending is None and url.scheme() == "chrome-extension" and url.host() == ext_id:
+                tab.page.triggerAction(QWebEnginePage.WebAction.Reload)
+
+    def _confirm_replace_extension(self, job: dict) -> None:
+        def ask() -> None:
+            source = job.get("source_path") or "a downloaded file"
+            accepted = ask_question(self, "Replace Extension",
+                                    f"Replace “{job.get('existing_name')}” with “{job.get('name')}” from {source}?\n\n"
+                                    "The new version gets access to everything the installed one has saved.", "Replace")
+            self.extensions.resolve_replace(job, accepted)
+        QTimer.singleShot(0, ask)  # not inside the install callback
+
+    def show_extension_notification(self, ext_id: str, note_id: str, options: dict) -> None:
+        """chrome.notifications: a notice in the window; clicking it is notifications.onClicked."""
+        entry = self.extensions.entry(ext_id)
+        text = " — ".join(str(options.get(k)).strip() for k in ("title", "message") if str(options.get(k) or "").strip())
+        self.content.toast.show_message(f"{entry.name if entry else 'An extension'}: {text or 'Notification'}", "info",
+                                        timeout=8000, on_click=lambda: self.extensions.bridge.notification_clicked(ext_id, note_id))
+
+    def _extension_menu_items(self, menu: QMenu, tab: Tab, request: QWebEngineContextMenuRequest) -> None:
+        """chrome.contextMenus items that fit what was right-clicked."""
+        MT = QWebEngineContextMenuRequest.MediaType
+        link, media, selected = QUrl(request.linkUrl()), QUrl(request.mediaUrl()), request.selectedText()
+        kinds = {MT.MediaTypeImage: "image", MT.MediaTypeVideo: "video", MT.MediaTypeAudio: "audio"}
+        contexts = {c for c, on in (("link", not link.isEmpty()), ("selection", bool(selected.strip())),
+                                    ("editable", request.isContentEditable()), (kinds.get(request.mediaType()), True)) if c and on}
+        contexts = contexts or {"page"}
+        page_url, target = tab.url().toString(), (link if not link.isEmpty() else media).toString()
+        info = {"editable": request.isContentEditable(), "pageUrl": page_url, "frameUrl": page_url}
+        if not link.isEmpty():
+            info["linkUrl"] = link.toString()
+        if request.mediaType() in kinds:
+            info.update(srcUrl=media.toString(), mediaType=kinds[request.mediaType()])
+        if selected.strip():
+            info["selectionText"] = selected
+
+        def fits(item: dict) -> bool:
+            wanted = set(_strings(item.get("contexts")) or ["page"])
+            if not (wanted & contexts or "all" in wanted):
+                return False
+            documents, targets = _strings(item.get("documentUrlPatterns")), _strings(item.get("targetUrlPatterns"))
+            if documents and not any(match_pattern(p, page_url) for p in documents):
+                return False
+            return not (targets and target and not any(match_pattern(p, target) for p in targets))
+
+        added = False
+        for entry in self.extensions.entries():
+            items = [m for m in self.extensions.bridge.menus(entry.id) if m.get("visible") is not False] if entry.enabled else []
+            top = [m for m in items if m.get("parentId") is None and fits(m)]
+            if not top:
+                continue
+            if not added:
+                menu.addSeparator()
+                added = True
+            if len(top) > 1:  # several items: grouped under the extension, like Chrome
+                self._add_extension_menu_items(menu.submenu(menu_text(entry.name), entry.icon), entry, items, top, fits, info, tab)
+            else:
+                self._add_extension_menu_items(menu, entry, items, top, fits, info, tab, entry.icon)
+
+    def _add_extension_menu_items(self, menu: QMenu, entry: ExtensionEntry, items: list, level: list, fits, info: dict,
+                                  tab, icon_: QIcon | None = None) -> None:
+        selection = " ".join(str(info.get("selectionText", "")).split())
+        for item in level:
+            kind = item.get("type") or "normal"
+            if kind == "separator":
+                menu.addSeparator()
+                continue
+            title = menu_text(str(item.get("title") or "").replace("%s", elide(selection, 32)))
+            children = [m for m in items if m.get("parentId") == item.get("id") and fits(m)]
+            if children:
+                sub = Menu(title, menu)
+                if icon_ is not None:
+                    sub.setIcon(icon_)
+                menu.addMenu(sub)
+                self._add_extension_menu_items(sub, entry, items, children, fits, info, tab)
+                continue
+            action = menu.addAction(title)
+            if icon_ is not None:
+                action.setIcon(icon_)
+            action.setEnabled(item.get("enabled") is not False)
+            if kind in ("checkbox", "radio"):
+                action.setCheckable(True)
+                action.setChecked(bool(item.get("checked")))
+            details = {**info, "menuItemId": item.get("id")}
+            if item.get("parentId") is not None:
+                details["parentMenuItemId"] = item["parentId"]
+            action.triggered.connect(lambda *_, e=entry.id, it=item, d=details: self.extensions.bridge.menu_clicked(e, it, dict(d), tab))
 
     def _fill_extensions_menu(self, menu: QMenu) -> None:
         reset_menu(menu)
@@ -5407,8 +9190,7 @@ class BrowserWindow(QMainWindow):
             self.extensions.install_from_path(path)
 
     def confirm_remove_extension(self, ext_id: str, name: str) -> None:
-        answer = QMessageBox.question(self, "Remove Extension", f"Remove “{name}” from {APP_NAME}?")
-        if answer == QMessageBox.StandardButton.Yes:
+        if ask_question(self, "Remove Extension", f"Remove “{name}” from {APP_NAME}?", "Remove"):
             self.extensions.uninstall(ext_id)
 
     # ── downloads ───────────────────────────────────────────────────────────────────────
@@ -5545,6 +9327,7 @@ class BrowserWindow(QMainWindow):
             menu.addAction("Select All", lambda: page.triggerAction(WA.SelectAll))
             menu.addSeparator()
             menu.addAction("View Page Source", self.view_source)
+        self._extension_menu_items(menu, tab, request)
         menu.addSeparator()
         menu.addAction("Inspect", lambda: tab.open_devtools(inspect=True))
         menu.popup(global_pos)
@@ -5856,6 +9639,19 @@ def render_newtab_page(settings: Settings) -> str:
     }
 
 
+def register_url_schemes() -> None:
+    """foxglove:// (internal pages) and foxglove-ext:// (the extension bridge) - must happen before QApplication."""
+    F = QWebEngineUrlScheme.Flag
+    for name, flags in ((b"foxglove", F.SecureScheme | F.LocalScheme | F.LocalAccessAllowed),
+                        # service workers may only fetch() schemes flagged ServiceWorkersAllowed; LocalScheme would block it
+                        (EXT_SCHEME.encode(), F.SecureScheme | F.CorsEnabled | F.FetchApiAllowed | F.ServiceWorkersAllowed)):
+        if QWebEngineUrlScheme.schemeByName(name).name().isEmpty():
+            scheme = QWebEngineUrlScheme(name)
+            scheme.setSyntax(QWebEngineUrlScheme.Syntax.Host)
+            scheme.setFlags(flags)
+            QWebEngineUrlScheme.registerScheme(scheme)
+
+
 def set_macos_app_name(name: str) -> None:
     """Show "Foxglove" instead of "Python" in the macOS menu bar (needs to run before QApplication)."""
     if not IS_MAC:
@@ -5889,8 +9685,11 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="foxglove.py", description=f"{APP_NAME} web browser")
     parser.add_argument("urls", nargs="*", help="pages to open")
     parser.add_argument("--profile", default="default", help="profile name (separate tabs, bookmarks and cookies)")
+    parser.add_argument("--verbose", action="store_true", help="show Chromium's messages, including extensions' errors")
     options, _unknown = parser.parse_known_args(argv[1:])
     profile_name = re.sub(r"[^A-Za-z0-9_.-]", "_", options.profile) or "default"
+    global VERBOSE
+    VERBOSE = options.verbose
 
     QCoreApplication.setApplicationName(APP_NAME)
     QCoreApplication.setOrganizationName("")
@@ -5907,19 +9706,14 @@ def main(argv: list[str] | None = None) -> int:
     flags = (original_flags or "").split()
     if appearance in ("dark", "light") and not any(f.startswith("--blink-settings") for f in flags):
         flags.append(f"--blink-settings=preferredColorScheme={0 if appearance == 'dark' else 1}")
-    if not any(f.startswith("--log-level") for f in flags):
+    if not options.verbose and not any(f.startswith("--log-level") for f in flags):
         flags.append("--log-level=3")  # keep Chromium's internal chatter out of the terminal
     if vpn is not None and not any(f.startswith("--force-webrtc-ip-handling-policy") for f in flags):
         # Without this, video-call code (WebRTC) reveals your real IP address even through a proxy.
         flags.append("--force-webrtc-ip-handling-policy=disable_non_proxied_udp")
     os.environ["QTWEBENGINE_CHROMIUM_FLAGS"] = " ".join(flags)
 
-    scheme = QWebEngineUrlScheme(b"foxglove")
-    scheme.setSyntax(QWebEngineUrlScheme.Syntax.Host)
-    scheme.setFlags(QWebEngineUrlScheme.Flag.SecureScheme | QWebEngineUrlScheme.Flag.LocalScheme
-                    | QWebEngineUrlScheme.Flag.LocalAccessAllowed)
-    QWebEngineUrlScheme.registerScheme(scheme)
-
+    register_url_schemes()
     install_error_guard()
     set_macos_app_name(APP_NAME)
     app = QApplication(argv)
@@ -5993,12 +9787,12 @@ def main(argv: list[str] | None = None) -> int:
     heartbeat.timeout.connect(lambda: None)  # lets Python notice Ctrl+C while Qt is running
     heartbeat.start(250)
 
+    menubar = getattr(window, "mac_menubar", None)  # now: the window may be gone by the time exec() returns
     code = app.exec()
 
     # Tear down in a safe order: every web page before the profile, so Chromium shuts down cleanly and
     # flushes cookies to disk.
     heartbeat.stop()
-    menubar = getattr(window, "mac_menubar", None)
     if not sip.isdeleted(window):  # owns every tab, pop-up, dialog and therefore every web page
         window.close_now()
         if not sip.isdeleted(window):

@@ -284,7 +284,7 @@ def test_rule_precedence(fg):
     ("/ads/*banner", "http://h/ads/big-banner.png", True), ("^ad^", "http://h/x/ad/y", True), ("^ad^", "http://h/x/adx", False),
     ("^ad^", "http://h/x/ad", True), ("ADS", "http://h/ads", True)])
 def test_url_filters(fg, pattern, url, hit):
-    assert bool(fg.url_filter_regex(pattern).search(url)) is hit
+    assert fg.UrlFilter(pattern).search(url) is hit
 
 
 @pytest.mark.parametrize("pattern, keys", [

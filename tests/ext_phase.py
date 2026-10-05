@@ -9,6 +9,7 @@ args: root, profile, page_url,
       exts:     [{"name", "path", "tag"}]  extensions to install (install) / to check (report)
       disable:  [name]                      install: switch these off afterwards
       unpin:    [name]                      install: take these off the toolbar
+      settle:   seconds                     install: wait this long after installing (onInstalled work)
       storage:  {name: value}               install: chrome.storage.local.set({persist: value}); report: read it
       enabled:  [name]                      report: names expected to come back enabled
       old:      true                        install: as an older Foxglove did (no polyfill wired in)
@@ -70,6 +71,7 @@ def install(h: helpers.Harness) -> dict:
         h.wait_state(entry.id, False)
     for name in ARGS.get("unpin", []):
         h.controller.set_pinned(by_name(h, name).id, False)
+    helpers.spin(ARGS.get("settle", 0))  # time for the workers' onInstalled
     for name, value in ARGS.get("storage", {}).items():
         page = h.fresh_page(ext_page_url(by_name(h, name)))
         helpers.run_js_async(page, f"await chrome.storage.local.set({{persist: {json.dumps(value)}}}); return true")

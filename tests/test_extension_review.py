@@ -433,9 +433,9 @@ def test_what_a_polyfill_update_keeps(harness, tmp_path):
     state.update(menus=[{"id": "m"}], alarms={"a": {}}, scripts=[{"id": "s"}], listeners=["tabs.onUpdated"])
     bridge.installed(entry.id, {"reason": "chrome_update"})  # a newer Foxglove: like a Chrome update
     assert (state.get("menus"), state.get("alarms"), state.get("scripts"), state.get("listeners")) == \
-        ([{"id": "m"}], {"a": {}}, [{"id": "s"}], None)
+        ([{"id": "m"}], {"a": {}}, [{"id": "s"}], ["tabs.onUpdated"])  # the same worker code: the same listeners
     bridge.installed(entry.id, {"reason": "update", "previousVersion": "0.9"})  # a new version of the extension
-    assert not any(k in state for k in ("menus", "alarms", "scripts"))
+    assert not any(k in state for k in ("menus", "alarms", "scripts", "listeners"))
 
 
 # ══════════════════════════════════════════════════════════════════════════════════════════

@@ -45,7 +45,7 @@ def register_schemes() -> None:
     """What main() does before QApplication exists: foxglove:// and foxglove-ext:// must be registered up front."""
     fg = load_foxglove()
     fg.register_url_schemes()
-    QCoreApplication.setApplicationName(fg.APP_NAME)  # Qt's extension/profile folders are named after the app
+    QCoreApplication.setApplicationName(getattr(fg, "DATA_NAME", fg.APP_NAME))  # Qt's extension/profile folders
     QCoreApplication.setOrganizationName("")
 
 

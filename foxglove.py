@@ -1,14 +1,16 @@
 #!/usr/bin/env python3
 """
-Foxglove - a Firefox-inspired web browser written in Python (PyQt6 + Qt WebEngine / Chromium).
+Chrome 2 - a web browser written in Python (PyQt6 + Qt WebEngine / Chromium), formerly called Foxglove.
 
-  * Firefox "Proton" dark look with a light-purple accent
+  * Google Chrome's New Tab page (Google search, shortcuts or most visited sites, Customize Chrome) and logo,
+    in a dark toolbar look with a light-purple accent
+  * Privacy screen: windows fade to grey while Chrome 2 isn't the active app (Settings > Privacy)
   * Session restore: quit any time - your tabs (with their back/forward history) and your
     cookies come back next launch, so you stay signed in
   * Bookmarks: star button, bookmarks toolbar with folders, bookmark manager, HTML import/export
   * Chrome extensions (Manifest V3): one-click install from the Chrome Web Store, or from a
     .crx/.zip file or an unpacked folder; toolbar popups with badges, options pages, enable/disable/remove.
-    Foxglove fills in the extension APIs its engine lacks - chrome.action, contextMenus, notifications,
+    Chrome 2 fills in the extension APIs its engine lacks - chrome.action, contextMenus, notifications,
     alarms, tabs, windows, scripting, offscreen, storage.sync/onChanged, i18n, commands - so extensions
     built for Chrome run, including ad blockers' declarativeNetRequest rules
   * VPN / proxy: route the browser through Tor, Cloudflare WARP or your own HTTP/SOCKS5 proxy,
@@ -19,8 +21,9 @@ Foxglove - a Firefox-inspired web browser written in Python (PyQt6 + Qt WebEngin
 Setup (once):   python3 -m pip install --upgrade PyQt6 PyQt6-WebEngine
 Run:            python3 foxglove.py            (optionally followed by URLs to open; --verbose shows
                                                 extensions' errors)
+macOS app:      python3 foxglove.py --install-app   (makes ~/Applications/Chrome 2.app, for the Dock)
 
-Your data (tabs, bookmarks, cookies, extensions) is kept in
+Your data (tabs, bookmarks, cookies, extensions) is kept in (the folder keeps the browser's former name)
   macOS:   ~/Library/Application Support/Foxglove
   Windows: %APPDATA%\\Foxglove
   Linux:   ~/.local/share/Foxglove
@@ -91,12 +94,13 @@ try:
     from PyQt6.QtWebEngineWidgets import QWebEngineView
 except ImportError as exc:  # shown instead of a traceback when the packages are missing
     sys.exit(
-        "Foxglove needs PyQt6 and PyQt6-WebEngine (6.8 or newer). Install them with:\n\n"
+        "Chrome 2 needs PyQt6 and PyQt6-WebEngine (6.8 or newer). Install them with:\n\n"
         "    python3 -m pip install --upgrade PyQt6 PyQt6-WebEngine\n\n"
         f"(details: {exc})"
     )
 
-APP_NAME = "Foxglove"
+APP_NAME = "Chrome 2"          # the name people see: windows, menus, dialogs, the Dock
+DATA_NAME = "Foxglove"         # what things are stored under (data folder, extension IDs): never changes
 APP_VERSION = "1.0"
 IS_MAC = sys.platform == "darwin"
 HAS_EXTENSIONS = hasattr(QWebEngineProfile, "extensionManager")  # Qt WebEngine 6.10+
@@ -223,21 +227,37 @@ ICONS = {
                  '<path stroke="#1c1b22" stroke-width="2.2" d="m8.5 12 2.5 2.5 4.5-5"/>',
 }
 
-LOGO_SVG = """<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128">
+# The Google Chrome logo: three 120° sectors (outer radius 24) whose edges are tangents of the white disc (radius 12),
+# each running from the disc to the rim 60° further on - the "pinwheel" - around a blue centre (radius 9.5). The
+# sectors are drawn as wedges through the centre (the white disc covers that) with a hairline of their own colour, so
+# no background shows through the anti-aliased seams.
+LOGO_SVG = """<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 48 48">
 <defs>
-<linearGradient id="bg" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#3a3846"/><stop offset="1" stop-color="#1c1b22"/></linearGradient>
-<linearGradient id="fur" x1="0.2" y1="0" x2="0.8" y2="1"><stop offset="0" stop-color="#e2d6ff"/><stop offset="1" stop-color="#9b7ff5"/></linearGradient>
+<linearGradient id="chrome-r" x1="3.2" y1="15" x2="44.8" y2="15" gradientUnits="userSpaceOnUse"><stop offset="0" stop-color="#d93025"/><stop offset="1" stop-color="#ea4335"/></linearGradient>
+<linearGradient id="chrome-y" x1="20.7" y1="47.7" x2="41.5" y2="11.7" gradientUnits="userSpaceOnUse"><stop offset="0" stop-color="#fcc934"/><stop offset="1" stop-color="#fbbc04"/></linearGradient>
+<linearGradient id="chrome-g" x1="26.6" y1="46.5" x2="5.8" y2="10.5" gradientUnits="userSpaceOnUse"><stop offset="0" stop-color="#1e8e3e"/><stop offset="1" stop-color="#34a853"/></linearGradient>
 </defs>
-<rect x="6" y="6" width="116" height="116" rx="28" fill="url(#bg)"/>
-<path d="M26 24 L50 45 H78 L102 24 L105 68 L64 107 L23 68 Z" fill="url(#fur)"/>
-<path d="M32 34 L45 46 L35 57 Z" fill="#7a5fd6"/>
-<path d="M96 34 L83 46 L93 57 Z" fill="#7a5fd6"/>
-<path d="M23 68 L51 73 L64 107 Z" fill="#f6f2ff"/>
-<path d="M105 68 L77 73 L64 107 Z" fill="#f6f2ff"/>
-<circle cx="49" cy="63" r="4.6" fill="#1c1b22"/>
-<circle cx="79" cy="63" r="4.6" fill="#1c1b22"/>
-<path d="M57.5 98.5 H70.5 L64 107 Z" fill="#1c1b22"/>
+<path fill="url(#chrome-r)" stroke="url(#chrome-r)" stroke-width=".12" d="M24 12L44.7846 12A24 24 0 0 0 3.2154 12L13.6077 30L24 24Z"/>
+<path fill="url(#chrome-y)" stroke="url(#chrome-y)" stroke-width=".12" d="M34.3923 30L24 48A24 24 0 0 0 44.7846 12L24 12L24 24Z"/>
+<path fill="url(#chrome-g)" stroke="url(#chrome-g)" stroke-width=".12" d="M13.6077 30L3.2154 12A24 24 0 0 0 24 48L34.3923 30L24 24Z"/>
+<circle cx="24" cy="24" r="12" fill="#fff"/>
+<circle cx="24" cy="24" r="9.5" fill="#1a73e8"/>
 </svg>"""
+
+
+def logo_image(size: int, margin: float = 0.0, background: str = "") -> "QImage":
+    """The logo rendered at *size* px (square), *margin* (a fraction of size) on each side, on *background* or clear."""
+    from PyQt6.QtGui import QImage
+    from PyQt6.QtSvg import QSvgRenderer
+    image = QImage(size, size, QImage.Format.Format_ARGB32_Premultiplied)
+    image.fill(QColor(background) if background else QColor(0, 0, 0, 0))
+    painter = QPainter(image)
+    painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+    inset = size * margin
+    QSvgRenderer(QByteArray(LOGO_SVG.encode("utf-8"))).render(painter, QRectF(inset, inset, size - 2 * inset,
+                                                                               size - 2 * inset))
+    painter.end()
+    return image
 
 
 class IconFactory:
@@ -279,6 +299,13 @@ class IconFactory:
         if not target.exists():
             target.write_text(LOGO_SVG, encoding="utf-8")
         return QIcon(target.as_posix())
+
+    def app_icon(self) -> QIcon:
+        """The application's (Dock / taskbar) icon: the logo with the margin app icons have around them."""
+        result = QIcon()
+        for size in (16, 32, 64, 128, 256, 512, 1024):
+            result.addPixmap(QPixmap.fromImage(logo_image(size, 0.08 if size >= 64 else 0.0)))
+        return result
 
 
 _icon_factory: IconFactory | None = None
@@ -1186,7 +1213,7 @@ EXTENSION_SHIM_JS = r"""/* foxglove-shim %(stamp)s
   }
 
   // ── calls to Foxglove: fetch() to its scheme (pages and the worker are known by their origin, content scripts by a token) ──
-  const unwrap = (r) => { if (r && r.ok) return r.value; throw new Error((r && r.error) || "Foxglove couldn't complete the request."); };
+  const unwrap = (r) => { if (r && r.ok) return r.value; throw new Error((r && r.error) || "Chrome 2 couldn't complete the request."); };
   const post = g.fetch.bind(g), json = JSON.stringify;  // the originals: page code may replace them later
   const PART = 12000;  // Qt garbles request bodies over 16 KiB: bigger calls go in parts, as ASCII so a part is never cut mid-character
   const ascii = (s) => s.replace(/[\u007f-\uffff]/g, (c) => "\\u" + c.charCodeAt(0).toString(16).padStart(4, "0"));
@@ -2045,6 +2072,14 @@ class Settings(QObject):
         "site_zoom": {},
         "site_permissions": {},  # origin -> {permission type name: "allow"/"block"} for the ones Qt doesn't remember
         "vpn": {"mode": "off", "type": "socks5", "host": "", "port": 1080, "username": "", "password": ""},
+        # New Tab page (Chrome's): "My shortcuts" show the most visited sites until first edited, like Chrome's
+        "ntp_shortcut_mode": "custom",     # "custom" (My shortcuts) or "most_visited"
+        "ntp_show_shortcuts": True,
+        "ntp_shortcuts": [],               # [{"title", "url"}] once edited
+        "ntp_shortcuts_edited": False,
+        "ntp_hidden": [],                  # most visited pages removed from the page
+        "ntp_theme": "",                   # "" (default) or a NTP_COLORS key
+        "privacy_screen": True,            # grey out the windows while Chrome 2 isn't the active app
     }
 
     def __init__(self, path: Path):
@@ -2490,6 +2525,23 @@ class HistoryStore:
         rows = self._run(f"SELECT url, title, last_visit, visit_count FROM places WHERE {where} "
                          "ORDER BY last_visit DESC LIMIT ?", tuple(params) + (limit,), fetch=True)
         return [(r[0], r[1], r[2], r[3]) for r in rows]
+
+    def top_sites(self, limit: int = 8, exclude=()) -> list[tuple[str, str]]:
+        """The New Tab page's most visited sites: web pages ranked as the address bar ranks them (visits, fading over
+        weeks), one per address (trailing "/" and #fragment aside), minus *exclude* (the ones removed from the page)."""
+        skip, found, seen = set(exclude), [], set()
+        rows = self._run("SELECT url, title FROM places WHERE url LIKE 'http%' "
+                         "ORDER BY visit_count * 1.0 / (1.0 + (? - last_visit) / 604800.0) DESC LIMIT ?",
+                         (time.time(), limit * 4 + len(skip)), fetch=True)
+        for url, title in rows:
+            key = url.split("#", 1)[0].rstrip("/")
+            if url in skip or key in seen or not url.startswith(("http://", "https://")):
+                continue
+            seen.add(key)
+            found.append((url, title))
+            if len(found) >= limit:
+                break
+        return found
 
     def delete(self, urls: list[str]) -> None:
         for url in urls:
@@ -3071,7 +3123,7 @@ class ExtensionsController(QObject):
         if not QWebEngineUrlScheme.schemeByName(EXT_SCHEME.encode()).name().isEmpty():
             self.profile.installUrlSchemeHandler(EXT_SCHEME.encode(), self.bridge)
         else:
-            log(f"{EXT_SCHEME}:// isn't registered - extensions run without Foxglove's API polyfill.")
+            log(f"{EXT_SCHEME}:// isn't registered - extensions run without {APP_NAME}'s API polyfill.")
 
     def sync_filtering(self) -> None:
         """Filter requests only while an enabled extension may have declarativeNetRequest rules (and look at requests
@@ -3525,7 +3577,7 @@ class ExtensionsController(QObject):
                 ext_id, id_source = extension_id_from_key(key_bytes), "manifest"
                 manifest["key"] = base64.b64encode(key_bytes).decode("ascii")
             else:  # unpacked: a key made from where it came from keeps the ID (and its data) stable, as in Chrome
-                derived = base64.b64encode(hashlib.sha256(f"{APP_NAME}:{source_path or uuid.uuid4()}".encode()).digest()).decode("ascii")
+                derived = base64.b64encode(hashlib.sha256(f"{DATA_NAME}:{source_path or uuid.uuid4()}".encode()).digest()).decode("ascii")
                 ext_id, id_source = None, None
             if expected_id and ext_id != expected_id:
                 raise InstallError("The downloaded file doesn't match the requested extension.")
@@ -6504,59 +6556,749 @@ class NetRules:
 # ══════════════════════════════════════════════════════════════════════════════════════════
 #  Internal pages (foxglove://newtab)
 # ══════════════════════════════════════════════════════════════════════════════════════════
-class InternalPages(QWebEngineUrlSchemeHandler):
-    def __init__(self, render_newtab, parent: QObject | None = None):
+NTP_MAX_SHORTCUTS, NTP_MAX_MOST_VISITED = 10, 8  # as in Chrome
+NTP_SHORTCUT_SCHEMES = ("http", "https", "ftp", "file")
+# Customize Chrome > Appearance: a theme is made from one of these colours (light and dark variants below)
+NTP_COLORS = (("blue", "Blue", "#1a73e8"), ("aqua", "Aqua", "#12a4af"), ("green", "Green", "#1e8e3e"),
+              ("viridian", "Viridian", "#0f7b6c"), ("citron", "Citron", "#a8a215"), ("orange", "Orange", "#e8710a"),
+              ("apricot", "Apricot", "#e8936b"), ("rose", "Rose", "#d96570"), ("pink", "Pink", "#d0518a"),
+              ("fuchsia", "Fuchsia", "#b146c2"), ("violet", "Violet", "#7b5bd6"), ("grey", "Grey", "#6e7681"))
+# Chrome's New Tab page colours (CSS variables), light and dark
+NTP_LIGHT = {
+    "bg": "#ffffff", "text": "#1f1f1f", "text-2": "#474747", "icon": "#5f6368", "logo": "#5f6368", "logo-text": "#1f1f1f",
+    "box-bg": "#ffffff", "box-hover": "#ffffff", "box-shadow": "0 1px 6px 0 rgba(32,33,36,.28)",
+    "box-shadow-hover": "0 1px 6px 0 rgba(32,33,36,.28), 0 0 0 1px rgba(32,33,36,.08)", "placeholder": "#5f6368",
+    "tile-bg": "#f1f3f4", "tile-hover": "rgba(31,31,31,.06)", "tile-text": "#1f1f1f",
+    "ogb-text": "#1f1f1f", "ogb-hover": "rgba(31,31,31,.08)", "avatar-bg": "#e3e3e3", "avatar-fg": "#5f6368",
+    "menu-bg": "#ffffff", "menu-hover": "rgba(31,31,31,.06)",
+    "menu-shadow": "0 1px 2px 0 rgba(60,64,67,.3), 0 2px 6px 2px rgba(60,64,67,.15)",
+    "apps-bg": "#e9eef6", "apps-card": "#ffffff", "dialog-bg": "#ffffff", "field-bg": "#f1f3f4", "error": "#b3261e",
+    "primary": "#0b57d0", "on-primary": "#ffffff", "outline": "#c7c7c7", "link": "#0b57d0",
+    "tonal": "#d3e3fd", "on-tonal": "#041e49", "toast-bg": "#303030", "toast-text": "#f2f2f2", "toast-link": "#a8c7fa",
+    "panel-bg": "#ffffff", "card-bg": "#f0f4f9", "divider": "#e3e3e3", "focus": "#0b57d0", "scrim": "rgba(0,0,0,.32)",
+}
+NTP_DARK = {
+    "bg": "#202124", "text": "#e8eaed", "text-2": "#bdc1c6", "icon": "#9aa0a6", "logo": "#ffffff", "logo-text": "#ffffff",
+    "box-bg": "#303134", "box-hover": "#3c4043", "box-shadow": "0 1px 6px 0 rgba(0,0,0,.28)",
+    "box-shadow-hover": "0 1px 6px 0 rgba(0,0,0,.28)", "placeholder": "#9aa0a6",
+    "tile-bg": "#303134", "tile-hover": "rgba(255,255,255,.1)", "tile-text": "#e8eaed",
+    "ogb-text": "#e8eaed", "ogb-hover": "rgba(255,255,255,.1)", "avatar-bg": "#3c4043", "avatar-fg": "#c4c7c5",
+    "menu-bg": "#303134", "menu-hover": "rgba(255,255,255,.08)",
+    "menu-shadow": "0 1px 2px 0 rgba(0,0,0,.3), 0 2px 6px 2px rgba(0,0,0,.15)",
+    "apps-bg": "#282a2c", "apps-card": "#1f1f1f", "dialog-bg": "#303134", "field-bg": "#202124", "error": "#f2b8b5",
+    "primary": "#a8c7fa", "on-primary": "#062e6f", "outline": "#5f6368", "link": "#a8c7fa",
+    "tonal": "#004a77", "on-tonal": "#c2e7ff", "toast-bg": "#e3e3e3", "toast-text": "#1f1f1f", "toast-link": "#0b57d0",
+    "panel-bg": "#292a2d", "card-bg": "#202124", "divider": "#3c4043", "focus": "#a8c7fa", "scrim": "rgba(0,0,0,.5)",
+}
+
+
+class NtpError(Exception):
+    pass
+
+
+def _mix(a: str, b: str, amount: float) -> str:
+    """*amount* of colour *a*, the rest *b*."""
+    x, y = QColor(a), QColor(b)
+    return QColor(*(round(getattr(x, c)() * amount + getattr(y, c)() * (1 - amount))
+                    for c in ("red", "green", "blue"))).name()
+
+
+def ntp_theme_css(theme: str) -> str:
+    """The New Tab page's colours for a theme ("" = Chrome's default): light, dark, and following the system."""
+    light, dark = dict(NTP_LIGHT), dict(NTP_DARK)
+    seed = next((color for key, _name, color in NTP_COLORS if key == theme), None)
+    if seed:
+        light.update({"bg": _mix(seed, "#ffffff", .14), "tile-bg": _mix(seed, "#ffffff", .24),
+                      "logo": _mix(seed, "#000000", .62), "logo-text": _mix(seed, "#000000", .5),
+                      "tonal": _mix(seed, "#ffffff", .3), "on-tonal": _mix(seed, "#000000", .3),
+                      "primary": _mix(seed, "#000000", .75), "link": _mix(seed, "#000000", .75), "focus": seed,
+                      "card-bg": _mix(seed, "#ffffff", .1)})
+        dark.update({"bg": _mix(seed, "#1b1b1b", .2), "box-bg": _mix(seed, "#2a2a2a", .22),
+                     "box-hover": _mix(seed, "#363636", .25), "tile-bg": _mix(seed, "#2a2a2a", .3),
+                     "tonal": _mix(seed, "#000000", .45), "on-tonal": _mix(seed, "#ffffff", .3),
+                     "primary": _mix(seed, "#ffffff", .45), "on-primary": _mix(seed, "#000000", .25),
+                     "link": _mix(seed, "#ffffff", .45), "focus": _mix(seed, "#ffffff", .45),
+                     "panel-bg": _mix(seed, "#232323", .12), "card-bg": _mix(seed, "#1b1b1b", .18)})
+
+    def block(palette: dict) -> str:
+        return "".join(f"--{name}:{value};" for name, value in palette.items())
+    return (f":root{{{block(light)}}}:root[data-appearance=dark]{{{block(dark)}}}"
+            f"@media (prefers-color-scheme: dark){{:root[data-appearance=system]{{{block(dark)}}}}}")
+
+
+class NewTabPage(QObject):
+    """Google Chrome's New Tab page (foxglove://newtab), filled in for this profile: the search box, shortcuts ("My
+    shortcuts", or the most visited sites from history) and Customize Chrome. The page changes them through
+    foxglove://newtab/api - and only that page can: foxglove:// is a local scheme, so web pages and extensions can't
+    even load it, and the API also wants the request to come from the foxglove://newtab origin with the token this
+    browser run put into the page."""
+
+    def __init__(self, settings: Settings, history: HistoryStore, favicons: FaviconCache, parent: QObject | None = None):
         super().__init__(parent)
-        self.render_newtab = render_newtab
+        self.settings, self.history, self.favicons = settings, history, favicons
+        self.token = secrets.token_urlsafe(24)
+
+    # ── what the page shows ──
+    def _hidden(self) -> list[str]:
+        return [u for u in self.settings.get("ntp_hidden") if isinstance(u, str)]
+
+    def most_visited(self, limit: int = NTP_MAX_MOST_VISITED) -> list[dict]:
+        return [{"title": title or display_url(QUrl(url)), "url": url}
+                for url, title in self.history.top_sites(limit, self._hidden())]
+
+    def shortcuts(self) -> list[dict]:
+        """My shortcuts: the most visited sites until the first change (as in Chrome), then the user's own list."""
+        if not self.settings.get("ntp_shortcuts_edited"):
+            return self.most_visited()
+        return [{"title": str(s.get("title") or ""), "url": s["url"]} for s in self.settings.get("ntp_shortcuts")
+                if isinstance(s, dict) and isinstance(s.get("url"), str)][:NTP_MAX_SHORTCUTS]
+
+    def _icon_url(self, url: str) -> str:
+        host = QUrl(url).host().lower()
+        if not host or not self.favicons._file(host).exists():
+            return ""
+        return f"/favicon?host={quote(host)}&t={self.token}"
+
+    def state(self) -> dict:
+        mode = self.settings.get("ntp_shortcut_mode")
+        mode = mode if mode in ("custom", "most_visited") else "custom"
+        theme = self.settings.get("ntp_theme")
+        theme = theme if any(theme == key for key, _n, _c in NTP_COLORS) else ""
+        tiles = self.shortcuts() if mode == "custom" else self.most_visited()
+        return {"mode": mode, "show": bool(self.settings.get("ntp_show_shortcuts")),
+                "max": NTP_MAX_SHORTCUTS if mode == "custom" else NTP_MAX_MOST_VISITED,
+                "tiles": [dict(t, icon=self._icon_url(t["url"])) for t in tiles],
+                "theme": theme, "theme_css": ntp_theme_css(theme), "hidden": len(self._hidden())}
+
+    def render(self) -> str:
+        engine = self.settings.get("search_engine")
+        google = engine == "Google"
+        appearance = self.settings.get("website_appearance")
+        state = dict(self.state(), token=self.token, engine=engine)
+        nonce = secrets.token_urlsafe(16)
+        colors = "".join(f'<button type="button" class="chip" data-theme="{key}" title="{name}" aria-label="{name}" '
+                         f'style="--chip:{color}"></button>' for key, name, color in NTP_COLORS)
+        values = {
+            "APPEARANCE": appearance if appearance in ("dark", "light", "system") else "dark",
+            "LOGO_MODE": "single" if state["theme"] else "color",
+            "THEME_CSS": state["theme_css"],
+            "OGB": "" if google else "hidden",
+            "LOGO": GOOGLE_LOGO_SVG if google else f'<div class="wordmark">{html.escape(engine)}</div>',
+            "PLACEHOLDER": html.escape(f"Search {engine} or type a URL", quote=True),
+            "APPS": "".join(f'<a class="app" href="{url}">{NTP_APP_ICONS[key]}<span>{name}</span></a>'
+                            for key, name, url in NTP_APPS),
+            "COLORS": colors,
+            "NONCE": nonce,
+            "STATE": json.dumps(state).replace("<", "\\u003c"),
+        }
+        return re.sub(r"\{\{([A-Z_]+)\}\}", lambda m: values[m.group(1)], NEWTAB_HTML)
+
+    # ── the page's requests ──
+    def trusted(self, job: QWebEngineUrlRequestJob, token: str = "") -> bool:
+        """Only the New Tab page itself: its origin, and the token it was served with."""
+        initiator = job.initiator()
+        if initiator.scheme() != "foxglove" or initiator.host() != "newtab":
+            return False
+        if not token:
+            headers = {bytes(k).decode("latin-1").lower(): bytes(v) for k, v in job.requestHeaders().items()}
+            token = headers.get("x-ntp-token", b"").decode("latin-1")
+        return hmac.compare_digest(token.encode("utf-8", "replace"), self.token.encode())
+
+    def favicon(self, job: QWebEngineUrlRequestJob) -> bytes | None:
+        query = dict(part.split("=", 1) for part in job.requestUrl().query().split("&") if "=" in part)
+        if not self.trusted(job, unquote(query.get("t", ""))):
+            return None
+        host = unquote(query.get("host", "")).lower()
+        try:
+            return self.favicons._file(host).read_bytes() if host else None
+        except OSError:
+            return None
+
+    def api(self, job: QWebEngineUrlRequestJob) -> dict | None:
+        """Answers a request from the page (None: refused); a change answers with the page's new state."""
+        if job.requestMethod() != b"POST" or not self.trusted(job):
+            return None
+        device = job.requestBody()
+        try:
+            if device is not None and not device.isOpen():
+                device.open(QIODevice.OpenModeFlag.ReadOnly)
+            request = json.loads(bytes(device.read(256 * 1024)).decode("utf-8")) if device is not None else None
+            if not isinstance(request, dict):
+                raise NtpError("Bad request")
+            return self._handle(request)
+        except NtpError as exc:
+            return {"error": str(exc)}
+        except (ValueError, UnicodeError):
+            return {"error": "Bad request"}
+
+    @staticmethod
+    def shortcut_url(text) -> str:
+        text = str(text or "").strip()
+        if not text:
+            raise NtpError("Type a URL")
+        if "://" not in text and not text.lower().startswith(("file:", "about:")):
+            text = "https://" + text
+        url = QUrl(text, QUrl.ParsingMode.StrictMode)
+        if (not url.isValid() or url.scheme().lower() not in NTP_SHORTCUT_SCHEMES or len(text) > 4096
+                or (url.scheme().lower() != "file" and not url.host())):
+            raise NtpError("Type a valid URL")
+        return url.toString()
+
+    def _item(self, raw, items: list[dict], skip: int = -1) -> dict:
+        raw = raw if isinstance(raw, dict) else {}
+        url = self.shortcut_url(raw.get("url"))
+        if any(i != skip and item["url"] == url for i, item in enumerate(items)):
+            raise NtpError("Shortcut already exists")
+        title = " ".join(str(raw.get("title") or "").split())[:200]
+        return {"title": title or display_url(QUrl(url)), "url": url}
+
+    @staticmethod
+    def _index(value, items: list) -> int:
+        if type(value) is not int or not 0 <= value < len(items):
+            raise NtpError("That shortcut is gone - reload the page")
+        return value
+
+    def _handle(self, request: dict) -> dict:
+        action, s = request.get("action"), self.settings
+        if action == "navigate":
+            url = url_from_input(str(request.get("text") or "")[:8192], s.search_template())
+            if url.scheme().lower() in ("javascript", "data", "blob", "view-source"):
+                url = QUrl(s.search_template().format(quote_plus(str(request.get("text")))))
+            return {"url": url.toString(QUrl.ComponentFormattingOption.FullyEncoded)}
+        if action == "prefs":
+            if request.get("mode") in ("custom", "most_visited"):
+                s.set("ntp_shortcut_mode", request["mode"])
+            if isinstance(request.get("show"), bool):
+                s.set("ntp_show_shortcuts", request["show"])
+            if request.get("theme") == "" or any(request.get("theme") == key for key, _n, _c in NTP_COLORS):
+                s.set("ntp_theme", request["theme"])
+        elif action in ("add", "edit", "remove", "move", "set"):
+            items = [dict(t) for t in self.shortcuts()]
+            if action == "add":
+                if len(items) >= NTP_MAX_SHORTCUTS:
+                    raise NtpError(f"You can have up to {NTP_MAX_SHORTCUTS} shortcuts")
+                items.append(self._item(request, items))
+            elif action == "edit":
+                index = self._index(request.get("index"), items)
+                items[index] = self._item(request, items, skip=index)
+            elif action == "remove":
+                del items[self._index(request.get("index"), items)]
+            elif action == "move":
+                item = items.pop(self._index(request.get("index"), items))
+                to = request.get("to") if type(request.get("to")) is int else len(items)
+                items.insert(clamp(to, 0, len(items)), item)
+            else:  # "set": undoing a change puts the list back
+                raw = request.get("items") if isinstance(request.get("items"), list) else []
+                items = []
+                for entry in raw[:NTP_MAX_SHORTCUTS]:
+                    items.append(self._item(entry, items))
+            s.set("ntp_shortcuts", items)
+            s.set("ntp_shortcuts_edited", True)
+        elif action in ("hide", "unhide"):
+            url, hidden = str(request.get("url") or ""), self._hidden()
+            if action == "hide" and url and url not in hidden:
+                s.set("ntp_hidden", (hidden + [url])[-500:])
+            elif action == "unhide" and url in hidden:
+                s.set("ntp_hidden", [u for u in hidden if u != url])
+        elif action == "unhide_all":
+            s.set("ntp_hidden", [])
+        elif action != "state":
+            raise NtpError("Unknown request")
+        return self.state()
+
+
+class InternalPages(QWebEngineUrlSchemeHandler):
+    """foxglove://newtab: the New Tab page, its favicons (/favicon) and its API (/api)."""
+
+    def __init__(self, newtab, parent: QObject | None = None):
+        """*newtab*: a NewTabPage, or a function returning the page's HTML (tests)."""
+        super().__init__(parent)
+        self.ntp = newtab if isinstance(newtab, NewTabPage) else None
+        self.render_newtab = newtab.render if self.ntp is not None else newtab
 
     def requestStarted(self, job: QWebEngineUrlRequestJob) -> None:
-        if job.requestUrl().host() != "newtab":
+        url = job.requestUrl()
+        path = url.path() or "/"
+        if url.host() != "newtab":
+            job.fail(QWebEngineUrlRequestJob.Error.UrlNotFound)
+            return
+        # (refused with an empty or error answer: a failed job leaves the page's fetch() waiting for ever)
+        if path == "/favicon" and self.ntp is not None:
+            self._reply(job, b"image/png", self.ntp.favicon(job) or b"")
+            return
+        if path == "/api" and self.ntp is not None:
+            answer = self.ntp.api(job)
+            self._reply(job, b"application/json", json.dumps(answer or {"error": "Not allowed"}).encode("utf-8"))
+            return
+        if path != "/":
             job.fail(QWebEngineUrlRequestJob.Error.UrlNotFound)
             return
         try:
             body = self.render_newtab().encode("utf-8")
         except Exception as exc:  # never leave the tab hanging
+            log(f"New Tab page: {exc!r}")
             body = f"<!doctype html><title>New Tab</title><pre>{html.escape(str(exc))}</pre>".encode()
+        self._reply(job, b"text/html", body)
+
+    @staticmethod
+    def _reply(job: QWebEngineUrlRequestJob, mime: bytes, data: bytes) -> None:
+        try:  # never inside another page's frame
+            job.setAdditionalResponseHeaders({QByteArray(b"X-Frame-Options"): [QByteArray(b"DENY")],
+                                              QByteArray(b"Cache-Control"): [QByteArray(b"no-store")]})
+        except (AttributeError, TypeError):
+            pass
         buffer = QBuffer(job)  # owned by the job, so it lives exactly as long as the request
-        buffer.setData(body)
+        buffer.setData(data)
         buffer.open(QIODevice.OpenModeFlag.ReadOnly)
-        job.reply(b"text/html", buffer)
+        job.reply(mime, buffer)
 
 
-NEWTAB_HTML = """<!doctype html>
-<html><head><meta charset="utf-8"><title>New Tab</title><meta name="color-scheme" content="dark">
+# The Google logo (Chrome shows it in colour, or in one colour in dark mode and with a colour theme)
+GOOGLE_LOGO_SVG = """<svg class="glogo" viewBox="0 0 272 92" width="272" height="92" role="img" aria-label="Google">
+<path fill="#EA4335" d="M115.75 47.18c0 12.77-9.99 22.18-22.25 22.18s-22.25-9.41-22.25-22.18C71.25 34.32 81.24 25 93.5 25s22.25 9.32 22.25 22.18zm-9.74 0c0-7.98-5.79-13.44-12.51-13.44S80.99 39.2 80.99 47.18c0 7.9 5.79 13.44 12.51 13.44s12.51-5.55 12.51-13.44z"/>
+<path fill="#FBBC05" d="M163.75 47.18c0 12.77-9.99 22.18-22.25 22.18s-22.25-9.41-22.25-22.18c0-12.85 9.99-22.18 22.25-22.18s22.25 9.32 22.25 22.18zm-9.74 0c0-7.98-5.79-13.44-12.51-13.44s-12.51 5.46-12.51 13.44c0 7.9 5.79 13.44 12.51 13.44s12.51-5.55 12.51-13.44z"/>
+<path fill="#4285F4" d="M209.75 26.34v39.82c0 16.38-9.66 23.07-21.08 23.07-10.75 0-17.22-7.19-19.66-13.07l8.48-3.53c1.51 3.61 5.21 7.87 11.17 7.87 7.31 0 11.84-4.51 11.84-13v-3.19h-.34c-2.18 2.69-6.38 5.04-11.68 5.04-11.09 0-21.25-9.66-21.25-22.09 0-12.52 10.16-22.26 21.25-22.26 5.29 0 9.49 2.35 11.68 4.96h.34v-3.61h9.25zm-8.56 20.92c0-7.81-5.21-13.52-11.84-13.52-6.72 0-12.35 5.71-12.35 13.52 0 7.73 5.63 13.36 12.35 13.36 6.63 0 11.84-5.63 11.84-13.36z"/>
+<path fill="#34A853" d="M225 3v65h-9.5V3h9.5z"/>
+<path fill="#EA4335" d="M262.02 54.48l7.56 5.04c-2.44 3.61-8.32 9.83-18.48 9.83-12.6 0-22.01-9.74-22.01-22.18 0-13.19 9.49-22.18 20.92-22.18 11.51 0 17.14 9.16 18.98 14.11l1.01 2.52-29.65 12.28c2.27 4.45 5.8 6.72 10.75 6.72 4.96 0 8.4-2.44 10.92-6.14zm-23.27-7.98l19.82-8.23c-1.09-2.77-4.37-4.7-8.23-4.7-4.95 0-11.84 4.37-11.59 12.93z"/>
+<path fill="#4285F4" d="M35.29 41.41V32H67c.31 1.64.47 3.58.47 5.68 0 7.06-1.93 15.79-8.15 22.01-6.05 6.3-13.78 9.66-24.02 9.66C16.32 69.35.36 53.89.36 34.91.36 15.93 16.32.47 35.3.47c10.5 0 17.98 4.12 23.6 9.49l-6.64 6.64c-4.03-3.78-9.49-6.72-16.97-6.72-13.86 0-24.7 11.17-24.7 25.03 0 13.86 10.84 25.03 24.7 25.03 8.99 0 14.11-3.61 17.39-6.89 2.66-2.66 4.41-6.46 5.1-11.65l-22.49.01z"/>
+</svg>"""
+_G_ICON = ('<path fill="#4285F4" d="M45.12 24.5c0-1.56-.14-3.06-.4-4.5H24v8.51h11.84c-.51 2.75-2.06 5.08-4.39 6.64v5.52h7.11'
+           'c4.16-3.83 6.56-9.47 6.56-16.17z"/><path fill="#34A853" d="M24 46c5.94 0 10.92-1.97 14.56-5.33l-7.11-5.52c-1.97 '
+           '1.32-4.49 2.1-7.45 2.1-5.73 0-10.58-3.87-12.31-9.07H4.34v5.7C7.96 41.07 15.4 46 24 46z"/><path fill="#FBBC05" '
+           'd="M11.69 28.18C11.25 26.86 11 25.45 11 24s.25-2.86.69-4.18v-5.7H4.34C2.85 17.09 2 20.45 2 24c0 3.55.85 6.91 '
+           '2.34 9.88l7.35-5.7z"/><path fill="#EA4335" d="M24 10.75c3.23 0 6.13 1.11 8.41 3.29l6.31-6.31C34.91 4.18 29.93 2 '
+           '24 2 15.4 2 7.96 6.93 4.34 14.12l7.35 5.7c1.73-5.2 6.58-9.07 12.31-9.07z"/>')
+_PAGE = 'M12 4h17l9 9v29a2 2 0 0 1-2 2H12a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2z'
+_PETAL = '<path fill="{}" transform="rotate({} 24 24)" d="M24 24V5a9.5 9.5 0 0 1 0 19z"/>'
+# The Google apps menu (the grid button at the top right): simplified drawings of each app's icon
+NTP_APP_ICONS = {key: f'<svg viewBox="0 0 48 48" aria-hidden="true">{body}</svg>' for key, body in {
+    "account": '<circle cx="24" cy="24" r="21" fill="#c2e7ff"/><circle cx="24" cy="19" r="7" fill="#0b57d0"/>'
+               '<path fill="#0b57d0" d="M11 36.2c2.9-4.1 7.6-6.2 13-6.2s10.1 2.1 13 6.2A17 17 0 0 1 24 42a17 17 0 0 1-13-5.8z"/>',
+    "search": _G_ICON,
+    "maps": '<path fill="#34a853" d="M24 3C16.3 3 10 9.2 10 17c0 10.4 14 28 14 28s14-17.6 14-28C38 9.2 31.7 3 24 3z"/>'
+            '<path fill="#4285f4" d="M36.2 10.2 24 22l7.6 9.9C35 26.6 38 21 38 17c0-2.5-.6-4.7-1.8-6.8z"/>'
+            '<path fill="#ea4335" d="M24 3c-4.4 0-8.3 2-10.9 5.2L24 22l12.2-11.8C33.8 5.9 29.2 3 24 3z"/>'
+            '<path fill="#fbbc04" d="M13.1 8.2A13.9 13.9 0 0 0 10 17c0 3.6 1.7 8 4 12.2L24 22z"/><circle cx="24" cy="17" r="5" fill="#fff"/>',
+    "youtube": '<rect x="2" y="10" width="44" height="30" rx="9" fill="#ff0000"/><path fill="#fff" d="M19.5 18v14l12-7z"/>',
+    "play": '<path fill="#4285f4" d="M9 5l16 19L9 43z"/><path fill="#34a853" d="M9 5l25 14-9 5z"/>'
+            '<path fill="#ea4335" d="M9 43l16-19 9 5z"/><path fill="#fbbc04" d="M34 19l7 4a1.2 1.2 0 0 1 0 2l-7 4-9-5z"/>',
+    "news": '<rect x="9" y="5" width="30" height="10" rx="2" fill="#34a853"/><rect x="7" y="8" width="34" height="8" rx="2" fill="#ea4335"/>'
+            '<rect x="5" y="12" width="38" height="30" rx="3" fill="#4285f4"/><path fill="#fff" d="M10 19h15v3H10zm0 6h15v3H10zm0 6h11v3H10z"/>'
+            '<rect x="29" y="19" width="9" height="15" rx="1" fill="#c2e7ff"/>',
+    "gmail": '<path fill="#4285f4" d="M3 16.2l10 7.5V40H6a3 3 0 0 1-3-3z"/><path fill="#34a853" d="M45 16.2l-10 7.5V40h7a3 3 0 0 0 3-3z"/>'
+             '<path fill="#ea4335" d="M35 11.2 24 19.45 13 11.2v12.5l11 8.25 11-8.25z"/>'
+             '<path fill="#c5221f" d="M3 12.3v3.9l10 7.5V11.2L9.9 8.9A4.3 4.3 0 0 0 3 12.3z"/>'
+             '<path fill="#fbbc04" d="M45 12.3v3.9l-10 7.5V11.2l3.1-2.3A4.3 4.3 0 0 1 45 12.3z"/>',
+    "meet": '<path fill="#00ac47" d="M4 15a3 3 0 0 1 3-3h22a3 3 0 0 1 3 3v18a3 3 0 0 1-3 3H7a3 3 0 0 1-3-3z"/>'
+            '<path fill="#00832d" d="M32 20l10-7v22l-10-7z"/><path fill="#ea4335" d="M4 15a3 3 0 0 1 3-3h7v10H4z"/>'
+            '<path fill="#2684fc" d="M14 12h15a3 3 0 0 1 3 3v7H14z"/><path fill="#ffba00" d="M4 26h10v10H7a3 3 0 0 1-3-3z"/>',
+    "chat": '<path fill="#34a853" d="M8 6h32a4 4 0 0 1 4 4v22a4 4 0 0 1-4 4H18l-10 8V10a4 4 0 0 1 0-4z"/>'
+            '<circle cx="16" cy="21" r="2.6" fill="#fff"/><circle cx="24" cy="21" r="2.6" fill="#fff"/><circle cx="32" cy="21" r="2.6" fill="#fff"/>',
+    "contacts": '<circle cx="24" cy="24" r="21" fill="#1a73e8"/><circle cx="24" cy="19" r="6.5" fill="#fff"/>'
+                '<path fill="#fff" d="M12 34c2.5-4 7-6 12-6s9.5 2 12 6a15 15 0 0 1-24 0z"/>',
+    "drive": '<path fill="#00ac47" d="M16.6 6 3 29.6l7 12L23.6 18z"/><path fill="#ffba00" d="M16.6 6h14L45 29.6H31z"/>'
+             '<path fill="#2684fc" d="M10 41.6h28l7-12H17z"/>',
+    "calendar": '<rect x="6" y="6" width="36" height="36" rx="5" fill="#fff" stroke="#4285f4" stroke-width="4"/>'
+                '<text x="24" y="31.5" text-anchor="middle" font-size="17" font-weight="700" fill="#4285f4" '
+                'font-family="Arial, sans-serif">31</text>',
+    "translate": '<rect x="16" y="16" width="28" height="28" rx="3" fill="#e3e3e3"/><rect x="4" y="4" width="28" height="28" rx="3" '
+                 'fill="#4285f4"/><text x="18" y="25" fill="#fff" font-size="16" font-weight="700" text-anchor="middle" '
+                 'font-family="Arial, sans-serif">G</text><text x="36" y="40" fill="#4285f4" font-size="12" text-anchor="middle" '
+                 'font-family="sans-serif">文</text>',
+    "photos": "".join(_PETAL.format(color, angle) for color, angle in
+                      (("#ea4335", 0), ("#4285f4", 90), ("#34a853", 180), ("#fbbc04", 270))),
+    "docs": f'<path fill="#4285f4" d="{_PAGE}"/><path fill="#a1c2fa" d="M29 4v9h9z"/>'
+            '<path fill="#fff" d="M16 22h16v2.5H16zm0 5h16v2.5H16zm0 5h11v2.5H16z"/>',
+    "sheets": f'<path fill="#0f9d58" d="{_PAGE}"/><path fill="#87ceac" d="M29 4v9h9z"/>'
+              '<path fill="#fff" fill-rule="evenodd" d="M16 21h16v14H16zm2.5 2.5v3h4.2v-3zm6.8 0v3h4.2v-3zm-6.8 5.5v3.5h4.2V29zm6.8 0v3.5h4.2V29z"/>',
+    "slides": f'<path fill="#f4b400" d="{_PAGE}"/><path fill="#fadb80" d="M29 4v9h9z"/>'
+              '<path fill="#fff" fill-rule="evenodd" d="M15 21h18v13H15zm2.5 2.5v8h13v-8z"/>',
+    "gemini": '<defs><linearGradient id="gem" x1="8" y1="40" x2="40" y2="8" gradientUnits="userSpaceOnUse">'
+              '<stop offset="0" stop-color="#1c7df1"/><stop offset=".5" stop-color="#5684d1"/><stop offset="1" stop-color="#a87ffb"/>'
+              '</linearGradient></defs><path fill="url(#gem)" d="M24 4c1.2 10.6 9.4 18.8 20 20-10.6 1.2-18.8 9.4-20 20-1.2-10.6-'
+              '9.4-18.8-20-20 10.6-1.2 18.8-9.4 20-20z"/>',
+}.items()}
+NTP_APPS = (("account", "Account", "https://myaccount.google.com/"), ("search", "Search", "https://www.google.com/"),
+            ("maps", "Maps", "https://maps.google.com/"), ("youtube", "YouTube", "https://www.youtube.com/"),
+            ("play", "Play", "https://play.google.com/"), ("news", "News", "https://news.google.com/"),
+            ("gmail", "Gmail", "https://mail.google.com/mail/"), ("meet", "Meet", "https://meet.google.com/"),
+            ("chat", "Chat", "https://chat.google.com/"), ("contacts", "Contacts", "https://contacts.google.com/"),
+            ("drive", "Drive", "https://drive.google.com/"), ("calendar", "Calendar", "https://calendar.google.com/"),
+            ("translate", "Translate", "https://translate.google.com/"), ("photos", "Photos", "https://photos.google.com/"),
+            ("docs", "Docs", "https://docs.google.com/document/"), ("sheets", "Sheets", "https://docs.google.com/spreadsheets/"),
+            ("slides", "Slides", "https://docs.google.com/presentation/"), ("gemini", "Gemini", "https://gemini.google.com/"))
+
+# Google Chrome's New Tab page, after Chromium's chrome/browser/resources/new_tab_page (app, logo, searchbox,
+# most_visited, customize buttons): the same layout, sizes and colours.
+NEWTAB_HTML = r"""<!doctype html>
+<html lang="en" data-appearance="{{APPEARANCE}}" data-logo="{{LOGO_MODE}}"><head><meta charset="utf-8">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'nonce-{{NONCE}}'; style-src 'unsafe-inline'; img-src foxglove: data:; connect-src foxglove:; base-uri 'none'; form-action 'none'">
+<meta name="color-scheme" content="light dark"><title>New Tab</title>
+<style id="theme">{{THEME_CSS}}</style>
 <style>
-:root { --bg:#2b2a33; --fg:#fbfbfe; --accent:%(accent)s; --field:#1c1b22; }
-html, body { margin:0; min-height:100%%; background:var(--bg); color:var(--fg);
-  font: 15px -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif; }
-main { max-width: 680px; margin: 0 auto; padding: 24vh 24px 48px; display:flex; flex-direction:column; align-items:center; }
-.brand { display:flex; align-items:center; gap:16px; margin-bottom:34px; user-select:none; }
-.brand svg { width:72px; height:72px; filter: drop-shadow(0 4px 10px rgba(0,0,0,.35)); }
-.brand span { font-size:38px; font-weight:600; letter-spacing:.3px; }
-form { width:100%%; position:relative; margin:0; }
-form svg { position:absolute; left:16px; top:16px; width:20px; height:20px; opacity:.75; }
-input { width:100%%; box-sizing:border-box; height:52px; border-radius:8px; border:2px solid transparent;
-  background:var(--field); color:var(--fg); font-size:16px; padding:0 16px 0 48px; outline:none;
-  box-shadow:0 2px 10px rgba(0,0,0,.35); }
-input:focus { border-color:var(--accent); }
-input::placeholder { color:#8f8f9d; }
+* { box-sizing: border-box; }
+html { height: 100%; }
+body { margin: 0; min-height: 100%; min-width: fit-content; background: var(--bg); color: var(--text); overflow-x: hidden;
+  font: 13px system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif; }
+button { font: inherit; color: inherit; }
+svg { display: block; }
+[hidden] { display: none !important; }
+:focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; }
+.icon { width: 20px; height: 20px; fill: currentColor; }
+
+/* the One Google Bar */
+#ogb { position: absolute; top: 0; right: 0; height: 60px; display: flex; align-items: center; gap: 4px; padding: 0 16px 0 8px; z-index: 3; }
+#ogb .link { color: var(--ogb-text); text-decoration: none; font-size: 13px; line-height: 24px; padding: 0 8px; }
+#ogb .link:hover { text-decoration: underline; }
+.round { width: 40px; height: 40px; border: 0; border-radius: 50%; background: none; padding: 0; cursor: pointer;
+  display: grid; place-items: center; color: var(--icon); text-decoration: none; }
+.round:hover, .round[aria-expanded=true] { background: var(--ogb-hover); }
+.round .icon { width: 24px; height: 24px; }
+#avatar span { width: 32px; height: 32px; border-radius: 50%; background: var(--avatar-bg); color: var(--avatar-fg); display: grid; place-items: center; }
+#avatar .icon { width: 22px; height: 22px; }
+#apps-menu { position: fixed; top: 60px; right: 12px; width: 328px; max-height: calc(100vh - 76px); overflow-y: auto; z-index: 20;
+  background: var(--apps-bg); border-radius: 28px; padding: 8px; box-shadow: var(--menu-shadow); }
+.apps { display: grid; grid-template-columns: repeat(3, 1fr); gap: 4px; background: var(--apps-card); border-radius: 24px; padding: 16px 12px; }
+.app { display: flex; flex-direction: column; align-items: center; gap: 6px; padding: 10px 4px 8px; border-radius: 16px; color: var(--text);
+  text-decoration: none; font-size: 14px; }
+.app:hover { background: var(--menu-hover); }
+.app svg { width: 40px; height: 40px; }
+
+/* logo, search box, shortcuts */
+#content { display: flex; flex-direction: column; align-items: center; padding-top: 56px; min-height: 100vh; position: relative; z-index: 1; }
+#logo { flex-shrink: 0; min-height: 168px; display: flex; flex-direction: column; justify-content: flex-end; margin-bottom: 38px; user-select: none; }
+#logo svg { width: 272px; height: 92px; }
+:root[data-logo=single] .glogo path, :root[data-appearance=dark] .glogo path { fill: var(--logo); }
+@media (prefers-color-scheme: dark) { :root[data-appearance=system] .glogo path { fill: var(--logo); } }
+.wordmark { font-size: 60px; font-weight: 500; letter-spacing: -1px; line-height: 92px; color: var(--logo-text); }
+#searchbox { --box-width: 337px; position: relative; width: var(--box-width); margin: 0 0 16px; }
+@media (min-width: 560px) { #searchbox { --box-width: 449px; } }
+@media (min-width: 672px) { #searchbox { --box-width: 561px; } }
+#q { display: block; width: 100%; height: 48px; border: 0; border-radius: 24px; outline: none; background: var(--box-bg); color: var(--text);
+  box-shadow: var(--box-shadow); font: inherit; font-size: 16px; padding: 0 96px 0 52px; }
+#q:hover { background: var(--box-hover); box-shadow: var(--box-shadow-hover); }
+#q::placeholder { color: var(--placeholder); opacity: 1; }
+#searchbox .search-icon { position: absolute; left: 16px; top: 14px; width: 20px; height: 20px; fill: var(--icon); pointer-events: none; }
+.box-buttons { position: absolute; right: 8px; top: 4px; display: flex; }
+.box-buttons .round { width: 40px; height: 40px; }
+.box-buttons .round:hover { background: var(--tile-hover); }
+.box-buttons svg { width: 24px; height: 24px; }
+#tiles { --columns: 5; display: grid; grid-template-columns: repeat(var(--columns), 112px); justify-content: center; margin-top: 8px; }
+.tile { position: relative; width: 112px; height: 112px; border-radius: 4px; display: flex; flex-direction: column; align-items: center;
+  color: var(--tile-text); text-decoration: none; cursor: pointer; border: 0; background: none; padding: 0; user-select: none; outline-offset: -2px; }
+.tile:hover, .tile:focus-visible { background: var(--tile-hover); }
+.tile-icon { margin-top: 16px; width: 48px; height: 48px; flex-shrink: 0; border-radius: 50%; background: var(--tile-bg); display: grid; place-items: center; }
+.tile-icon img { width: 24px; height: 24px; }
+.tile-icon .icon { width: 24px; height: 24px; }
+.monogram { font-size: 18px; font-weight: 500; color: var(--icon); text-transform: uppercase; }
+.tile-title { margin-top: 6px; width: 88px; height: 28px; padding: 2px 8px; display: flex; align-items: center; }
+.tile-title span { width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; text-align: center; font-size: 13px; line-height: 16px; }
+.tile-action { position: absolute; top: 4px; right: 4px; width: 28px; height: 28px; border: 0; border-radius: 50%; background: none; padding: 0;
+  display: grid; place-items: center; color: var(--icon); cursor: pointer; opacity: 0; }
+.tile:hover .tile-action, .tile:focus-within .tile-action, .tile-action:focus-visible { opacity: 1; }
+.tile-action:hover { background: var(--tile-hover); }
+.tile-action .icon { width: 16px; height: 16px; }
+.tile.dragging { opacity: .4; }
+
+/* Customize Chrome */
+#customize { position: fixed; right: 16px; bottom: 16px; z-index: 2; height: 32px; border: 0; border-radius: 16px; padding: 0 16px 0 12px;
+  display: flex; align-items: center; gap: 8px; background: var(--tonal); color: var(--on-tonal); font-weight: 500; cursor: pointer;
+  box-shadow: 0 1px 2px 0 rgba(0,0,0,.3), 0 1px 3px 1px rgba(0,0,0,.15); }
+#customize:hover { background-image: linear-gradient(rgba(127,127,127,.12), rgba(127,127,127,.12)); }
+#customize .icon { width: 16px; height: 16px; }
+#panel { position: fixed; top: 0; right: 0; bottom: 0; width: 360px; max-width: 100vw; z-index: 10; overflow-y: auto; background: var(--panel-bg);
+  border-left: 1px solid var(--divider); box-shadow: -2px 0 6px rgba(0,0,0,.12); transform: translateX(105%); transition: transform .2s ease;
+  visibility: hidden; padding-bottom: 24px; }
+#panel.open { transform: none; visibility: visible; }
+.panel-head { display: flex; align-items: center; justify-content: space-between; height: 56px; padding: 0 8px 0 20px; }
+.panel-head h2 { margin: 0; font-size: 15px; font-weight: 500; }
+.panel-head .round { color: var(--text-2); }
+.card { margin: 0 12px 12px; padding: 16px; border-radius: 12px; background: var(--card-bg); }
+.card h3 { margin: 0 0 14px; font-size: 13px; font-weight: 500; }
+.chips { display: grid; grid-template-columns: repeat(6, 40px); gap: 12px; justify-content: space-between; }
+.chip { width: 40px; height: 40px; border-radius: 50%; border: 1px solid var(--divider); cursor: pointer; padding: 0;
+  background: linear-gradient(135deg, var(--chip) 50%, color-mix(in srgb, var(--chip) 30%, #fff) 50%); }
+.chip.default { --chip: #1a73e8; background: linear-gradient(135deg, #e8f0fe 50%, #1a73e8 50%); }
+.chip[aria-pressed=true] { outline: 2px solid var(--primary); outline-offset: 2px; }
+.row { display: flex; align-items: center; justify-content: space-between; gap: 12px; min-height: 40px; cursor: pointer; }
+.switch { appearance: none; width: 32px; height: 18px; border-radius: 9px; background: var(--outline); position: relative; cursor: pointer; margin: 0; flex-shrink: 0; transition: background .15s; }
+.switch::after { content: ""; position: absolute; top: 3px; left: 3px; width: 12px; height: 12px; border-radius: 50%; background: var(--bg); transition: left .15s; }
+.switch:checked { background: var(--primary); }
+.switch:checked::after { left: 17px; background: var(--on-primary); }
+.radio { display: flex; gap: 12px; padding: 10px 0; cursor: pointer; align-items: flex-start; }
+.radio input { margin: 2px 0 0; accent-color: var(--primary); width: 16px; height: 16px; }
+.radio b { display: block; font-weight: 400; }
+.radio small { display: block; color: var(--text-2); font-size: 12px; margin-top: 2px; }
+.radios[aria-disabled=true] { opacity: .45; pointer-events: none; }
+
+/* menus, dialogs, toast */
+.menu { position: fixed; z-index: 20; min-width: 160px; padding: 8px 0; background: var(--menu-bg); border-radius: 4px; box-shadow: var(--menu-shadow); }
+.menu button { display: block; width: 100%; height: 32px; padding: 0 24px; border: 0; background: none; text-align: left; cursor: pointer; color: var(--text); }
+.menu button:hover, .menu button:focus-visible { background: var(--menu-hover); outline: none; }
+dialog { width: 320px; border: 0; border-radius: 8px; padding: 0; background: var(--dialog-bg); color: var(--text);
+  box-shadow: 0 1px 3px 0 rgba(0,0,0,.3), 0 4px 8px 3px rgba(0,0,0,.15); }
+dialog::backdrop { background: var(--scrim); }
+dialog h2 { margin: 0; padding: 20px 20px 16px; font-size: 15px; font-weight: 400; }
+.field { padding: 0 20px 12px; }
+.field label { display: block; margin-bottom: 4px; color: var(--text-2); font-size: 12px; }
+.field input { width: 100%; height: 32px; border: 0; border-radius: 4px; padding: 0 8px; background: var(--field-bg); color: var(--text); font: inherit; outline: none; }
+.field input:focus { box-shadow: inset 0 -2px 0 var(--focus); }
+.error { min-height: 16px; margin-top: 4px; color: var(--error); font-size: 12px; }
+.buttons { display: flex; justify-content: flex-end; gap: 8px; padding: 12px 20px 20px; }
+.btn { height: 32px; padding: 0 16px; border: 1px solid var(--outline); border-radius: 16px; background: none; color: var(--link); font-weight: 500; cursor: pointer; }
+.btn.action { background: var(--primary); border-color: transparent; color: var(--on-primary); }
+.btn:disabled { opacity: .38; cursor: default; }
+#toast { position: fixed; left: 24px; bottom: 24px; z-index: 30; min-height: 48px; max-width: calc(100vw - 48px); display: flex; align-items: center;
+  gap: 16px; padding: 6px 8px 6px 16px; border-radius: 8px; background: var(--toast-bg); color: var(--toast-text);
+  box-shadow: 0 1px 3px 0 rgba(0,0,0,.3), 0 4px 8px 3px rgba(0,0,0,.15); }
+#toast span { flex: 1; }
+#toast button { height: 32px; padding: 0 12px; border: 0; border-radius: 16px; background: none; color: var(--toast-link); font-weight: 500; cursor: pointer; }
+#toast button:hover { background: rgba(127,127,127,.18); }
 </style></head>
-<body><main>
-<div class="brand">%(logo)s<span>%(app)s</span></div>
-<form id="search"><svg viewBox="0 0 24 24" fill="none" stroke="#fbfbfe" stroke-width="2" stroke-linecap="round">
-<circle cx="11" cy="11" r="7"/><path d="m20.5 20.5-4.5-4.5"/></svg>
-<input id="q" placeholder="Search with %(engine)s or enter address" autocomplete="off"></form>
+<body>
+<header id="ogb" {{OGB}}>
+  <a class="link" href="https://mail.google.com/mail/&amp;ogbl">Gmail</a>
+  <a class="link" href="https://www.google.com/imghp?hl=en&amp;ogbl">Images</a>
+  <button id="apps" class="round" type="button" title="Google apps" aria-label="Google apps" aria-expanded="false" aria-haspopup="true">
+    <svg class="icon" viewBox="0 0 24 24"><path d="M6 8c1.1 0 2-.9 2-2s-.9-2-2-2-2 .9-2 2 .9 2 2 2zm6 12c1.1 0 2-.9 2-2s-.9-2-2-2-2 .9-2 2 .9 2 2 2zm-6 0c1.1 0 2-.9 2-2s-.9-2-2-2-2 .9-2 2 .9 2 2 2zm0-6c1.1 0 2-.9 2-2s-.9-2-2-2-2 .9-2 2 .9 2 2 2zm6 0c1.1 0 2-.9 2-2s-.9-2-2-2-2 .9-2 2 .9 2 2 2zm4-8c0 1.1.9 2 2 2s2-.9 2-2-.9-2-2-2-2 .9-2 2zm-4 2c1.1 0 2-.9 2-2s-.9-2-2-2-2 .9-2 2 .9 2 2 2zm6 6c1.1 0 2-.9 2-2s-.9-2-2-2-2 .9-2 2 .9 2 2 2zm0 6c1.1 0 2-.9 2-2s-.9-2-2-2-2 .9-2 2 .9 2 2 2z"/></svg>
+  </button>
+  <a id="avatar" class="round" href="https://accounts.google.com/" title="Google Account" aria-label="Google Account"><span>
+    <svg class="icon" viewBox="0 0 24 24"><path d="M12 12c2.21 0 4-1.79 4-4s-1.79-4-4-4-4 1.79-4 4 1.79 4 4 4zm0 2c-2.67 0-8 1.34-8 4v2h16v-2c0-2.66-5.33-4-8-4z"/></svg>
+  </span></a>
+</header>
+<div id="apps-menu" role="menu" hidden><div class="apps">{{APPS}}</div></div>
+<main id="content">
+  <div id="logo">{{LOGO}}</div>
+  <form id="searchbox" role="search" autocomplete="off">
+    <svg class="search-icon" viewBox="0 0 24 24"><path d="M15.5 14h-.79l-.28-.27A6.47 6.47 0 0 0 16 9.5 6.5 6.5 0 1 0 9.5 16c1.61 0 3.09-.59 4.23-1.57l.27.28v.79l5 4.99L20.49 19l-4.99-5zm-6 0C7.01 14 5 11.99 5 9.5S7.01 5 9.5 5 14 7.01 14 9.5 11.99 14 9.5 14z"/></svg>
+    <input id="q" type="search" placeholder="{{PLACEHOLDER}}" aria-label="{{PLACEHOLDER}}" spellcheck="false" autocomplete="off" maxlength="2048">
+    <div class="box-buttons" {{OGB}}>
+      <button id="voice" class="round" type="button" title="Search by voice" aria-label="Search by voice"><svg viewBox="0 0 24 24">
+        <path fill="#4285f4" d="M12 15c1.66 0 3-1.31 3-2.97V5.01C15 3.35 13.66 2 12 2S9 3.34 9 5.01v7.02C9 13.69 10.34 15 12 15z"/>
+        <path fill="#34a853" d="M11 18.08h2V22h-2z"/>
+        <path fill="#fbbc04" d="M7.05 16.87C5.78 15.54 5 14.04 5 12h2c0 1.45.56 2.42 1.47 3.38v.32l-1.15 1.18z"/>
+        <path fill="#ea4335" d="M12 16.93a4.97 5.25 0 0 1-3.54-1.55l-1.41 1.49C8.31 18.21 10.07 19 12 19c3.87 0 6.99-2.92 6.99-7H17c0 2.92-2.24 4.93-5 4.93z"/>
+      </svg></button>
+      <a id="lens" class="round" href="https://lens.google.com/" title="Search by image" aria-label="Search by image"><svg viewBox="0 0 24 24">
+        <path fill="#ea4335" d="M3 7.5V7a4 4 0 0 1 4-4h1.5v2.2H7A1.8 1.8 0 0 0 5.2 7v.5z"/>
+        <path fill="#fbbc04" d="M3 16.5V17a4 4 0 0 0 4 4h1.5v-2.2H7A1.8 1.8 0 0 1 5.2 17v-.5z"/>
+        <path fill="#4285f4" d="M21 7.5V7a4 4 0 0 0-4-4h-1.5v2.2H17A1.8 1.8 0 0 1 18.8 7v.5z"/>
+        <circle cx="12" cy="12" r="3.3" fill="none" stroke="#4285f4" stroke-width="2.2"/>
+        <circle cx="18.2" cy="18.2" r="2.1" fill="#34a853"/>
+      </svg></a>
+    </div>
+  </form>
+  <div id="tiles" role="list" aria-label="Shortcuts"></div>
 </main>
-<script>
-const template = %(template)s;
-document.getElementById('search').addEventListener('submit', (e) => {
+<button id="customize" type="button" title="Customize this page" aria-controls="panel" aria-expanded="false">
+  <svg class="icon" viewBox="0 0 24 24"><path d="M3 17.25V21h3.75L17.81 9.94l-3.75-3.75L3 17.25zM20.71 7.04a1 1 0 0 0 0-1.41l-2.34-2.34a1 1 0 0 0-1.41 0l-1.83 1.83 3.75 3.75 1.83-1.83z"/></svg>
+  <span>Customize Chrome</span>
+</button>
+<aside id="panel" aria-label="Customize Chrome">
+  <div class="panel-head"><h2>Customize Chrome</h2>
+    <button id="panel-close" class="round" type="button" title="Close" aria-label="Close"><svg class="icon" viewBox="0 0 24 24"><path d="M19 6.41 17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"/></svg></button>
+  </div>
+  <section class="card"><h3>Appearance</h3>
+    <div class="chips"><button type="button" class="chip default" data-theme="" title="Default" aria-label="Default"></button>{{COLORS}}</div>
+  </section>
+  <section class="card"><h3>Shortcuts</h3>
+    <label class="row"><span>Show shortcuts</span><input id="show" class="switch" type="checkbox" role="switch"></label>
+    <div class="radios" id="modes">
+      <label class="radio"><input type="radio" name="mode" value="custom"><span><b>My shortcuts</b><small>Shortcuts are curated by you</small></span></label>
+      <label class="radio"><input type="radio" name="mode" value="most_visited"><span><b>Most visited sites</b><small>Shortcuts are suggested based on websites you visit often</small></span></label>
+    </div>
+  </section>
+</aside>
+<div id="tile-menu" class="menu" role="menu" hidden>
+  <button id="menu-edit" type="button" role="menuitem">Edit shortcut</button>
+  <button id="menu-remove" type="button" role="menuitem">Remove</button>
+</div>
+<dialog id="edit">
+  <form method="dialog" id="edit-form">
+    <h2 id="edit-title">Add shortcut</h2>
+    <div class="field"><label for="name">Name</label><input id="name" maxlength="200" spellcheck="false"></div>
+    <div class="field"><label for="url">URL</label><input id="url" maxlength="2048" spellcheck="false"><div id="url-error" class="error"></div></div>
+    <div class="buttons"><button id="cancel" class="btn" type="button">Cancel</button><button id="done" class="btn action" type="submit">Done</button></div>
+  </form>
+</dialog>
+<div id="toast" role="status" hidden><span id="toast-text"></span><button id="toast-undo" type="button">Undo</button><button id="toast-restore" type="button">Restore all</button></div>
+<template id="i-more"><svg class="icon" viewBox="0 0 24 24"><path d="M12 8c1.1 0 2-.9 2-2s-.9-2-2-2-2 .9-2 2 .9 2 2 2zm0 2c-1.1 0-2 .9-2 2s.9 2 2 2 2-.9 2-2-.9-2-2-2zm0 6c-1.1 0-2 .9-2 2s.9 2 2 2 2-.9 2-2-.9-2-2-2z"/></svg></template>
+<template id="i-close"><svg class="icon" viewBox="0 0 24 24"><path d="M19 6.41 17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"/></svg></template>
+<template id="i-add"><svg class="icon" viewBox="0 0 24 24"><path d="M19 13h-6v6h-2v-6H5v-2h6V5h2v6h6v2z"/></svg></template>
+<script type="application/json" id="state">{{STATE}}</script>
+<script nonce="{{NONCE}}">
+(() => {
+"use strict";
+const $ = (id) => document.getElementById(id);
+const S = JSON.parse($("state").textContent);
+const tiles = $("tiles"), q = $("q"), menu = $("tile-menu"), dialog = $("edit"), panel = $("panel"), apps = $("apps-menu");
+let menuIndex = -1, editing = -1, dragFrom = -1, undo = null, toastTimer = 0;
+
+async function api(body) {
+  const response = await fetch("/api", {method: "POST", body: JSON.stringify(body),
+    headers: {"Content-Type": "application/json", "X-NTP-Token": S.token}});
+  const answer = await response.json();
+  if (answer.error) throw new Error(answer.error);
+  return answer;
+}
+async function change(body) { const state = await api(body); Object.assign(S, state); render(); return state; }
+const el = (tag, cls, text) => { const e = document.createElement(tag); if (cls) e.className = cls; if (text) e.textContent = text; return e; };
+const icon = (name) => $("i-" + name).content.firstElementChild.cloneNode(true);
+const nameOf = (t) => t.title || (() => { try { return new URL(t.url).hostname.replace(/^www\./, ""); } catch { return t.url; } })();
+const copy = () => S.tiles.map((t) => ({title: t.title, url: t.url}));
+
+function monogram(name) { return el("span", "monogram", (name.replace(/^www\./, "")[0] || "?")); }
+
+function tile(t, index) {
+  const a = el("a", "tile"), name = nameOf(t);
+  a.href = t.url; a.title = name; a.setAttribute("role", "listitem"); a.draggable = S.mode === "custom";
+  const iconBox = el("div", "tile-icon");
+  if (t.icon) {
+    const img = new Image(); img.alt = ""; img.draggable = false; img.src = t.icon;
+    img.addEventListener("error", () => img.replaceWith(monogram(name)));
+    iconBox.append(img);
+  } else iconBox.append(monogram(name));
+  const title = el("div", "tile-title"); title.append(el("span", "", name));
+  const action = el("button", "tile-action"); action.type = "button";
+  if (S.mode === "custom") {
+    action.title = action.ariaLabel = `More actions for ${name} shortcut`; action.append(icon("more"));
+    action.addEventListener("click", (e) => { e.preventDefault(); e.stopPropagation(); openMenu(index, action); });
+  } else {
+    action.title = action.ariaLabel = "Don't show on this page"; action.append(icon("close"));
+    action.addEventListener("click", (e) => { e.preventDefault(); e.stopPropagation(); hideSite(t); });
+  }
+  a.append(iconBox, title, action);
+  if (S.mode === "custom") {
+    a.addEventListener("dragstart", (e) => { dragFrom = index; a.classList.add("dragging"); e.dataTransfer.effectAllowed = "move"; e.dataTransfer.setData("text/uri-list", t.url); });
+    a.addEventListener("dragend", () => { a.classList.remove("dragging"); dragFrom = -1; });
+    a.addEventListener("dragover", (e) => { if (dragFrom >= 0) { e.preventDefault(); e.dataTransfer.dropEffect = "move"; } });
+    a.addEventListener("drop", (e) => {
+      e.preventDefault();
+      const from = dragFrom; dragFrom = -1;
+      if (from >= 0 && from !== index) change({action: "move", index: from, to: index}).catch(() => {});
+    });
+  }
+  return a;
+}
+
+function addTile() {
+  const b = el("button", "tile add"); b.type = "button"; b.title = "Add shortcut"; b.setAttribute("role", "listitem");
+  const iconBox = el("div", "tile-icon"); iconBox.append(icon("add"));
+  const title = el("div", "tile-title"); title.append(el("span", "", "Add shortcut"));
+  b.append(iconBox, title);
+  b.addEventListener("click", () => openDialog(-1));
+  return b;
+}
+
+function render() {
+  $("theme").textContent = S.theme_css;
+  document.documentElement.dataset.logo = S.theme ? "single" : "color";
+  tiles.hidden = !S.show;
+  tiles.replaceChildren(...S.tiles.map(tile));
+  if (S.mode === "custom" && S.tiles.length < S.max) tiles.append(addTile());
+  const n = tiles.children.length;
+  tiles.style.setProperty("--columns", n <= 5 ? Math.max(n, 1) : Math.ceil(n / 2));
+  $("show").checked = S.show;
+  $("modes").setAttribute("aria-disabled", String(!S.show));
+  for (const radio of document.querySelectorAll("input[name=mode]")) radio.checked = radio.value === S.mode;
+  for (const chip of document.querySelectorAll(".chip")) chip.setAttribute("aria-pressed", String(chip.dataset.theme === S.theme));
+}
+
+// ── the search box: what the address bar would do with the text ──
+$("searchbox").addEventListener("submit", async (e) => {
   e.preventDefault();
-  const q = document.getElementById('q').value.trim();
-  if (!q) return;
-  const looksLikeUrl = /^[a-z][a-z0-9+.-]*:\\/\\//i.test(q) || (/^[^\\s/]+\\.[a-z]{2,}(:\\d+)?(\\/\\S*)?$/i.test(q));
-  location.href = looksLikeUrl ? (/^[a-z][a-z0-9+.-]*:\\/\\//i.test(q) ? q : 'https://' + q)
-                               : template.replace('{}', encodeURIComponent(q).replace(/%%20/g, '+'));
+  const text = q.value.trim();
+  if (!text) return;
+  try { const {url} = await api({action: "navigate", text}); if (url) location.href = url; } catch (err) { showToast(err.message); }
 });
+$("voice").addEventListener("click", () => { q.focus(); showToast("Voice search isn't available in this browser"); });
+
+// ── shortcut menu, dialog, toast ──
+function closeMenus() {
+  menu.hidden = true; apps.hidden = true; $("apps").setAttribute("aria-expanded", "false");
+}
+function openMenu(index, anchor) {
+  closeMenus();
+  menuIndex = index;
+  const r = anchor.getBoundingClientRect();
+  menu.hidden = false;
+  menu.style.left = Math.max(8, Math.min(r.left, innerWidth - menu.offsetWidth - 8)) + "px";
+  menu.style.top = Math.min(r.bottom + 4, innerHeight - menu.offsetHeight - 8) + "px";
+  $("menu-edit").focus();
+}
+$("menu-edit").addEventListener("click", () => { closeMenus(); openDialog(menuIndex); });
+$("menu-remove").addEventListener("click", async () => {
+  closeMenus();
+  const before = copy();
+  try { await change({action: "remove", index: menuIndex}); showToast("Shortcut removed", () => change({action: "set", items: before})); }
+  catch (err) { showToast(err.message); }
+});
+function openDialog(index) {
+  editing = index;
+  const t = index >= 0 ? S.tiles[index] : {title: "", url: ""};
+  $("edit-title").textContent = index >= 0 ? "Edit shortcut" : "Add shortcut";
+  $("name").value = index >= 0 ? nameOf(t) : ""; $("url").value = t.url; $("url-error").textContent = "";
+  $("done").disabled = !$("url").value.trim();
+  dialog.showModal(); $("name").focus();
+}
+$("url").addEventListener("input", () => { $("done").disabled = !$("url").value.trim(); $("url-error").textContent = ""; });
+$("cancel").addEventListener("click", () => dialog.close());
+$("edit-form").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const before = copy(), adding = editing < 0;
+  try {
+    await change({action: adding ? "add" : "edit", index: editing, title: $("name").value, url: $("url").value});
+  } catch (err) { $("url-error").textContent = err.message; return; }
+  dialog.close();
+  showToast(adding ? "Shortcut added" : "Shortcut edited", () => change({action: "set", items: before}));
+});
+async function hideSite(t) {
+  try {
+    await change({action: "hide", url: t.url});
+    showToast("Shortcut removed", () => change({action: "unhide", url: t.url}), () => change({action: "unhide_all"}));
+  } catch (err) { showToast(err.message); }
+}
+function showToast(text, onUndo, onRestore) {
+  $("toast-text").textContent = text;
+  undo = onUndo || null;
+  $("toast-undo").hidden = !onUndo; $("toast-restore").hidden = !onRestore;
+  $("toast-restore").onclick = onRestore ? () => { hideToast(); onRestore().catch(() => {}); } : null;
+  $("toast").hidden = false;
+  clearTimeout(toastTimer); toastTimer = setTimeout(hideToast, 10000);
+}
+function hideToast() { $("toast").hidden = true; undo = null; }
+function doUndo() { const action = undo; hideToast(); if (action) action().catch((err) => showToast(err.message)); }
+$("toast-undo").addEventListener("click", doUndo);
+
+// ── Google apps, Customize Chrome ──
+$("apps").addEventListener("click", (e) => {
+  e.stopPropagation();
+  const open = apps.hidden;
+  closeMenus(); apps.hidden = !open; $("apps").setAttribute("aria-expanded", String(open));
+});
+function setPanel(open) {
+  panel.classList.toggle("open", open); $("customize").setAttribute("aria-expanded", String(open));
+  if (open) $("panel-close").focus();
+}
+$("customize").addEventListener("click", (e) => { e.stopPropagation(); setPanel(!panel.classList.contains("open")); });
+$("panel-close").addEventListener("click", () => setPanel(false));
+$("show").addEventListener("change", () => change({action: "prefs", show: $("show").checked}).catch(() => {}));
+for (const radio of document.querySelectorAll("input[name=mode]"))
+  radio.addEventListener("change", () => change({action: "prefs", mode: radio.value}).catch(() => {}));
+for (const chip of document.querySelectorAll(".chip"))
+  chip.addEventListener("click", () => change({action: "prefs", theme: chip.dataset.theme}).catch(() => {}));
+
+document.addEventListener("click", (e) => {
+  if (!menu.contains(e.target) && !apps.contains(e.target)) closeMenus();
+  if (panel.classList.contains("open") && !panel.contains(e.target) && !dialog.open) setPanel(false);
+});
+document.addEventListener("keydown", (e) => {
+  if (e.key === "Escape") { closeMenus(); setPanel(false); }
+  const typing = /^(INPUT|TEXTAREA)$/.test((document.activeElement || {}).tagName || "");
+  if ((e.ctrlKey || e.metaKey) && !e.shiftKey && e.key.toLowerCase() === "z" && undo && !typing) { e.preventDefault(); doUndo(); }
+});
+render();
+})();
 </script>
 </body></html>"""
 
@@ -7967,6 +8709,95 @@ class ExtensionPopup(Panel):
         self.close()
 
 
+class PrivacyScreen(QWidget):
+    """Covers a browser window - toolbars and all - with an opaque grey screen and the logo while Chrome 2 isn't the
+    active application (another app in front, swiping between desktops, Mission Control, the app switcher), so what's
+    on the pages doesn't show there. It follows the application's state, not the window's: Chrome 2's own dialogs,
+    menus and panels don't set it off. Fades in, and goes at once when the app is active again; it never takes a click
+    or a key. Settings > Privacy turns it off ("privacy_screen")."""
+
+    FADE_MS = 120
+    DELAY_MS = 40  # an app that is inactive for less (a full-screen switch, a system prompt flashing by) isn't covered
+    COLOR = "#5f6368"
+
+    def __init__(self, window: QWidget, settings: Settings):
+        from PyQt6.QtCore import QVariantAnimation
+        super().__init__(window)
+        self.settings = settings
+        self.covering = False
+        self.opacity = 0.0
+        self._logo = None
+        self.setObjectName("PrivacyScreen")
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.hide()
+        self._fade = QVariantAnimation(self)
+        self._fade.setDuration(self.FADE_MS)
+        self._fade.valueChanged.connect(self._set_opacity)
+        self._delay = QTimer(self)
+        self._delay.setSingleShot(True)
+        self._delay.setInterval(self.DELAY_MS)
+        self._delay.timeout.connect(self.cover)
+        window.installEventFilter(self)
+        QGuiApplication.instance().applicationStateChanged.connect(self._on_state)
+        settings.changed.connect(self._on_setting)
+
+    def _on_state(self, state) -> None:
+        if state == Qt.ApplicationState.ApplicationActive:
+            self.uncover()
+        elif self.settings.get("privacy_screen") and not self.covering:
+            self._delay.start()
+
+    def _on_setting(self, key: str) -> None:
+        if key == "privacy_screen" and not self.settings.get("privacy_screen"):
+            self.uncover()
+
+    def cover(self) -> None:
+        self._delay.stop()
+        parent = self.parentWidget()
+        if self.covering or parent is None or not self.settings.get("privacy_screen"):
+            return
+        self.covering = True
+        self.setGeometry(parent.rect())
+        self.raise_()
+        self.show()
+        self._fade.stop()
+        self._fade.setStartValue(self.opacity)
+        self._fade.setEndValue(1.0)
+        self._fade.start()
+
+    def uncover(self) -> None:
+        self._delay.stop()
+        self._fade.stop()
+        self.covering = False
+        self.opacity = 0.0
+        self.hide()
+
+    def _set_opacity(self, value) -> None:
+        self.opacity = float(value)
+        self.update()
+
+    def eventFilter(self, obj, event) -> bool:
+        if obj is self.parentWidget():
+            if event.type() == QEvent.Type.Resize:
+                self.setGeometry(obj.rect())
+            elif event.type() == QEvent.Type.ChildAdded and self.covering:  # stay on top of anything shown meanwhile
+                QTimer.singleShot(0, lambda: None if sip.isdeleted(self) or not self.covering else self.raise_())
+        return False
+
+    def paintEvent(self, event) -> None:
+        size = clamp(min(self.width(), self.height()) // 5, 48, 128)
+        scale = self.devicePixelRatioF()
+        if self._logo is None or self._logo.width() != round(size * scale):  # one image: fades as a whole
+            self._logo = logo_image(round(size * scale))
+            self._logo.setDevicePixelRatio(scale)
+        painter = QPainter(self)
+        painter.setOpacity(self.opacity)
+        painter.fillRect(self.rect(), QColor(self.COLOR))
+        painter.drawImage(QRectF((self.width() - size) / 2, (self.height() - size) / 2, size, size), self._logo)
+        painter.end()
+
+
 class PopupWindow(QWidget):
     """A small window for pages opened with window.open(..., features) - e.g. "Sign in with…" pop-ups."""
 
@@ -8007,6 +8838,7 @@ class PopupWindow(QWidget):
             self.move(win.geometry().center() - self.rect().center())
         win.popups.add(self)
         self.destroyed.connect(lambda *_: win.popups.discard(self))
+        self.privacy_screen = PrivacyScreen(self, win.settings)
 
     def _on_url(self, url: QUrl) -> None:
         secure = url.scheme() == "https"
@@ -8856,6 +9688,12 @@ class SettingsDialog(QDialog):
         layout.addLayout(privacy_row)
         layout.addWidget(tone_label("Cookies and website data are kept when you quit (including session cookies), so "
                                     "websites keep you signed in.", "dim", wrap=True))
+        self.privacy_screen = QCheckBox(f"Hide pages when {APP_NAME} isn't in focus")
+        self.privacy_screen.setToolTip(f"While another app is in front (or you switch desktops), {APP_NAME}'s windows "
+                                       "turn grey, so nobody sees your pages in the app switcher or over your shoulder")
+        self.privacy_screen.setChecked(settings.get("privacy_screen"))
+        self.privacy_screen.toggled.connect(lambda on: settings.set("privacy_screen", on))
+        layout.addWidget(self.privacy_screen)
         layout.addSpacing(6)
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
         buttons.rejected.connect(self.reject)
@@ -8954,7 +9792,7 @@ def vpn_endpoint(cfg: dict, probe: bool = True) -> VpnEndpoint | None:
 
 
 class VpnPanel(Panel):
-    """Choose how Foxglove connects: directly, through Tor, Cloudflare WARP or your own proxy server."""
+    """Choose how Chrome 2 connects: directly, through Tor, Cloudflare WARP or your own proxy server."""
 
     def __init__(self, win: "BrowserWindow"):
         super().__init__(win, pinned=True)  # stays open while you copy details from elsewhere
@@ -8971,7 +9809,7 @@ class VpnPanel(Panel):
         top.addWidget(tone_label(f"On · {VPN_PRESETS[active.mode]['label'] if active.mode in VPN_PRESETS else 'Your proxy'}"
                                  if active else "Off", "accent" if active else "dim"))
         layout.addLayout(top)
-        layout.addWidget(tone_label("Send Foxglove's traffic through:", "secondary"))
+        layout.addWidget(tone_label(f"Send {APP_NAME}'s traffic through:", "secondary"))
         self.group = QButtonGroup(self)
         self.radios: dict[str, QRadioButton] = {}
         for mode, title, help_text in (
@@ -9027,7 +9865,7 @@ class VpnPanel(Panel):
         self.result = tone_label("", "secondary", wrap=True)
         self.result.hide()
         layout.addWidget(self.result)
-        layout.addWidget(tone_label("Only Foxglove's own traffic uses the VPN. Applying restarts Foxglove; your tabs "
+        layout.addWidget(tone_label(f"Only {APP_NAME}'s own traffic uses the VPN. Applying restarts {APP_NAME}; your tabs "
                                     "and logins come back.", "dim", wrap=True))
         buttons = QHBoxLayout()
         buttons.addStretch(1)
@@ -9403,6 +10241,7 @@ class BrowserWindow(QMainWindow):
         self._autosave.start()
         self._rebuild_extension_buttons()
         self._restore(startup_urls)
+        self.privacy_screen = PrivacyScreen(self, settings)
 
     # ── construction ────────────────────────────────────────────────────────────────────
     def _build_nav_bar(self) -> QWidget:
@@ -10484,7 +11323,7 @@ class BrowserWindow(QMainWindow):
         self.toast(f"Imported {count} bookmark{'s' if count != 1 else ''}.")
 
     def export_bookmarks(self) -> None:
-        default = str(Path.home() / f"{APP_NAME.lower()}-bookmarks-{time.strftime('%Y-%m-%d')}.html")
+        default = str(Path.home() / f"{APP_NAME.lower().replace(' ', '-')}-bookmarks-{time.strftime('%Y-%m-%d')}.html")
         path, _ = QFileDialog.getSaveFileName(self, "Export Bookmarks", default, "Bookmark files (*.html)")
         if not path:
             return
@@ -11179,7 +12018,7 @@ class BrowserWindow(QMainWindow):
 
     def show_about(self) -> None:
         QMessageBox.about(self, f"About {APP_NAME}",
-                          f"<h3>{APP_NAME} {APP_VERSION}</h3><p>A Firefox-inspired browser written in Python.</p>"
+                          f"<h3>{APP_NAME} {APP_VERSION}</h3><p>A Chrome-style browser written in Python.</p>"
                           f"<p>Qt {QT_VERSION_STR} · Chromium {qWebEngineChromiumVersion()}<br>"
                           f"Python {sys.version.split()[0]}</p>")
 
@@ -11327,21 +12166,11 @@ class BrowserWindow(QMainWindow):
 # ══════════════════════════════════════════════════════════════════════════════════════════
 #  Start-up
 # ══════════════════════════════════════════════════════════════════════════════════════════
-def render_newtab_page(settings: Settings) -> str:
-    engine = settings.get("search_engine")
-    return NEWTAB_HTML % {
-        "accent": P.ACCENT,
-        "logo": LOGO_SVG.replace('<svg ', '<svg aria-hidden="true" ', 1),
-        "app": APP_NAME,
-        "engine": html.escape(engine),
-        "template": json.dumps(settings.search_template()),
-    }
-
-
 def register_url_schemes() -> None:
     """foxglove:// (internal pages) and foxglove-ext:// (the extension bridge) - must happen before QApplication."""
     F = QWebEngineUrlScheme.Flag
-    for name, flags in ((b"foxglove", F.SecureScheme | F.LocalScheme | F.LocalAccessAllowed),
+    # foxglove: local (no other scheme may load it), fetch() for the New Tab page's own API
+    for name, flags in ((b"foxglove", F.SecureScheme | F.LocalScheme | F.LocalAccessAllowed | F.FetchApiAllowed),
                         # service workers may only fetch() schemes flagged ServiceWorkersAllowed; LocalScheme would block it
                         (EXT_SCHEME.encode(), F.SecureScheme | F.CorsEnabled | F.FetchApiAllowed | F.ServiceWorkersAllowed)):
         if QWebEngineUrlScheme.schemeByName(name).name().isEmpty():
@@ -11351,8 +12180,18 @@ def register_url_schemes() -> None:
             QWebEngineUrlScheme.registerScheme(scheme)
 
 
+def set_application_names() -> Path:
+    """Qt's application name stays DATA_NAME, so the data folder (and Qt WebEngine's profile and extension folders
+    in it) are found where they always were; people see APP_NAME (QApplication.setApplicationDisplayName).
+    Returns the data folder."""
+    QCoreApplication.setApplicationName(DATA_NAME)
+    QCoreApplication.setOrganizationName("")
+    QCoreApplication.setApplicationVersion(APP_VERSION)
+    return Path(QStandardPaths.writableLocation(QStandardPaths.StandardLocation.AppDataLocation))
+
+
 def set_macos_app_name(name: str) -> None:
-    """Show "Foxglove" instead of "Python" in the macOS menu bar (needs to run before QApplication)."""
+    """Show *name* ("Chrome 2") instead of "Python" in the macOS menu bar (needs to run before QApplication)."""
     if not IS_MAC:
         return
     try:
@@ -11488,21 +12327,143 @@ def apply_browser_identity(profile: QWebEngineProfile) -> str:
     return user_agent
 
 
+# ── python3 foxglove.py --install-app: an app to start Chrome 2 from the Dock / app menu ──────────────────────────────
+APP_BUNDLE_ID = "local.foxglove.chrome2"
+APP_EXECUTABLE = "chrome2"
+ICONSET_SIZES = ((16, 1), (16, 2), (32, 1), (32, 2), (128, 1), (128, 2), (256, 1), (256, 2), (512, 1), (512, 2))
+ICNS_TYPES = {16: b"icp4", 32: b"icp5", 64: b"icp6", 128: b"ic07", 256: b"ic08", 512: b"ic09", 1024: b"ic10"}
+
+
+def _gui_app() -> QGuiApplication:
+    """Rendering icons needs a QGuiApplication: an off-screen one if none is running (no Dock icon for it)."""
+    app = QGuiApplication.instance()
+    if app is None:
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        app = QGuiApplication([sys.argv[0] or "foxglove.py"])
+    return app
+
+
+def _png(size: int) -> bytes:
+    data = QByteArray()
+    buffer = QBuffer(data)
+    buffer.open(QIODevice.OpenModeFlag.WriteOnly)
+    logo_image(size, 0.08 if size >= 64 else 0.0).save(buffer, "PNG")
+    buffer.close()
+    return bytes(data)
+
+
+def write_icns(target: Path) -> str:
+    """The logo as a macOS icon file, at every iconset size: made with iconutil when there is one (macOS), else written
+    directly (PNG-based .icns, which macOS reads too). Returns how it was made."""
+    _gui_app()
+    with tempfile.TemporaryDirectory() as tmp:
+        iconset = Path(tmp) / "icon.iconset"
+        iconset.mkdir()
+        for size, scale in ICONSET_SIZES:
+            (iconset / f"icon_{size}x{size}{'@2x' if scale == 2 else ''}.png").write_bytes(_png(size * scale))
+        iconutil = shutil.which("iconutil")
+        if iconutil:
+            try:
+                subprocess.run([iconutil, "-c", "icns", str(iconset), "-o", str(target)], check=True, timeout=60,
+                               capture_output=True)
+                return "iconutil"
+            except (OSError, subprocess.SubprocessError) as exc:
+                log(f"iconutil couldn't make the icon ({exc}); writing it directly")
+    chunks = b"".join(kind + (8 + len(png)).to_bytes(4, "big") + png
+                      for kind, png in ((kind, _png(px)) for px, kind in ICNS_TYPES.items()))
+    target.write_bytes(b"icns" + (8 + len(chunks)).to_bytes(4, "big") + chunks)
+    return "direct"
+
+
+def make_app_bundle(bundle: Path, python: str, script: str) -> Path:
+    """A macOS app bundle that starts *script* with *python* (the Python - venv - it was made with), logging to
+    ~/Library/Logs/Chrome 2.log. Made in a temporary folder first, then put in place of any older one."""
+    import plistlib
+    import shlex
+    bundle.parent.mkdir(parents=True, exist_ok=True)
+    staging = bundle.with_name(bundle.name + ".part")
+    shutil.rmtree(staging, ignore_errors=True)
+    contents = staging / "Contents"
+    (contents / "MacOS").mkdir(parents=True)
+    (contents / "Resources").mkdir()
+    info = {
+        "CFBundleName": APP_NAME, "CFBundleDisplayName": APP_NAME, "CFBundleIdentifier": APP_BUNDLE_ID,
+        "CFBundleExecutable": APP_EXECUTABLE, "CFBundleIconFile": "icon.icns", "CFBundlePackageType": "APPL",
+        "CFBundleSignature": "????", "CFBundleVersion": APP_VERSION, "CFBundleShortVersionString": APP_VERSION,
+        "CFBundleInfoDictionaryVersion": "6.0", "LSMinimumSystemVersion": "11.0", "NSHighResolutionCapable": True,
+        "NSSupportsAutomaticGraphicsSwitching": True, "LSApplicationCategoryType": "public.app-category.productivity",
+    }
+    (contents / "Info.plist").write_bytes(plistlib.dumps(info))
+    (contents / "PkgInfo").write_text("APPL????", encoding="ascii")
+    launcher = contents / "MacOS" / APP_EXECUTABLE
+    launcher.write_text(
+        "#!/bin/sh\n"
+        f"# Starts {APP_NAME}; made by: python3 foxglove.py --install-app (run that again if Python or the script moves)\n"
+        f'LOG="$HOME/Library/Logs/{APP_NAME}.log"\n'
+        'mkdir -p "$HOME/Library/Logs"\n'
+        f'echo "--- $(date): starting {APP_NAME}" >>"$LOG"\n'
+        f'exec {shlex.quote(python)} {shlex.quote(script)} "$@" >>"$LOG" 2>&1\n', encoding="utf-8")
+    launcher.chmod(0o755)
+    write_icns(contents / "Resources" / "icon.icns")
+    shutil.rmtree(bundle, ignore_errors=True)
+    staging.rename(bundle)
+    return bundle
+
+
+def install_app(home: Path | None = None) -> int:
+    """--install-app: macOS: ~/Applications/Chrome 2.app (for the Dock); Linux: an app-menu launcher."""
+    home = home or Path.home()
+    python, script = sys.executable, os.path.abspath(__file__)
+    if IS_MAC:
+        bundle = make_app_bundle(home / "Applications" / f"{APP_NAME}.app", python, script)
+        lsregister = Path("/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework"
+                          "/Support/lsregister")
+        if lsregister.exists():  # so Finder and the Dock show the new icon right away
+            subprocess.run([str(lsregister), "-f", str(bundle)], capture_output=True, timeout=60, check=False)
+        print(f"Made {bundle}\n\n"
+              f"Open it from Finder (Go > Home > Applications), Launchpad or Spotlight (type “{APP_NAME}”).\n"
+              f"To keep it in the Dock: drag “{APP_NAME}” from that folder onto the Dock, or right-click its Dock icon "
+              "while it runs > Options > Keep in Dock.\n"
+              f"It starts {script}\nwith {python} - run --install-app again if either moves.\n"
+              f"Its output goes to ~/Library/Logs/{APP_NAME}.log")
+        return 0
+    if sys.platform.startswith("linux"):
+        data = Path(os.environ.get("XDG_DATA_HOME") or home / ".local" / "share")
+        icon_path = data / "icons" / "hicolor" / "256x256" / "apps" / "chrome-2.png"
+        icon_path.parent.mkdir(parents=True, exist_ok=True)
+        _gui_app()
+        icon_path.write_bytes(_png(256))
+        desktop = data / "applications" / "chrome-2.desktop"
+        desktop.parent.mkdir(parents=True, exist_ok=True)
+        quoted = " ".join('"' + part.replace("\\", "\\\\").replace('"', '\\"').replace("$", "\\$").replace("`", "\\`")
+                          + '"' for part in (python, script))
+        desktop.write_text("[Desktop Entry]\nType=Application\n"
+                           f"Name={APP_NAME}\nComment=Web browser\nExec={quoted} %U\nIcon={icon_path}\n"
+                           "Terminal=false\nCategories=Network;WebBrowser;\nStartupNotify=true\n"
+                           f"StartupWMClass={DATA_NAME}\n", encoding="utf-8")  # (Qt's window class: the app name)
+        print(f"--install-app makes a macOS app; on Linux it added {APP_NAME} to your app menu instead:\n  {desktop}")
+        return 0
+    print(f"--install-app makes a macOS app (~/Applications/{APP_NAME}.app). On this system, start {APP_NAME} with:\n"
+          f"  {python} {script}")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     argv = list(sys.argv if argv is None else argv)
     parser = argparse.ArgumentParser(prog="foxglove.py", description=f"{APP_NAME} web browser")
     parser.add_argument("urls", nargs="*", help="pages to open")
     parser.add_argument("--profile", default="default", help="profile name (separate tabs, bookmarks and cookies)")
     parser.add_argument("--verbose", action="store_true", help="show Chromium's messages, including extensions' errors")
+    parser.add_argument("--install-app", action="store_true",
+                        help=f"make ~/Applications/{APP_NAME}.app (macOS) to start {APP_NAME} from the Dock, then quit")
     options, _unknown = parser.parse_known_args(argv[1:])
+    if options.install_app:
+        return install_app()
     profile_name = re.sub(r"[^A-Za-z0-9_.-]", "_", options.profile) or "default"
     global VERBOSE
     VERBOSE = options.verbose
 
-    QCoreApplication.setApplicationName(APP_NAME)
-    QCoreApplication.setOrganizationName("")
-    QCoreApplication.setApplicationVersion(APP_VERSION)
-    data_root = Path(QStandardPaths.writableLocation(QStandardPaths.StandardLocation.AppDataLocation))
+    data_root = set_application_names()
     profile_dir = data_root / "Profiles" / profile_name
     profile_dir.mkdir(parents=True, exist_ok=True)
     settings_preview = read_json(profile_dir / "settings.json", {})
@@ -11531,7 +12492,7 @@ def main(argv: list[str] | None = None) -> int:
     app.setAttribute(Qt.ApplicationAttribute.AA_DontShowIconsInMenus, False)
     apply_dark_palette(app)
     app.setStyleSheet(build_stylesheet())
-    app.setWindowIcon(icons().logo())
+    app.setWindowIcon(icons().app_icon())  # (the Dock icon on macOS)
     # The VPN/proxy must be in place before the first profile exists: Qt WebEngine reads it once, and
     # switching later lets already-open connections bypass it. Changing it restarts Foxglove.
     if vpn is None:
@@ -11575,7 +12536,7 @@ def main(argv: list[str] | None = None) -> int:
         web_settings.setAttribute(getattr(attribute, name), value)
     web_settings.setAttribute(attribute.ForceDarkMode, settings.get("force_dark_pages"))
 
-    pages = InternalPages(lambda: render_newtab_page(settings), app)
+    pages = InternalPages(NewTabPage(settings, history, favicons, app), app)
     profile.installUrlSchemeHandler(b"foxglove", pages)
     extensions = ExtensionsController(profile, profile_dir / "extensions.json", profile_dir / "extension-staging", user_agent)
 
@@ -11626,7 +12587,7 @@ def main(argv: list[str] | None = None) -> int:
 
 
 def restart_process(profile_name: str, original_flags: str | None) -> None:
-    """Start Foxglove again in this same process (same terminal, same Ctrl+C), e.g. to apply a VPN change."""
+    """Start Chrome 2 again in this same process (same terminal, same Ctrl+C), e.g. to apply a VPN change."""
     if original_flags is None:
         os.environ.pop("QTWEBENGINE_CHROMIUM_FLAGS", None)
     else:

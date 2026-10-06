@@ -10,7 +10,7 @@ Foxglove - a Firefox-inspired web browser written in Python (PyQt6 + Qt WebEngin
     .crx/.zip file or an unpacked folder; toolbar popups with badges, options pages, enable/disable/remove.
     Foxglove fills in the extension APIs its engine lacks - chrome.action, contextMenus, notifications,
     alarms, tabs, windows, scripting, offscreen, storage.sync/onChanged, i18n, commands - so extensions
-    built for Chrome run (ad blockers' network rules are kept but not enforced yet)
+    built for Chrome run, including ad blockers' declarativeNetRequest rules
   * VPN / proxy: route the browser through Tor, Cloudflare WARP or your own HTTP/SOCKS5 proxy,
     with WebRTC leak protection, a connection check and a kill switch (shield button in the toolbar)
   * Smart address bar (history + bookmarks), downloads panel, find in page, per-site zoom,

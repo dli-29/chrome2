@@ -144,6 +144,16 @@ PERMISSION_TEXT = {
     _PT.ClipboardReadWrite: "read and write your clipboard",
     _PT.LocalFontsAccess: "use the fonts installed on your computer",
 }
+# Site settings rows. Qt stores decisions for location, notifications, clipboard and fonts itself; camera, microphone
+# and pointer lock it asks about every time, so Foxglove remembers those ("site_permissions"). Screen sharing can only
+# be blocked: like Chrome, Foxglove always asks before a site sees your screen.
+SITE_PERMISSIONS = ((_PT.Geolocation, "Location"), (_PT.MediaVideoCapture, "Camera"), (_PT.MediaAudioCapture, "Microphone"),
+                    (_PT.Notifications, "Notifications"), (_PT.ClipboardReadWrite, "Clipboard"),
+                    (_PT.DesktopVideoCapture, "Screen sharing"), (_PT.MouseLock, "Pointer lock"),
+                    (_PT.LocalFontsAccess, "Fonts on your computer"))
+PERMISSION_PARTS = {_PT.MediaAudioVideoCapture: (_PT.MediaAudioCapture, _PT.MediaVideoCapture),
+                    _PT.DesktopAudioVideoCapture: (_PT.DesktopVideoCapture,)}  # requests for two at once
+ASK_ALWAYS = {_PT.DesktopVideoCapture, _PT.DesktopAudioVideoCapture}
 
 
 # ══════════════════════════════════════════════════════════════════════════════════════════
@@ -576,6 +586,28 @@ def display_url(url: QUrl) -> str:
     if url.isEmpty() or is_newtab(url) or url.toString() in ("about:blank", *NEWTAB_OVERRIDES):
         return ""
     return url.toDisplayString()
+
+
+_SECOND_LEVEL = {"co", "com", "net", "org", "gov", "edu", "ac", "or", "ne", "go", "gob", "mil", "nic", "sch", "ltd", "plc", "nhs"}
+
+
+def site_of(host: str) -> str:
+    """The site a host belongs to, about its registrable domain (no public-suffix list): accounts.google.com ->
+    google.com, www.bbc.co.uk -> bbc.co.uk. IP addresses and localhost are their own site."""
+    host = host.lower().strip(".").strip("[]")
+    labels = host.split(".")
+    if len(labels) <= 2 or re.fullmatch(r"[\d.]+|[0-9a-f:]+", host):
+        return host
+    return ".".join(labels[-3:] if len(labels[-1]) == 2 and labels[-2] in _SECOND_LEVEL else labels[-2:])
+
+
+def origin_of(url: QUrl) -> str:
+    """"scheme://host[:port]" of a web address ("" for anything else) - what permissions and storage belong to."""
+    if url.scheme() not in ("http", "https") or not url.host():
+        return ""
+    host = url.host(QUrl.ComponentFormattingOption.FullyEncoded)
+    port, default = url.port(), DEFAULT_PORTS[url.scheme()]
+    return f"{url.scheme()}://{f'[{host}]' if ':' in host else host}{f':{port}' if port not in (-1, default) else ''}"
 
 
 # scheme, host (without the port), port ("*", digits or None: any), path - as Chrome's URLPattern splits them
@@ -2000,6 +2032,7 @@ class Settings(QObject):
         "website_appearance": "dark",
         "force_dark_pages": False,
         "site_zoom": {},
+        "site_permissions": {},  # origin -> {permission type name: "allow"/"block"} for the ones Qt doesn't remember
         "vpn": {"mode": "off", "type": "socks5", "host": "", "port": 1080, "username": "", "password": ""},
     }
 
@@ -2461,6 +2494,196 @@ class HistoryStore:
             except sqlite3.Error:
                 pass
             self.db = None
+
+
+class CookieIndex(QObject):
+    """Every cookie in a profile, kept current from its cookie store (which can't be searched). One per profile, shared
+    by the site settings and chrome.cookies: CookieIndex.of(profile). Make it before the profile's first page: it starts
+    from the cookies Chromium saved (its Cookies database, read before Chromium opens it), then follows every change.
+    loadAllCookies() can't stand in for that: Qt asks Chromium to load the cookies and drops the answer, so cookies
+    that were already there are never reported."""
+    added = pyqtSignal(object)    # QNetworkCookie
+    removed = pyqtSignal(object)
+    loaded = pyqtSignal()
+    changed = pyqtSignal()        # at most every 150 ms (for views)
+    LOAD_MS = 1500                # what loadAllCookies() may still report arrives well within this (it never says "done")
+    SAME_SITE = {0: QNetworkCookie.SameSite.None_, 1: QNetworkCookie.SameSite.Lax, 2: QNetworkCookie.SameSite.Strict}
+
+    def __init__(self, profile: QWebEngineProfile):
+        super().__init__(profile)
+        self.store = profile.cookieStore()
+        self.cookies: dict[tuple, QNetworkCookie] = {}  # (name, domain, path) -> cookie; updated in place, never replaced
+        self.ready = False
+        self._notify = QTimer(self)
+        self._notify.setSingleShot(True)
+        self._notify.setInterval(150)
+        self._notify.timeout.connect(self.changed)
+        if not profile.isOffTheRecord():
+            self._read_saved(Path(profile.persistentStoragePath()) / "Cookies")
+        self.store.cookieAdded.connect(self._added)
+        self.store.cookieRemoved.connect(self._removed)
+        self.store.loadAllCookies()
+        QTimer.singleShot(self.LOAD_MS, self._loaded)
+
+    def _read_saved(self, path: Path) -> None:
+        try:
+            db = sqlite3.connect(f"file:{quote(str(path))}?mode=ro", uri=True, timeout=0.5) if path.is_file() else None
+            rows = db.execute("SELECT host_key, name, value, path, expires_utc, is_secure, is_httponly, has_expires, "
+                              "samesite FROM cookies").fetchall() if db else []
+            if db:
+                db.close()
+        except sqlite3.Error as exc:
+            log(f"Couldn't read the saved cookies: {exc}")
+            return
+        now = time.time()
+        for host, name, value, cookie_path, expires, secure, http_only, has_expires, same_site in rows:
+            # (a value Chromium encrypted reads as "": cookies are deleted by name, so that doesn't matter)
+            cookie = QNetworkCookie(str(name).encode(), str(value or "").encode())
+            cookie.setDomain(str(host))
+            cookie.setPath(str(cookie_path or "/"))
+            cookie.setSecure(bool(secure))
+            cookie.setHttpOnly(bool(http_only))
+            cookie.setSameSitePolicy(self.SAME_SITE.get(same_site, QNetworkCookie.SameSite.Default))
+            if has_expires:
+                seconds = int(expires) / 1e6 - 11644473600  # microseconds since 1601
+                if seconds <= now:
+                    continue
+                cookie.setExpirationDate(QDateTime.fromMSecsSinceEpoch(int(seconds * 1000)))
+            self.cookies[self.key(cookie)] = cookie
+
+    @classmethod
+    def of(cls, profile: QWebEngineProfile) -> "CookieIndex":
+        index = profile.findChild(cls)
+        return index if index is not None else cls(profile)
+
+    @staticmethod
+    def key(cookie: QNetworkCookie) -> tuple:
+        return bytes(cookie.name()).decode("utf-8", "replace"), cookie.domain().lower(), cookie.path() or "/"
+
+    def _added(self, cookie) -> None:
+        cookie = QNetworkCookie(cookie)
+        self.cookies[self.key(cookie)] = cookie
+        self.added.emit(cookie)
+        self._notify.isActive() or self._notify.start()
+
+    def _removed(self, cookie) -> None:
+        cookie = QNetworkCookie(cookie)
+        self.cookies.pop(self.key(cookie), None)
+        self.removed.emit(cookie)
+        self._notify.isActive() or self._notify.start()
+
+    def _loaded(self) -> None:
+        if not sip.isdeleted(self):
+            self.ready = True
+            self.loaded.emit()
+            self.changed.emit()
+
+    def for_site(self, site: str) -> list[QNetworkCookie]:
+        return sorted((c for c in self.cookies.values() if site_of(c.domain()) == site),
+                      key=lambda c: (c.domain().lstrip("."), bytes(c.name())))
+
+    def sites(self) -> dict[str, int]:
+        counts: dict[str, int] = {}
+        for cookie in self.cookies.values():
+            site = site_of(cookie.domain())
+            counts[site] = counts.get(site, 0) + 1
+        return counts
+
+    def delete(self, cookie: QNetworkCookie) -> None:
+        """Delete it (Qt deletes the cookies of that name a request to this URL would carry)."""
+        host = cookie.domain().lstrip(".")
+        self.store.deleteCookie(cookie, QUrl(f"{'https' if cookie.isSecure() else 'http'}://{host}{cookie.path() or '/'}"))
+
+
+class SiteDataCleaner(QObject):
+    """Clears what web pages store in the browser - local storage, IndexedDB, Cache Storage, service workers - for some
+    origins. Qt has no API for that, so a hidden page *in* each origin clears it with the web platform's own calls:
+    first an empty document given the origin (no network, works offline; it can't reach service workers), then, when
+    *thorough*, the site's /robots.txt, a real document of the origin that can unregister them too. Limits: an IndexedDB
+    database a tab holds open goes when that tab lets go of it (the caller reloads such tabs); sessionStorage belongs
+    to each tab and goes with it."""
+    finished = pyqtSignal()
+    PARALLEL, STEP_MS = 4, 6000
+    BLANK = "<!doctype html><title></title>"
+    JS = """(async () => {
+  const soon = (p) => Promise.race([p, new Promise(ok => setTimeout(ok, 2500))]);
+  try { localStorage.clear(); sessionStorage.clear(); } catch (e) {}
+  try { await soon(Promise.all((await indexedDB.databases()).map(d => new Promise(ok => {
+    const r = indexedDB.deleteDatabase(d.name); r.onsuccess = r.onerror = r.onblocked = ok; })))); } catch (e) {}
+  try { await soon(Promise.all((await caches.keys()).map(k => caches.delete(k)))); } catch (e) {}
+  try { await soon(Promise.all((await navigator.serviceWorker.getRegistrations()).map(r => r.unregister()))); } catch (e) {}
+  window.__foxgloveCleared = true;
+})(); true"""
+
+    def __init__(self, profile: QWebEngineProfile, origins: list[str], thorough: bool = False, parent: QObject | None = None):
+        super().__init__(parent)
+        self.profile = profile
+        self.origins = [o for o in dict.fromkeys(origins) if o]
+        self.queue = list(self.origins)
+        self.thorough = thorough
+        self.cleared: set[str] = set()  # origins whose storage was reached
+        self._workers = 0
+
+    def start(self) -> None:
+        self._workers = min(self.PARALLEL, len(self.queue))
+        for _ in range(self._workers):
+            page = QWebEnginePage(self.profile, self)
+            page.settings().setAttribute(QWebEngineSettings.WebAttribute.AutoLoadImages, False)
+            page.loadFinished.connect(lambda ok, p=page: p._on_load(ok))
+            self._next(page)
+        if not self._workers:
+            QTimer.singleShot(0, self.finished.emit)
+
+    def _next(self, page: QWebEnginePage) -> None:
+        if not self.queue:
+            page._on_load = lambda _ok: None
+            page.deleteLater()
+            self._workers -= 1
+            if not self._workers:
+                self.finished.emit()
+            return
+        origin = self.queue.pop(0)
+        loads = [lambda: page.setHtml(self.BLANK, QUrl(origin + "/"))]
+        url = QUrl(origin)
+        if self.thorough and (url.scheme() == "https" or url.host() in ("localhost", "127.0.0.1", "::1")):  # secure: may have workers
+            loads.append(lambda: page.load(QUrl(origin + "/robots.txt")))
+        self._step(page, origin, loads)
+
+    def _step(self, page: QWebEnginePage, origin: str, loads: list) -> None:
+        if sip.isdeleted(self) or sip.isdeleted(page):
+            return
+        if not loads:
+            self._next(page)
+            return
+        token = page._token = object()
+        started = time.monotonic()
+
+        def current() -> bool:
+            return not sip.isdeleted(page) and page._token is token
+
+        def advance() -> None:
+            if current():
+                page._token = None
+                self._step(page, origin, loads)
+
+        def check() -> None:
+            if current() and time.monotonic() - started < self.STEP_MS / 1000:
+                page.runJavaScript("window.__foxgloveCleared === true",
+                                   lambda done: (self.cleared.add(origin), advance()) if done else QTimer.singleShot(100, check))
+            else:
+                advance()
+
+        def loaded(ok: bool) -> None:
+            if current():
+                if ok and origin_of(page.url()) == origin:
+                    page.runJavaScript(self.JS)
+                    check()
+                else:  # offline, or the site sent us elsewhere: nothing of this origin to run in
+                    advance()
+
+        page._on_load = loaded
+        QTimer.singleShot(self.STEP_MS + 500, advance)
+        loads.pop(0)()
 
 
 class FaviconCache(QObject):
@@ -3775,7 +3998,7 @@ class ExtensionBridge(QWebEngineUrlSchemeHandler):
         self._script_patterns: dict[str, tuple] = {}    # ext id -> (its manifest's content_scripts, their PatternSet)
         self._downloads = itertools.count(1)
         self._parts: dict[tuple, dict] = {}             # calls arriving in parts: (ext id, id) -> {"sender", "count", "parts", "time"}
-        self._cookies: dict[tuple, QNetworkCookie] = {}  # the profile's cookies (chrome.cookies), kept current by the store
+        self._cookies: dict[tuple, QNetworkCookie] = {}  # the profile's cookies (chrome.cookies): the CookieIndex's, once watched
         self._removed: dict[tuple, QNetworkCookie] = {}  # just removed: an overwrite if it comes right back
         self._cookie_waiters: dict[tuple, list] = {}     # cookies.set calls waiting for the store
         self._cookies_ready = self._cookies_watched = False
@@ -3785,11 +4008,14 @@ class ExtensionBridge(QWebEngineUrlSchemeHandler):
         if self._cookies_watched or self.c.manager is None:
             return
         self._cookies_watched = True
-        store = self.c.profile.cookieStore()
-        store.cookieAdded.connect(self._cookie_added)
-        store.cookieRemoved.connect(self._cookie_removed)
-        store.loadAllCookies()
-        QTimer.singleShot(1500, lambda: setattr(self, "_cookies_ready", True))  # loading reports every cookie as added
+        index = CookieIndex.of(self.c.profile)  # shared with the site settings
+        self._cookies = index.cookies
+        index.added.connect(self._cookie_added)
+        index.removed.connect(self._cookie_removed)
+        if index.ready:
+            self._cookies_ready = True
+        else:  # loading reports every cookie as added
+            index.loaded.connect(lambda: setattr(self, "_cookies_ready", True))
 
     # ── requests ─────────────────────────────────────────────────────────────────────────
     def requestStarted(self, job: QWebEngineUrlRequestJob) -> None:
@@ -5254,9 +5480,7 @@ class ExtensionBridge(QWebEngineUrlSchemeHandler):
         return [{"fontId": f, "displayName": f} for f in sorted(set(QFontDatabase.families()), key=str.lower)]
 
     # ── chrome.cookies, on the profile's cookie store (Foxglove keeps a copy current: the store has no lookup) ──
-    @staticmethod
-    def _cookie_key(cookie: QNetworkCookie) -> tuple:
-        return bytes(cookie.name()).decode("utf-8", "replace"), cookie.domain().lower(), cookie.path() or "/"
+    _cookie_key = staticmethod(CookieIndex.key)
 
     @staticmethod
     def _cookie_info(cookie: QNetworkCookie) -> dict:
@@ -5354,8 +5578,7 @@ class ExtensionBridge(QWebEngineUrlSchemeHandler):
 
     def _cookie_added(self, cookie) -> None:
         cookie = QNetworkCookie(cookie)
-        key = self._cookie_key(cookie)
-        self._cookies[key] = cookie
+        key = self._cookie_key(cookie)  # (the index has it already)
         replaced = self._removed.pop(key, None)
         if replaced is not None:
             self._cookie_event(replaced, True, "overwrite")
@@ -5367,7 +5590,6 @@ class ExtensionBridge(QWebEngineUrlSchemeHandler):
     def _cookie_removed(self, cookie) -> None:
         cookie = QNetworkCookie(cookie)
         key = self._cookie_key(cookie)
-        self._cookies.pop(key, None)
         self._removed[key] = cookie  # an overwrite comes back at once (removed, then added)
 
         def settle() -> None:
@@ -7156,10 +7378,11 @@ class BookmarkPanel(Panel):
 
 
 class SiteInfoPanel(Panel):
-    """Opens from the padlock: connection security and the permissions granted to the site."""
+    """Opens from the padlock: connection security, the site's permissions and cookies, and its site settings."""
 
     def __init__(self, win: "BrowserWindow", url: QUrl):
         super().__init__(win)
+        self.win = win
         layout = QVBoxLayout(self)
         layout.setContentsMargins(16, 14, 16, 14)
         layout.setSpacing(8)
@@ -7183,30 +7406,47 @@ class SiteInfoPanel(Panel):
         layout.addLayout(top)
         layout.addWidget(tone_label(heading, "heading"))
         layout.addWidget(tone_label(detail, "secondary", wrap=True))
-        permissions = []
-        if url.scheme() in ("http", "https"):
-            origin = QUrl(f"{url.scheme()}://{url.authority()}")
-            permissions = [p for p in win.profile.listPermissionsForOrigin(origin)
-                           if p.state() != QWebEnginePermission.State.Ask and p.permissionType() in PERMISSION_TEXT]
-        if permissions:
-            line = QFrame()
-            line.setObjectName("PanelSeparator")
-            line.setFixedHeight(1)
-            layout.addWidget(line)
+        origin = origin_of(url)
+        decisions = [(kind, state) for o, kind, state in win.permission_decisions() if o == origin] if origin else []
+        if decisions:
+            layout.addWidget(self._line())
             layout.addWidget(tone_label("Permissions", "heading"))
-            for permission in permissions:
+            for kind, state in decisions:
                 row = QHBoxLayout()
-                allowed = permission.state() == QWebEnginePermission.State.Granted
-                text = PERMISSION_TEXT[permission.permissionType()]
-                row.addWidget(tone_label(f"{'Allowed' if allowed else 'Blocked'} to {text}", "secondary"), 1)
+                row.addWidget(tone_label(f"{'Allowed' if state == 'allow' else 'Blocked'} to {PERMISSION_TEXT[kind]}", "secondary"), 1)
                 clear = tool_button(icon("close", P.TEXT_2), "Forget this decision", 26)
-                clear.clicked.connect(lambda *_, p=permission, r=row: self._reset(p, r))
+                clear.clicked.connect(lambda *_, k=kind, r=row: self._reset(origin, k, r))
                 row.addWidget(clear)
                 layout.addLayout(row)
+        if origin:
+            self.site = site_of(url.host())
+            layout.addWidget(self._line())
+            row = QHBoxLayout()
+            self.cookies = tone_label("", "secondary")
+            row.addWidget(self.cookies, 1)
+            settings = make_button("Site settings…")
+            settings.clicked.connect(lambda *_: (self.close(), win.show_site_settings(url)))
+            row.addWidget(settings)
+            layout.addLayout(row)
+            index = CookieIndex.of(win.profile)
+            index.changed.connect(self._count_cookies)
+            self._count_cookies()
         self.setMinimumWidth(340)
 
-    def _reset(self, permission, row: QHBoxLayout) -> None:
-        permission.reset()
+    @staticmethod
+    def _line() -> QFrame:
+        line = QFrame()
+        line.setObjectName("PanelSeparator")
+        line.setFixedHeight(1)
+        return line
+
+    def _count_cookies(self) -> None:
+        if not sip.isdeleted(self):
+            count = len(CookieIndex.of(self.win.profile).for_site(self.site))
+            self.cookies.setText(f"{count} cookie{'' if count == 1 else 's'} from {self.site}")
+
+    def _reset(self, origin: str, kind, row: QHBoxLayout) -> None:
+        self.win.set_permission_state(origin, kind, "ask")
         for i in range(row.count()):
             widget = row.itemAt(i).widget()
             if widget is not None:
@@ -7923,7 +8163,7 @@ class ClearDataDialog(QDialog):
         layout.setSpacing(10)
         layout.addWidget(tone_label("Choose what to clear:", "heading"))
         self.history = QCheckBox("Browsing history")
-        self.cookies = QCheckBox("Cookies (you'll be signed out of websites)")
+        self.cookies = QCheckBox("Cookies and site data (you'll be signed out of websites)")
         self.cache = QCheckBox("Cached images and files")
         self.history.setChecked(True)
         self.cache.setChecked(True)
@@ -7938,14 +8178,241 @@ class ClearDataDialog(QDialog):
 
     def _clear(self) -> None:
         profile = self.win.profile
+        if self.cookies.isChecked():  # first: history tells which sites may have stored data
+            self.win.clear_site_data()
         if self.history.isChecked():
             self.win.clear_history_traces()
-        if self.cookies.isChecked():
-            profile.cookieStore().deleteAllCookies()
         if self.cache.isChecked():
             profile.clearHttpCache()
         self.accept()
         self.win.toast("Browsing data cleared.")
+
+
+class SiteSettingsDialog(QDialog):
+    """Site settings: every site with cookies or permission decisions (searchable), and per site its permissions
+    (Allow / Block / Ask), its cookies and a way to clear everything it stored."""
+    CHOICES = (("Ask (default)", "ask"), ("Allow", "allow"), ("Block", "block"))
+
+    def __init__(self, win: "BrowserWindow"):
+        super().__init__(win)
+        self.win = win
+        self.index = CookieIndex.of(win.profile)
+        self.site, self.origin = "", ""
+        self.setWindowTitle("Site Settings")
+        self.resize(660, 620)
+        layout = QVBoxLayout(self)
+        self.stack = QStackedWidget()
+        self.stack.addWidget(self._all_page())
+        self.stack.addWidget(self._site_page())
+        layout.addWidget(self.stack, 1)
+        close = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
+        close.rejected.connect(self.reject)
+        layout.addWidget(close)
+        self._refresh_timer = QTimer(self)  # cookies change in bursts (a page load sets dozens)
+        self._refresh_timer.setSingleShot(True)
+        self._refresh_timer.setInterval(100)
+        self._refresh_timer.timeout.connect(self.refresh)
+        self.index.changed.connect(self._refresh_timer.start)
+        win.settings.changed.connect(self._settings_changed)
+
+    def _settings_changed(self, key: str) -> None:
+        if key == "site_permissions" and not sip.isdeleted(self):
+            self._refresh_timer.start()
+
+    # ── every site ──────────────────────────────────────────────────────────────────────
+    def _all_page(self) -> QWidget:
+        page = QWidget()
+        column = QVBoxLayout(page)
+        column.setContentsMargins(0, 0, 0, 0)
+        column.addWidget(tone_label("All sites", "title"))
+        column.addWidget(tone_label("Sites that keep cookies in " + APP_NAME + ", or that you allowed or blocked from "
+                                    "something. Cookies are kept when you quit, so you stay signed in.", "dim", wrap=True))
+        self.search = QLineEdit()
+        self.search.setPlaceholderText("Search sites")
+        self.search.setClearButtonEnabled(True)
+        self.search.textChanged.connect(lambda *_: self._fill_sites())
+        column.addWidget(self.search)
+        self.sites = QTreeWidget()
+        self.sites.setRootIsDecorated(False)
+        self.sites.setUniformRowHeights(True)
+        self.sites.setHeaderLabels(["Site", "Cookies", "Permissions"])
+        self.sites.setColumnWidth(0, 360)
+        self.sites.itemDoubleClicked.connect(lambda item, _c: self.show_site(item.text(0)))
+        column.addWidget(self.sites, 1)
+        row = QHBoxLayout()
+        details = make_button("Details…")
+        details.clicked.connect(lambda *_: self.sites.currentItem() and self.show_site(self.sites.currentItem().text(0)))
+        remove = make_button("Remove", danger=True)
+        remove.setToolTip("Delete this site's cookies and stored data and forget its permissions")
+        remove.clicked.connect(lambda *_: self.sites.currentItem() and self.remove_site(self.sites.currentItem().text(0)))
+        remove_all = make_button("Remove All…", danger=True)
+        remove_all.clicked.connect(lambda *_: self.remove_all())
+        for widget in (details, remove):
+            row.addWidget(widget)
+        row.addStretch(1)
+        row.addWidget(remove_all)
+        column.addLayout(row)
+        return page
+
+    def site_rows(self) -> dict[str, list[int]]:
+        """site -> [cookies, permission decisions]"""
+        rows = {site: [count, 0] for site, count in self.index.sites().items()}
+        for origin, _kind, _state in self.win.permission_decisions():
+            rows.setdefault(site_of(QUrl(origin).host()), [0, 0])[1] += 1
+        return rows
+
+    def _fill_sites(self) -> None:
+        current = self.sites.currentItem().text(0) if self.sites.currentItem() else ""
+        words = self.search.text().lower().split()
+        self.sites.clear()
+        for site, (cookies, permissions) in sorted(self.site_rows().items()):
+            if all(w in site for w in words):
+                item = QTreeWidgetItem([site, str(cookies), str(permissions) if permissions else ""])
+                item.setIcon(0, self.win.favicons.get(f"https://{site}/"))
+                self.sites.addTopLevelItem(item)
+                if site == current:
+                    self.sites.setCurrentItem(item)
+
+    def show_all(self) -> None:
+        self._fill_sites()
+        self.stack.setCurrentIndex(0)
+
+    def remove_site(self, site: str) -> None:
+        self.win.reset_site_permissions(site)
+        self.win.clear_site_data(site, lambda: self.win.toast(f"Removed data for {site}."))
+        self._refresh_timer.start()
+
+    def remove_all(self) -> None:
+        if ask_question(self, "Remove All Site Data", "Delete every site's cookies and stored data, and forget every "
+                        "permission you gave or refused? You'll be signed out of websites.", "Remove All"):
+            self.win.reset_site_permissions()
+            self.win.clear_site_data(None, lambda: self.win.toast("Removed all site data."))
+            self._refresh_timer.start()
+
+    # ── one site ────────────────────────────────────────────────────────────────────────
+    def _site_page(self) -> QWidget:
+        page = QWidget()
+        column = QVBoxLayout(page)
+        column.setContentsMargins(0, 0, 0, 0)
+        top = QHBoxLayout()
+        back = make_button("‹ All Sites")
+        back.clicked.connect(lambda *_: self.show_all())
+        top.addWidget(back)
+        self.title = tone_label("", "title")
+        top.addWidget(self.title, 1)
+        column.addLayout(top)
+        heading = QHBoxLayout()
+        heading.addWidget(tone_label("Permissions", "heading"), 1)
+        self.origins = QComboBox()
+        self.origins.setToolTip("Permissions belong to each address (origin) of the site")
+        self.origins.currentTextChanged.connect(lambda text: self._show_permissions(text))
+        heading.addWidget(self.origins)
+        column.addLayout(heading)
+        grid = QGridLayout()
+        grid.setHorizontalSpacing(12)
+        self.choices: dict = {}
+        for i, (kind, label) in enumerate(SITE_PERMISSIONS):
+            box = QComboBox()
+            for text, value in self.CHOICES:
+                if not (value == "allow" and kind in ASK_ALWAYS):
+                    box.addItem(text, value)
+            box.currentIndexChanged.connect(lambda _i, k=kind, b=box: self._set_permission(k, b.currentData()))
+            grid.addWidget(QLabel(label), i // 2, (i % 2) * 2)
+            grid.addWidget(box, i // 2, (i % 2) * 2 + 1)
+            self.choices[kind] = box
+        column.addLayout(grid)
+        column.addSpacing(6)
+        self.cookie_heading = tone_label("Cookies", "heading")
+        column.addWidget(self.cookie_heading)
+        self.cookie_list = QTreeWidget()
+        self.cookie_list.setRootIsDecorated(False)
+        self.cookie_list.setUniformRowHeights(True)
+        self.cookie_list.setHeaderLabels(["Name", "Domain", "Expires"])
+        self.cookie_list.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        self.cookie_list.setColumnWidth(0, 220)
+        self.cookie_list.setColumnWidth(1, 220)
+        column.addWidget(self.cookie_list, 1)
+        row = QHBoxLayout()
+        delete = make_button("Delete")
+        delete.clicked.connect(lambda *_: self.delete_cookies(selected=True))
+        delete_all = make_button("Delete All Cookies")
+        delete_all.clicked.connect(lambda *_: self.delete_cookies())
+        reset = make_button("Reset Permissions")
+        reset.clicked.connect(lambda *_: (self.win.reset_site_permissions(self.site), self._show_permissions(self.origin)))
+        clear = make_button("Clear Data for This Site", danger=True)
+        clear.setToolTip("Cookies, local storage, databases, caches and service workers - you'll be signed out")
+        clear.clicked.connect(lambda *_: self.clear_site())
+        for widget in (delete, delete_all):
+            row.addWidget(widget)
+        row.addStretch(1)
+        for widget in (reset, clear):
+            row.addWidget(widget)
+        column.addLayout(row)
+        column.addWidget(tone_label("Clearing a site's data signs you out of it. Tabs showing the site reload.",
+                                    "dim", wrap=True))
+        return page
+
+    def show_site(self, site: str, origin: str = "") -> None:
+        self.site = site
+        self.title.setText(site)
+        origins = sorted(self.win.site_origins(site), key=lambda o: (o != origin, not o.startswith("https:"), o))
+        if origin and origin not in origins:
+            origins.insert(0, origin)
+        origins = origins or [f"https://{site}"]
+        self.origins.blockSignals(True)
+        self.origins.clear()
+        self.origins.addItems(origins)
+        self.origins.blockSignals(False)
+        self.origins.setVisible(len(origins) > 1)
+        self._show_permissions(origins[0])
+        self._fill_cookies()
+        self.stack.setCurrentIndex(1)
+
+    def _show_permissions(self, origin: str) -> None:
+        self.origin = origin
+        for kind, box in self.choices.items():
+            box.blockSignals(True)
+            box.setCurrentIndex(max(0, box.findData(self.win.permission_state(origin, kind))))
+            box.blockSignals(False)
+
+    def _set_permission(self, kind, state: str) -> None:
+        if self.origin:
+            self.win.set_permission_state(self.origin, kind, state)
+
+    def _fill_cookies(self) -> None:
+        selected = {tuple(i.data(0, Qt.ItemDataRole.UserRole)) for i in self.cookie_list.selectedItems()}
+        cookies = self.index.for_site(self.site)
+        self.cookie_heading.setText(f"Cookies ({len(cookies)})")
+        self.cookie_list.clear()
+        for cookie in cookies:
+            expires = "Session" if cookie.isSessionCookie() else cookie.expirationDate().toLocalTime().toString("yyyy-MM-dd HH:mm")
+            item = QTreeWidgetItem([bytes(cookie.name()).decode("utf-8", "replace"), cookie.domain().lstrip("."), expires])
+            if cookie.isSessionCookie():
+                item.setToolTip(2, "A session cookie: " + APP_NAME + " keeps it when you quit, so you stay signed in")
+            item.setData(0, Qt.ItemDataRole.UserRole, list(CookieIndex.key(cookie)))
+            item.setToolTip(0, f"{'Secure · ' if cookie.isSecure() else ''}{'HttpOnly · ' if cookie.isHttpOnly() else ''}"
+                               f"path {cookie.path() or '/'}")
+            self.cookie_list.addTopLevelItem(item)
+            item.setSelected(CookieIndex.key(cookie) in selected)
+
+    def delete_cookies(self, selected: bool = False) -> None:
+        keys = [tuple(i.data(0, Qt.ItemDataRole.UserRole)) for i in self.cookie_list.selectedItems()] if selected else \
+            [CookieIndex.key(c) for c in self.index.for_site(self.site)]
+        for key in keys:
+            cookie = self.index.cookies.get(key)
+            if cookie is not None:
+                self.index.delete(cookie)
+
+    def clear_site(self) -> None:
+        site = self.site
+        self.win.clear_site_data(site, lambda: self.win.toast(f"Cleared data for {site}."))
+
+    def refresh(self) -> None:
+        if self.stack.currentIndex() == 0:
+            self._fill_sites()
+        else:
+            self._fill_cookies()
+            self._show_permissions(self.origin)
 
 
 class ExtensionRow(QFrame):
@@ -8169,13 +8636,16 @@ class SettingsDialog(QDialog):
 
         section("Privacy")
         privacy_row = QHBoxLayout()
+        sites = make_button("Site Settings and Cookies…")
+        sites.clicked.connect(lambda *_: win.show_site_settings(QUrl()))
+        privacy_row.addWidget(sites)
         clear = make_button("Clear Browsing Data…")
         clear.clicked.connect(lambda *_: run_dialog(ClearDataDialog(win)))
         privacy_row.addWidget(clear)
         privacy_row.addStretch(1)
         layout.addLayout(privacy_row)
-        layout.addWidget(tone_label("Cookies are kept when you quit (including session cookies), so websites keep "
-                                    "you signed in.", "dim", wrap=True))
+        layout.addWidget(tone_label("Cookies and website data are kept when you quit (including session cookies), so "
+                                    "websites keep you signed in.", "dim", wrap=True))
         layout.addSpacing(6)
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
         buttons.rejected.connect(self.reject)
@@ -8650,6 +9120,7 @@ class BrowserWindow(QMainWindow):
         self.restart_request = restart_request if restart_request is not None else {"requested": False}
         self._vpn_warned = False
         self.profile = profile
+        self.cookie_index = CookieIndex.of(profile)  # (main() made it already, before any page)
         self.settings = settings
         self.bookmarks = bookmarks
         self.history = history
@@ -8850,6 +9321,7 @@ class BrowserWindow(QMainWindow):
         self.act_exit_fullscreen.setEnabled(False)
         self.act_mute = a("Mute Tab", lambda: self.toggle_mute(self.current_tab()), [] if mac else ["Ctrl+M"])
         self.act_settings = a("Settings", self.show_settings, ["Ctrl+,"], role=QAction.MenuRole.PreferencesRole)
+        self.act_site_settings = a("Site Settings and Cookies…", lambda: self.show_site_settings())
         self.act_about = a(f"About {APP_NAME}", self.show_about, [], role=QAction.MenuRole.AboutRole)
         self.act_shortcuts = a("Keyboard Shortcuts", self.show_shortcuts)
         self.act_quit = a(f"Quit {APP_NAME}" if mac else "Exit", self.close, [QKeySequence.StandardKey.Quit, "Ctrl+Q"],
@@ -8877,6 +9349,7 @@ class BrowserWindow(QMainWindow):
         menu.addAction(zoom_row)
         menu.addSeparator()
         menu.addAction(self.act_settings)
+        menu.addAction(self.act_site_settings)
         tools = menu.submenu("More Tools")
         tools.addAction(self.act_devtools)
         tools.addAction(self.act_source)
@@ -8931,7 +9404,7 @@ class BrowserWindow(QMainWindow):
         bookmarks_menu.aboutToShow.connect(lambda: self._fill_bookmarks_menu(bookmarks_menu))
         tools_menu = self.mac_menubar.addMenu("Tools")
         for item in (self.act_downloads, self.act_extensions, self.act_vpn, None, self.act_find, self.act_find_next, None,
-                     self.act_clear_data, self.act_settings):
+                     self.act_clear_data, self.act_site_settings, self.act_settings):
             tools_menu.addSeparator() if item is None else tools_menu.addAction(item)
         window_menu = self.mac_menubar.addMenu("Window")
         window_menu.addAction(self.act_next_tab)
@@ -9431,26 +9904,33 @@ class BrowserWindow(QMainWindow):
         if text is None:
             permission.deny()
             return
+        remembered = self.remembered_decision(permission)  # set in site settings, or answered before
+        if remembered is not None:
+            permission.grant() if remembered else permission.deny()
+            return
         origin = permission.origin()
         bar = InfoBar(icon("info", P.ACCENT), f"Allow <b>{html.escape(origin.host() or origin.toString())}</b> to {text}?")
         bar.setProperty("origin", f"{origin.scheme()}://{origin.authority()}")
         decided = {"done": False}
 
-        def decide(allow: bool) -> None:
+        def decide(allow: bool, remember: bool = False) -> None:
             if not decided["done"]:
                 decided["done"] = True
                 permission.grant() if allow else permission.deny()
+                if remember:
+                    self.remember_decision(permission, allow)
 
-        bar.add_button("Block", lambda: (decide(False), bar.dismiss()))
-        bar.add_button("Allow", lambda: (decide(True), bar.dismiss()), primary=True)
+        bar.add_button("Block", lambda: (decide(False, True), bar.dismiss()))
+        bar.add_button("Allow", lambda: (decide(True, True), bar.dismiss()), primary=True)
         bar.on_dismiss = lambda: decide(False)
         tab.permission_bars.append(bar)
         tab.add_bar(bar)
 
     def ask_permission_modal(self, parent: QWidget, permission: QWebEnginePermission) -> None:
         text = PERMISSION_TEXT.get(permission.permissionType())
-        if text is None:
-            permission.deny()
+        remembered = self.remembered_decision(permission) if text is not None else False
+        if remembered is not None:
+            permission.grant() if remembered else permission.deny()
             return
         host = permission.origin().host() or permission.origin().toString()
         answer = QMessageBox.question(parent, "Permission Request", f"Allow {host} to {text}?",
@@ -10347,6 +10827,113 @@ class BrowserWindow(QMainWindow):
         else:
             self.focus_url_bar()
 
+    # ── site settings: permissions, cookies and stored data, per site ───────────────────
+    def show_site_settings(self, url: QUrl | None = None) -> None:
+        """Site settings for *url*'s site (default: the current tab's, if it shows a website), else every site."""
+        if url is None:
+            tab = self.current_tab()
+            url = tab.url() if tab is not None else QUrl()
+        self._single_dialog("sites", lambda: SiteSettingsDialog(self))
+        dialog = self._dialogs["sites"]
+        origin = origin_of(url)
+        dialog.show_site(site_of(url.host()), origin) if origin else dialog.show_all()
+
+    def permission_state(self, origin: str, kind) -> str:
+        """"allow", "block" or "ask": what Foxglove does when *origin* ("https://host[:port]") asks for *kind*."""
+        if QWebEnginePermission.isPersistent(kind):
+            state = self.profile.queryPermission(QUrl(origin), kind).state()
+            return {QWebEnginePermission.State.Granted: "allow", QWebEnginePermission.State.Denied: "block"}.get(state, "ask")
+        entry = self.settings.get("site_permissions").get(origin)
+        state = entry.get(kind.name) if isinstance(entry, dict) else None
+        return state if state == "block" or (state == "allow" and kind not in ASK_ALWAYS) else "ask"
+
+    def set_permission_state(self, origin: str, kind, state: str) -> None:
+        if QWebEnginePermission.isPersistent(kind):  # Qt keeps these (on disk: StoreOnDisk)
+            permission = self.profile.queryPermission(QUrl(origin), kind)
+            {"allow": permission.grant, "block": permission.deny}.get(state, permission.reset)()
+            return
+        decisions = {o: dict(d) for o, d in self.settings.get("site_permissions").items() if isinstance(d, dict)}
+        entry = decisions.setdefault(origin, {})
+        if state == "block" or (state == "allow" and kind not in ASK_ALWAYS):
+            entry[kind.name] = state
+        else:
+            entry.pop(kind.name, None)
+        if not entry:
+            del decisions[origin]
+        self.settings.set("site_permissions", decisions)
+
+    def remembered_decision(self, permission: QWebEnginePermission) -> bool | None:
+        """Your earlier answer to a request Qt doesn't remember itself (camera, microphone...), or None to ask."""
+        kind, origin = permission.permissionType(), origin_of(permission.origin())
+        if not origin or QWebEnginePermission.isPersistent(kind):
+            return None
+        states = {self.permission_state(origin, part) for part in PERMISSION_PARTS.get(kind, (kind,))}
+        return False if "block" in states else True if states == {"allow"} else None
+
+    def remember_decision(self, permission: QWebEnginePermission, allow: bool) -> None:
+        """Keep an Allow/Block answer for camera, microphone and pointer lock, as Qt keeps the others (never screen sharing)."""
+        kind, origin = permission.permissionType(), origin_of(permission.origin())
+        if origin and not QWebEnginePermission.isPersistent(kind) and kind not in ASK_ALWAYS:
+            for part in PERMISSION_PARTS.get(kind, (kind,)):
+                self.set_permission_state(origin, part, "allow" if allow else "block")
+
+    def permission_decisions(self) -> list[tuple[str, object, str]]:
+        """Every remembered answer: (origin, permission type, "allow" or "block")."""
+        found = []
+        for permission in self.profile.listAllPermissions():
+            state, kind = permission.state(), permission.permissionType()
+            if state != QWebEnginePermission.State.Ask and kind in PERMISSION_TEXT and origin_of(permission.origin()):
+                found.append((origin_of(permission.origin()), kind, "allow" if state == QWebEnginePermission.State.Granted else "block"))
+        for origin in self.settings.get("site_permissions"):
+            for kind, _label in SITE_PERMISSIONS:
+                if not QWebEnginePermission.isPersistent(kind) and (state := self.permission_state(origin, kind)) != "ask":
+                    found.append((origin, kind, state))
+        return found
+
+    def reset_site_permissions(self, site: str | None = None) -> None:
+        for origin, kind, _state in self.permission_decisions():
+            if site is None or site_of(QUrl(origin).host()) == site:
+                self.set_permission_state(origin, kind, "ask")
+
+    def site_origins(self, site: str | None = None) -> list[str]:
+        """The origins of *site* (None: of every site) Foxglove knows of - open pages, history, permissions, cookies.
+        Stored data belongs to origins, and Qt can't list the ones that have some."""
+        urls = [t.url() for t in self.tabs()] + [p.url() for p in self.popups]
+        urls += [QUrl(row[0]) for row in self.history.recent(limit=5000)]
+        found = dict.fromkeys(origin_of(url) for url in urls)
+        found.update(dict.fromkeys(origin for origin, _kind, _state in self.permission_decisions()))
+        found.update(dict.fromkeys(f"https://{c.domain().lstrip('.')}" for c in self.cookie_index.cookies.values()))
+        return [o for o in found if o and (site is None or site_of(QUrl(o).host()) == site)]
+
+    def clear_site_data(self, site: str | None = None, done=None) -> SiteDataCleaner:
+        """Delete *site*'s cookies and stored data (None: every site's). For one site its service workers go too, and
+        its open tabs are reloaded so they let go of what they hold."""
+        index = self.cookie_index
+        origins = self.site_origins(site)
+
+        def delete_cookies() -> None:
+            if site is None:
+                self.profile.cookieStore().deleteAllCookies()
+            else:
+                for cookie in index.for_site(site):
+                    index.delete(cookie)
+
+        def finished() -> None:
+            delete_cookies()  # again: whatever the site set while its /robots.txt loaded
+            if site is not None:
+                for tab in self.tabs():
+                    if tab.pending is None and origin_of(tab.url()) in origins:
+                        tab.page.triggerAction(QWebEnginePage.WebAction.Reload)
+            cleaner.deleteLater()
+            if done is not None:
+                done()
+
+        delete_cookies()
+        cleaner = SiteDataCleaner(self.profile, origins, thorough=site is not None, parent=self)
+        cleaner.finished.connect(finished)
+        cleaner.start()
+        return cleaner
+
     def show_about(self) -> None:
         QMessageBox.about(self, f"About {APP_NAME}",
                           f"<h3>{APP_NAME} {APP_VERSION}</h3><p>A Firefox-inspired browser written in Python.</p>"
@@ -10620,6 +11207,7 @@ def main(argv: list[str] | None = None) -> int:
     profile.setPersistentPermissionsPolicy(QWebEngineProfile.PersistentPermissionsPolicy.StoreOnDisk)
     user_agent = re.sub(r"\s*QtWebEngine/\S+", "", profile.httpUserAgent())
     profile.setHttpUserAgent(user_agent)  # look like regular Chrome so sites don't serve a degraded version
+    CookieIndex.of(profile)  # before any page: it starts from the cookies saved last time
 
     settings = Settings(profile_dir / "settings.json")
     favicons = FaviconCache(profile_dir / "favicons")
@@ -10672,6 +11260,9 @@ def main(argv: list[str] | None = None) -> int:
     if not sip.isdeleted(profile):
         sip.delete(profile)
     history.close()
+    # Then shut Chromium down for good: its threads finish writing cookies and site data on the way out. (Before a
+    # restart this must not be left to chance - os.execv() would cut them off and lose the latest cookies.)
+    sip.delete(app)
     lock.unlock()
     if restart_request["requested"]:
         restart_process(profile_name, original_flags)

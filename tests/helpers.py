@@ -6,7 +6,6 @@ from __future__ import annotations
 
 import importlib.util
 import json
-import re
 import sys
 import threading
 import time
@@ -276,8 +275,7 @@ class Harness:
         self.profile = QWebEngineProfile(self.name)
         self.profile.setPersistentCookiesPolicy(QWebEngineProfile.PersistentCookiesPolicy.ForcePersistentCookies)
         self.profile.setPersistentPermissionsPolicy(QWebEngineProfile.PersistentPermissionsPolicy.StoreOnDisk)
-        self.user_agent = re.sub(r"\s*QtWebEngine/\S+", "", self.profile.httpUserAgent())
-        self.profile.setHttpUserAgent(self.user_agent)
+        self.user_agent = fg.apply_browser_identity(self.profile)
         attribute = QWebEngineSettings.WebAttribute
         for name_, value in (("FullScreenSupportEnabled", True), ("JavascriptCanOpenWindows", True),
                              ("LocalStorageEnabled", True), ("PdfViewerEnabled", True)):

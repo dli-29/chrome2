@@ -10548,6 +10548,121 @@ def set_macos_app_name(name: str) -> None:
         pass
 
 
+# ── Looking like the desktop Chrome Foxglove is built on ─────────────────────────────────────────────────────────────
+# Google sign-in ("This browser or app may not be secure") and bot checks distrust browsers that look embedded or
+# automated. Qt WebEngine is Chrome's engine but by default it announces itself as "Chromium" only (no "Google Chrome"
+# brand), sends no Accept-Language header, lacks the chrome.loadTimes/csi/app every Chrome page has and reports a 0 ms
+# network round trip (as headless Chrome does). Nothing here solves CAPTCHAs or automates anything.
+CHROME_SCRIPT = "foxglove-chrome-shape"
+CHROME_SHAPE_JS = r"""(() => {
+  if (!/^(https?|file|about|blob|data):$/.test(location.protocol)) return;  // not extension or Foxglove pages
+  const chrome = window.chrome || (window.chrome = {});
+  if ("loadTimes" in chrome) return;  // already done (or a real Chrome binding)
+  // Our stand-ins print what Chrome's own functions print - asked from this frame or any same-origin one (one registry,
+  // handed to frames that know this launch's key).
+  const key = "%KEY%";
+  let looks = new WeakMap();
+  try {
+    const shared = window !== parent && Reflect.apply(parent.Function.prototype.toString, key, []);
+    if (shared instanceof parent.WeakMap) looks = shared;
+  } catch (error) {}  // a cross-origin parent
+  const native = (fn, text) => (looks.set(fn, text || `function ${fn.name}() { [native code] }`), fn);
+  Object.defineProperty(Function.prototype, "toString", {value: native(new Proxy(Function.prototype.toString, {
+    apply: (fn, self, args) => self === key ? looks : looks.has(self) ? looks.get(self) : Reflect.apply(fn, self, args)}),
+    "function toString() { [native code] }")});
+  const nav = () => performance.getEntriesByType("navigation")[0] || {};
+  const at = (ms) => ms > 0 ? (performance.timeOrigin + ms) / 1000 : 0;
+  chrome.loadTimes = native(function () {
+    const n = nav(), proto = n.nextHopProtocol || "http/1.1", alpn = location.protocol === "https:";
+    const paint = performance.getEntriesByName("first-paint")[0], start = performance.timeOrigin / 1000;
+    return {requestTime: start, startLoadTime: start, commitLoadTime: at(n.responseStart),
+      finishDocumentLoadTime: at(n.domContentLoadedEventEnd), finishLoadTime: at(n.loadEventEnd),
+      firstPaintTime: at(paint && paint.startTime), firstPaintAfterLoadTime: 0,
+      navigationType: {reload: "Reload", back_forward: "BackForward"}[n.type] || "Other",
+      wasFetchedViaSpdy: /^h[23]/.test(proto), wasNpnNegotiated: alpn, npnNegotiatedProtocol: alpn ? proto : "unknown",
+      wasAlternateProtocolAvailable: false, connectionInfo: proto};
+  }, "function() {  native function GetLoadTimes();  return GetLoadTimes();}");
+  chrome.csi = native(function () {
+    const n = nav();
+    return {startE: Math.round(performance.timeOrigin), onloadT: Math.round(at(n.domContentLoadedEventEnd) * 1000),
+      pageT: performance.now(), tran: 15};
+  }, "function() {  native function GetCSI();  return GetCSI();}");
+  if (!("app" in chrome)) {
+    const fail = (name) => new TypeError(`Error in invocation of app.${name}()`);
+    const plain = (name, value) => native({[name](...args) { if (args.length) throw fail(name); return value; }}[name]);
+    chrome.app = {isInstalled: false, getDetails: plain("getDetails", null), getIsInstalled: plain("getIsInstalled", false),
+      installState: native({installState(callback) {
+        if (typeof callback !== "function") throw fail("installState");
+        setTimeout(() => callback("not_installed"));
+      }}.installState),
+      runningState: plain("runningState", "cannot_run"),
+      InstallState: {DISABLED: "disabled", INSTALLED: "installed", NOT_INSTALLED: "not_installed"},
+      RunningState: {CANNOT_RUN: "cannot_run", READY_TO_RUN: "ready_to_run", RUNNING: "running"}};
+  }
+  const rtt = window.NetworkInformation && Object.getOwnPropertyDescriptor(NetworkInformation.prototype, "rtt");
+  if (rtt && rtt.get && navigator.connection.rtt === 0) {  // Qt never measures the network; Chrome always has an estimate
+    const get = rtt.get;
+    Object.defineProperty(NetworkInformation.prototype, "rtt", {get: native(Object.getOwnPropertyDescriptor(
+      {get rtt() { const value = Reflect.apply(get, this, []); return value === 0 ? 50 : value; }}, "rtt").get)});
+  }
+})();"""
+
+
+def chrome_languages() -> str:
+    """Chrome's Accept-Language for a fresh profile in the system's language, e.g. "en-US,en;q=0.9"."""
+    first = next(iter(QLocale.system().uiLanguages()), "")
+    primary = "-".join(QLocale(first).name().split("_")[:2]) if first else ""  # "en" -> "en-US", like Chrome
+    if not re.fullmatch(r"[a-z]{2,3}(-[A-Z]{2}|-[0-9]{3})?", primary):  # "C"/POSIX locales
+        primary = "en-US"
+    base = primary.split("-")[0]
+    return primary if base == primary else f"{primary},{base};q=0.9"
+
+
+def _rosetta() -> bool:
+    """True when an Intel build of Python (and so of Qt) runs on Apple Silicon: Chrome itself would run natively."""
+    try:
+        import ctypes
+        sysctl = ctypes.CDLL("/usr/lib/libSystem.B.dylib").sysctlbyname
+        sysctl.argtypes = [ctypes.c_char_p, ctypes.c_void_p, ctypes.POINTER(ctypes.c_size_t), ctypes.c_void_p, ctypes.c_size_t]
+        value, size = ctypes.c_int(0), ctypes.c_size_t(ctypes.sizeof(ctypes.c_int))
+        return sysctl(b"sysctl.proc_translated", ctypes.byref(value), ctypes.byref(size), None, 0) == 0 and value.value == 1
+    except (OSError, AttributeError):
+        return False
+
+
+def apply_browser_identity(profile: QWebEngineProfile) -> str:
+    """Present *profile* consistently as the stable desktop Chrome it is built on - user agent, client hints (brands),
+    Accept-Language and the window.chrome APIs - in every tab, frame and pop-up. Returns the user agent."""
+    user_agent = re.sub(r"\s*QtWebEngine/\S+", "", profile.httpUserAgent())
+    profile.setHttpUserAgent(user_agent)  # look like regular Chrome so sites don't serve a degraded version
+    if not profile.httpAcceptLanguage():
+        profile.setHttpAcceptLanguage(chrome_languages())  # by default Qt sends none at all
+    hints = profile.clientHints() if hasattr(profile, "clientHints") else None  # Qt 6.8+
+    if hints is not None:
+        brands = {name: version for name, version in hints.fullVersionList().items() if isinstance(version, str)}
+        chromium = brands.setdefault("Chromium", hints.fullVersion() or qWebEngineChromiumVersion())
+        brands.setdefault("Google Chrome", chromium)  # Qt shuffles them (stable per major version)
+        hints.setFullVersionList(brands)
+        os_token = re.search(r"\((Macintosh|Windows|CrOS|Android|X11|Linux)", user_agent)
+        platform = {"Macintosh": "macOS", "Windows": "Windows", "CrOS": "Chrome OS", "Android": "Android"}.get(
+            os_token.group(1) if os_token else "", "Linux" if os_token else "")
+        if platform and hints.platform() != platform:
+            hints.setPlatform(platform)
+        if IS_MAC and hints.arch() == "x86" and _rosetta():
+            hints.setArch("arm")
+    scripts = profile.scripts()
+    for old in scripts.find(CHROME_SCRIPT):
+        scripts.remove(old)
+    script = QWebEngineScript()
+    script.setName(CHROME_SCRIPT)
+    script.setWorldId(QWebEngineScript.ScriptWorldId.MainWorld)
+    script.setInjectionPoint(QWebEngineScript.InjectionPoint.DocumentCreation)
+    script.setRunsOnSubFrames(True)
+    script.setSourceCode(CHROME_SHAPE_JS.replace("%KEY%", secrets.token_hex(16)))
+    scripts.insert(script)
+    return user_agent
+
+
 def main(argv: list[str] | None = None) -> int:
     argv = list(sys.argv if argv is None else argv)
     parser = argparse.ArgumentParser(prog="foxglove.py", description=f"{APP_NAME} web browser")
@@ -10618,8 +10733,7 @@ def main(argv: list[str] | None = None) -> int:
     profile.setPersistentCookiesPolicy(QWebEngineProfile.PersistentCookiesPolicy.ForcePersistentCookies)
     profile.setHttpCacheType(QWebEngineProfile.HttpCacheType.DiskHttpCache)
     profile.setPersistentPermissionsPolicy(QWebEngineProfile.PersistentPermissionsPolicy.StoreOnDisk)
-    user_agent = re.sub(r"\s*QtWebEngine/\S+", "", profile.httpUserAgent())
-    profile.setHttpUserAgent(user_agent)  # look like regular Chrome so sites don't serve a degraded version
+    user_agent = apply_browser_identity(profile)  # the same in tabs, frames and sign-in pop-ups
 
     settings = Settings(profile_dir / "settings.json")
     favicons = FaviconCache(profile_dir / "favicons")

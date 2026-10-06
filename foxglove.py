@@ -7207,15 +7207,31 @@ class UrlBar(QLineEdit):
 class Panel(QFrame):
     """A Firefox-style arrow panel that drops down below a toolbar button."""
 
-    def __init__(self, parent: QWidget, translucent: bool = True):
-        super().__init__(parent, Qt.WindowType.Popup)
+    def __init__(self, parent: QWidget, translucent: bool = True, pinned: bool = False):
+        # A pinned panel lives inside the window and stays open until closed; a popup closes as soon as focus leaves.
+        super().__init__(parent, Qt.WindowType.Widget if pinned else Qt.WindowType.Popup)
+        self.pinned = pinned
         self.setObjectName("Panel")
         self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
-        if TRANSLUCENT_POPUPS and translucent:
+        if pinned:
+            self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground)
+            parent.installEventFilter(self)  # follow the window as it resizes
+        elif TRANSLUCENT_POPUPS and translucent:
             self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
         else:
             self.setProperty("square", True)
         self._anchor: QWidget | None = None
+
+    def eventFilter(self, watched, event) -> bool:
+        if self.pinned and event.type() == QEvent.Type.Resize and watched is self.parentWidget():
+            self.reposition()
+        return super().eventFilter(watched, event)
+
+    def keyPressEvent(self, event) -> None:
+        if self.pinned and event.key() == Qt.Key.Key_Escape:
+            self.close()
+            return
+        super().keyPressEvent(event)
 
     def paintEvent(self, event) -> None:
         # Translucent windows skip their style-sheet background, so paint the rounded panel ourselves.
@@ -7231,11 +7247,21 @@ class Panel(QFrame):
         self.adjustSize()
         self.reposition()
         self.show()
-        self.activateWindow()
+        if self.pinned:
+            self.raise_()
+            self.setFocus()
+        else:
+            self.activateWindow()
 
     def reposition(self) -> None:
         anchor = self._anchor
         if anchor is None or sip.isdeleted(anchor):
+            return
+        if self.pinned:
+            parent = self.parentWidget()
+            corner = anchor.mapTo(parent, QPoint(anchor.width(), anchor.height()))
+            self.move(clamp(corner.x() - self.width(), 4, max(4, parent.width() - self.width() - 4)),
+                      clamp(corner.y() + 4, 0, max(0, parent.height() - self.height())))
             return
         bottom_right = anchor.mapToGlobal(QPoint(anchor.width(), anchor.height()))
         x = bottom_right.x() - self.width()
@@ -8931,7 +8957,7 @@ class VpnPanel(Panel):
     """Choose how Foxglove connects: directly, through Tor, Cloudflare WARP or your own proxy server."""
 
     def __init__(self, win: "BrowserWindow"):
-        super().__init__(win)
+        super().__init__(win, pinned=True)  # stays open while you copy details from elsewhere
         self.win = win
         self.check_page: QWebEnginePage | None = None
         cfg = sanitize_vpn(win.settings.get("vpn"))
@@ -9411,7 +9437,7 @@ class BrowserWindow(QMainWindow):
         layout.addWidget(self.url_bar, 1)
         layout.addSpacing(6)
         self.vpn_button = tool_button(icon("shield", P.TEXT_2), "VPN / Proxy")
-        self.vpn_button.clicked.connect(lambda *_: self.show_vpn_panel())
+        self.vpn_button.clicked.connect(lambda *_: self.show_vpn_panel(toggle=True))
         layout.addWidget(self.vpn_button)
         self._update_vpn_button()
         self.download_button = DownloadButton()
@@ -10980,7 +11006,14 @@ class BrowserWindow(QMainWindow):
             self.vpn_button.setIcon(icon("shield", P.TEXT_2))
             self.vpn_button.setToolTip("VPN off - click to set one up")
 
-    def show_vpn_panel(self) -> None:
+    def show_vpn_panel(self, toggle: bool = False) -> None:
+        panel = self.findChild(VpnPanel, options=Qt.FindChildOption.FindDirectChildrenOnly)
+        if panel is not None and not sip.isdeleted(panel) and panel.isVisible():
+            if toggle:
+                panel.close()
+            else:
+                panel.raise_()
+            return
         VpnPanel(self).popup_at(self.vpn_button if self.vpn_button.isVisible() else self.menu_button)
 
     def restart_browser(self) -> None:

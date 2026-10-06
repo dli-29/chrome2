@@ -6,6 +6,7 @@ pop-ups too) must see Chrome's window.chrome APIs - without any trace of Qt WebE
 """
 from __future__ import annotations
 
+import itertools
 import json
 import re
 import sys
@@ -98,30 +99,21 @@ def test_accept_language_matches_navigator_languages(fg, harness, server):
 
 CHROME_PROBE = """
 const shape = (w) => {
-  const c = w.chrome, str = (f) => Function.prototype.toString.call(f);
+  const c = w.chrome;
   return {keys: Object.keys(c), loadTimes: Object.keys(c.loadTimes()), csi: Object.keys(c.csi()), app: Object.keys(c.app),
-          loadTimesStr: str(c.loadTimes), csiStr: str(c.csi), appStr: str(c.app.getDetails), name: c.loadTimes.name,
-          ownStr: w.Function.prototype.toString.call(c.loadTimes),
+          name: c.loadTimes.name, appName: c.app.getDetails.name,
           details: c.app.getDetails(), installed: c.app.getIsInstalled(), running: c.app.runningState(), isInstalled: c.app.isInstalled};
 };
 const frame = document.querySelector("iframe").contentWindow;
 const blank = document.body.appendChild(document.createElement("iframe")).contentWindow;
 let threw = "";
 try { chrome.app.getDetails(1); } catch (e) { threw = e.constructor.name + ": " + e.message; }
-let notFunction = "";
-try { Function.prototype.toString.call({}); } catch (e) { notFunction = e.constructor.name; }
 const state = await new Promise((resolve) => chrome.app.installState(resolve));
 const lt = chrome.loadTimes(), csi = chrome.csi();
 return {top: shape(window), frame: shape(frame), blank: typeof blank.chrome === "object" && typeof blank.chrome.loadTimes,
-        threw, notFunction, state, toString: Function.prototype.toString.toString(),
-        toStringOfToString: Function.prototype.toString.call(Function.prototype.toString),
-        ownSource: (function sample(a) { return a + 1; }).toString(), nativeStr: String(Array.prototype.push),
-        rtt: navigator.connection.rtt, rttGetter: String(Object.getOwnPropertyDescriptor(NetworkInformation.prototype, "rtt").get),
-        lt: {proto: lt.connectionInfo, type: lt.navigationType, request: lt.requestTime, finish: lt.finishDocumentLoadTime},
+        threw, state, lt: {proto: lt.connectionInfo, type: lt.navigationType, request: lt.requestTime, finish: lt.finishDocumentLoadTime},
         csi: {startE: csi.startE, onloadT: csi.onloadT, tran: csi.tran}, now: Date.now(),
-        hop: performance.getEntriesByType("navigation")[0].nextHopProtocol,
-        cross: [frame.Function.prototype.toString.call(Function.prototype.toString), blank.Function.prototype.toString.call(chrome.loadTimes),
-                blank.Function.prototype.toString.call(Object.getOwnPropertyDescriptor(NetworkInformation.prototype, "rtt").get)]};
+        hop: performance.getEntriesByType("navigation")[0].nextHopProtocol};
 """
 
 
@@ -141,24 +133,87 @@ def test_window_chrome_looks_like_chrome(harness, server):
         assert shape["csi"] == ["startE", "onloadT", "pageT", "tran"]
         assert shape["app"] == ["isInstalled", "getDetails", "getIsInstalled", "installState", "runningState",
                                 "InstallState", "RunningState"]
-        assert shape["loadTimesStr"] == "function() {  native function GetLoadTimes();  return GetLoadTimes();}"
-        assert shape["csiStr"] == "function() {  native function GetCSI();  return GetCSI();}"
-        assert shape["appStr"] == "function getDetails() { [native code] }" and shape["name"] == ""
-        assert shape["ownStr"] == shape["loadTimesStr"]
+        assert shape["name"] == "" and shape["appName"] == "getDetails"
         assert (shape["details"], shape["installed"], shape["running"], shape["isInstalled"]) == (None, False, "cannot_run", False)
     assert got["blank"] == "function", got["blank"]
-    assert got["threw"] == "TypeError: Error in invocation of app.getDetails()" and got["notFunction"] == "TypeError"
+    assert got["threw"] == "TypeError: Error in invocation of app.getDetails()"
     assert got["state"] == "not_installed"
-    # Function.prototype.toString still behaves natively for everything else
-    assert got["toString"] == got["toStringOfToString"] == "function toString() { [native code] }"
-    assert got["ownSource"] == "function sample(a) { return a + 1; }"
-    assert got["cross"] == ["function toString() { [native code] }", got["top"]["loadTimesStr"],
-                            "function get rtt() { [native code] }"]  # the same answer from another frame's realm
-    assert got["nativeStr"] == "function push() { [native code] }"
-    assert got["rtt"] > 0 and got["rttGetter"] == "function get rtt() { [native code] }"
     assert got["lt"]["proto"] == got["hop"] and got["lt"]["type"] == "Other"
     assert abs(got["lt"]["request"] * 1000 - got["now"]) < 60_000 and got["lt"]["finish"] >= got["lt"]["request"]
     assert got["csi"]["tran"] == 15 and got["csi"]["onloadT"] >= got["csi"]["startE"] > 0
+
+
+# What fingerprinting scripts (CreepJS's "lies", bot checks) look at to catch a browser that patches itself. The same
+# probe runs in a plain Qt WebEngine profile: everything but window.chrome must answer exactly as there.
+TAMPER_PROBE = """
+const out = {};
+try { Function.prototype.toString.call(null); } catch (e) { out.toStringError = e.stack; }
+try { new Function.prototype.toString(); } catch (e) { out.ctor = e.message; }
+out.toStringKeys = Reflect.ownKeys(Function.prototype.toString).map(String);
+out.toStringDesc = JSON.stringify(Object.getOwnPropertyDescriptor(Function.prototype, "toString"), (k, v) => typeof v === "function" ? String(v) : v);
+try { Object.setPrototypeOf(Function.prototype.toString, Object.create(Function.prototype.toString)); out.cyclic = "no error"; }
+catch (e) { out.cyclic = e.constructor.name + ": " + e.message; }
+out.rttGetter = String(Object.getOwnPropertyDescriptor(NetworkInformation.prototype, "rtt").get);
+const src = "postMessage([navigator.connection.rtt, typeof self.chrome, navigator.userAgentData.brands.map(b => b.brand).join('|')])";
+const worker = new Worker(URL.createObjectURL(new Blob([src], {type: "text/javascript"})));
+out.worker = await new Promise(ok => worker.onmessage = e => ok(e.data));
+out.page = [navigator.connection.rtt, typeof window.chrome, navigator.userAgentData.brands.map(b => b.brand).join("|")];
+if (window.chrome && window.chrome.app) {
+  for (const call of [() => chrome.app.getDetails(1), () => chrome.app.installState()]) {
+    try { call(); } catch (e) { out.appErrors = (out.appErrors || []).concat(e.stack); }
+  }
+}
+return out;
+"""
+
+
+def test_no_detectable_tampering(harness, server, qapp):
+    url = serve(server, "/compat/lies", "<!doctype html><title>lies</title>")
+    page = harness.page()
+    assert load(page, url)
+    shim = run_js_async(page, TAMPER_PROBE)
+    plain = QWebEngineProfile()
+    try:
+        from PyQt6.QtWebEngineCore import QWebEnginePage
+        other = QWebEnginePage(plain)
+        assert load(other, url)
+        native = run_js_async(other, TAMPER_PROBE)
+        sip.delete(other)
+    finally:
+        sip.delete(plain)
+    for key in ("toStringError", "ctor", "toStringKeys", "toStringDesc", "cyclic", "rttGetter"):
+        assert shim[key] == native[key], key
+    assert native["cyclic"].startswith("TypeError")  # a Proxy around toString would let this through
+    assert shim["page"][0] == shim["worker"][0] == native["page"][0]  # the network round trip: page and worker agree
+    assert shim["page"][2] == shim["worker"][2] and shim["page"][1] == "object" and shim["worker"][1] == "undefined"
+    assert len(shim["appErrors"]) == 2 and not any("userscript" in stack for stack in shim["appErrors"]), shim["appErrors"]
+    assert all(stack.startswith("TypeError: Error in invocation of app.") for stack in shim["appErrors"])
+
+
+def chrome_brand_order(major: int) -> list[str]:
+    """The brand order Chrome sends (GenerateBrandVersionList): orders[major % 6] places GREASE, Chromium and the
+    product brand."""
+    orders = ((0, 1, 2), (0, 2, 1), (1, 0, 2), (1, 2, 0), (2, 0, 1), (2, 1, 0))
+    out = [""] * 3
+    for slot, brand in zip(orders[major % 6], (grease_brand(major)[0], "Chromium", "Google Chrome")):
+        out[slot] = brand
+    return out
+
+
+def test_brand_order(harness, server):
+    assert chrome_brand_order(131) == ["Google Chrome", "Chromium", "Not_A Brand"]  # as real Chrome 131 sends it
+    assert chrome_brand_order(124) == ["Chromium", "Google Chrome", "Not-A.Brand"]  # and 124
+    url = serve(server, "/compat/order", "<!doctype html><title>order</title>")
+    page = harness.page()
+    assert load(page, url)
+    sent = [b["brand"] for b in brand_list(lower(server.headers["/compat/order"])["sec-ch-ua"])]
+    expected = chrome_brand_order(int(MAJOR))
+    if sent != expected:
+        # Qt WebEngine sorts the brands, then applies major % 3! permutations itself (PopulateBrandVersionLists), so
+        # Chrome's order is out of reach whatever Foxglove passes. Known and accepted: headers and JS agree.
+        qt_order = [list(p) for p in itertools.permutations(sorted(expected))][int(MAJOR) % 6]
+        assert sent == qt_order, sent
+        pytest.xfail(f"Qt WebEngine's brand order {sent} differs from Chrome {MAJOR}'s {expected}")
 
 
 def test_internal_pages_untouched(harness):

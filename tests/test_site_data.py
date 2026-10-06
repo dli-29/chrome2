@@ -222,6 +222,87 @@ def test_site_helpers(fg):
     assert fg.origin_of(QUrl("http://127.0.0.1:8080/x")) == "http://127.0.0.1:8080"
     assert fg.origin_of(QUrl("http://[::1]:81/")) == "http://[::1]:81"
     assert fg.origin_of(QUrl("file:///tmp/x")) == "" and fg.origin_of(QUrl("foxglove://newtab")) == ""
+    # hosting domains: every subdomain is its own site, as in Chrome
+    assert fg.site_of("alice.github.io") == "alice.github.io" and fg.site_of("www.alice.github.io") == "alice.github.io"
+    assert fg.site_of(".bob.github.io") == "bob.github.io" and fg.site_of("github.io") == "github.io"
+    assert fg.site_of("x.y.s3.amazonaws.com") == "y.s3.amazonaws.com" and fg.site_of("app.vercel.app") == "app.vercel.app"
+    assert fg.site_of("docs.github.com") == "github.com"
+
+
+def test_hosting_subdomains_are_separate_sites(window, fg):
+    """Clearing alice.github.io must not touch bob.github.io (site_of had no public suffixes: both were "github.io")."""
+    for host in ("alice.github.io", "bob.github.io", "www.alice.github.io"):
+        window.history.add_visit(f"https://{host}/", host)
+    assert sorted(window.site_origins("alice.github.io")) == ["https://alice.github.io", "https://www.alice.github.io"]
+    index = fg.CookieIndex.of(window.profile)
+    for domain in (".alice.github.io", "bob.github.io"):
+        cookie = fg.QNetworkCookie(b"sid", b"1")
+        cookie.setDomain(domain)
+        index.cookies[index.key(cookie)] = cookie
+    try:
+        assert [c.domain() for c in index.for_site("alice.github.io")] == [".alice.github.io"]
+        assert index.sites().get("bob.github.io") == 1 and "github.io" not in index.sites()
+    finally:
+        index.cookies.clear()
+
+
+def test_cookie_set_again_unchanged_stays_listed_until_cleared(window, harness, site, fg, monkeypatch):
+    """Qt reports a cookie set again with the same value as removed, with nothing added after it: it must stay in the
+    index (and so be deleted by "Clear Data for This Site"), not drop out while the browser still sends it."""
+    page = harness.page()
+    index = fg.CookieIndex.of(window.profile)
+    for n in range(2):  # the server sends the same session cookie, and a script sets the same one, twice
+        assert load(page, f"{site.url}/cookies?again=1&n={n}")
+        run_js(page, "document.cookie = 'consent=yes; path=/'; 1")
+    wait_until(lambda: index.unsure, 5, "the store to report the cookies removed")
+    from helpers import spin
+    spin(0.5)
+    assert site_cookies(fg, window.profile, "127.0.0.1") == ["again", "consent", "n"]
+    assert load(page, f"{site.url}/blank?again") and "again=1" in site.cookies["/blank"]
+    done = []
+    window.clear_site_data("127.0.0.1", lambda: done.append(True))
+    wait_until(lambda: done, 40, "the site's data to be cleared")
+    assert load(page, f"{site.url}/blank?cleared") and site.cookies["/blank"] == ""
+    assert site_cookies(fg, window.profile, "127.0.0.1") == [] and not index.unsure
+    # really deleted by the site: gone from the list once Chromium's database (written within 30 s) says so
+    assert load(page, f"{site.url}/cookies?gone=1&kept=1")
+    wait_until(lambda: site_cookies(fg, window.profile, "127.0.0.1") == ["gone", "kept"], 5, "two cookies")
+    assert load(page, f"{site.url}/cookies?gone=;Max-Age=0&kept=1")
+    wait_until(lambda: ("gone", "127.0.0.1", "/") in index.unsure, 5, "the removal")
+    assert load(page, f"{site.url}/blank?gone") and site.cookies["/blank"] == "kept=1"
+    assert isinstance(index._saved_keys(), set)  # (readable while Chromium has it open)
+    saved = {k for k in index.cookies if k[0] == "kept"}  # what the database has 30 s later
+    monkeypatch.setattr(index, "_saved_keys", lambda: saved)
+    monkeypatch.setattr(index, "RECHECK_S", 0)
+    index._reconcile()
+    assert site_cookies(fg, window.profile, "127.0.0.1") == ["kept"] and not index.unsure
+
+
+def test_deleting_one_cookie_keeps_same_name_ones(window, harness, server, fg):
+    """Chromium deletes every cookie of the name a request to the URL would carry: deleting sid on /app must not take
+    sid on / (the site's whole sign-in) with it."""
+    server.routes["/f7/root"] = (200, "text/html", b"<title>r</title>", {"Set-Cookie": "sid=root; Path=/"})
+    server.routes["/f7/app"] = (200, "text/html", b"<title>a</title>", {"Set-Cookie": "sid=app; Path=/app"})
+    server.routes["/app/page"] = (200, "text/html", b"<title>p</title>", {})
+    page = harness.page()
+    assert load(page, server.url("/f7/root")) and load(page, server.url("/f7/app"))
+    index = fg.CookieIndex.of(window.profile)
+    wait_until(lambda: [k for k in index.cookies if k[0] == "sid"].__len__() == 2, 5, "both cookies")
+    window.show_site_settings(QUrl(server.url("/")))
+    dialog = window._dialogs["sites"]
+    wait_until(lambda: dialog.cookie_list.topLevelItemCount() == 2, 5, "the list")
+    items = [dialog.cookie_list.topLevelItem(i) for i in range(2)]
+    next(i for i in items if tuple(i.data(0, fg.Qt.ItemDataRole.UserRole))[2] == "/app").setSelected(True)
+    dialog.delete_cookies(selected=True)
+    wait_until(lambda: sorted(k[2] for k in index.cookies if k[0] == "sid") == ["/"], 5, "only the /app one gone")
+    assert load(page, server.url("/app/page"))
+    assert server.headers["/app/page"].get("Cookie") == "sid=root"  # still signed in
+    # a same-name cookie whose value Foxglove can't know (encrypted on disk) can't be kept: it is reported
+    assert load(page, server.url("/f7/app"))
+    wait_until(lambda: len([k for k in index.cookies if k[0] == "sid"]) == 2, 5, "both again")
+    index.unknown_values.add(("sid", "127.0.0.1", "/"))
+    lost = index.delete([index.cookies[("sid", "127.0.0.1", "/app")]])
+    assert [index.key(c) for c in lost] == [("sid", "127.0.0.1", "/")]
 
 
 def test_cookie_list_and_per_site_delete(window, harness, site, fg):
@@ -376,9 +457,10 @@ def test_clear_site_data_removes_storage_of_that_site_only(window, harness, site
 
 def test_clear_browsing_data_clears_cookies_and_site_data(window, harness, site, fg, monkeypatch):
     tab = window.current_tab()
-    load_tab(tab, f"{site.url}/store")
-    poll_js(tab.page, "window.__done === true", timeout=15, what="the data to be stored")
-    load_tab(tab, f"{site.url}/blank?cleared")
+    load_tab(tab, f"{site.url}/set")  # (only the first load of /set stores anything)
+    poll_js(tab.page, "window.__done === true", timeout=15, what="the data to be stored")  # the tab keeps its database open
+    toasts = []
+    monkeypatch.setattr(window, "toast", lambda text, *_a: toasts.append(text))
     dialog = fg.ClearDataDialog(window)
     assert dialog.cookies.text().startswith("Cookies and site data")
     dialog.history.setChecked(True)
@@ -389,7 +471,84 @@ def test_clear_browsing_data_clears_cookies_and_site_data(window, harness, site,
     dialog._clear()
     assert cleaners and site.url in cleaners[0].origins  # found through history (cleared after this)
     assert not cleaners[0].thorough
-    wait_until(lambda: fg.sip.isdeleted(cleaners[0]) or not cleaners[0]._workers, 40, "the clearing")
+    assert toasts == ["Clearing cookies and site data…"]  # done only when it is
+    wait_until(lambda: toasts[-1:] == ["Browsing data cleared."], 40, "the clearing")
     wait_until(lambda: not fg.CookieIndex.of(window.profile).cookies, 5, "no cookies")
+    wait_until(lambda: not tab.loading, 15, "the tab to reload")  # it let go of its database
     after = stored(harness, site.url)
     assert (after["cookie"], after["ls"], after["idb"], after["cache"]) == ("", None, None, None)
+
+
+def test_clearing_every_site_spares_what_you_do_meanwhile(window, harness, site, fg):
+    """Clearing every site takes a while (a hidden page per origin). Signing in somewhere meanwhile must stick: no
+    second "delete all cookies" at the end, and an origin you load again is left alone."""
+    other = f"http://localhost:{site.port}"
+    window.history.add_visit(other + "/", "other")  # known from history: far down the queue
+    for i in range(150):
+        window.history.add_visit(f"https://site{i}.example.test/", f"s{i}")
+    page = harness.page()
+    cleaner = window.clear_site_data(None)
+    assert other in cleaner.queue
+    tab = window.current_tab()
+    assert load(tab.page, f"{other}/cookies?plogin=1")  # signing in again, in a tab
+    run_js(tab.page, "localStorage.setItem('token', 'new'); 1")
+    assert other in cleaner.visited and other not in cleaner.queue
+    finished = wait_until(lambda: fg.sip.isdeleted(cleaner) or not cleaner._workers, 60, "the clearing") and True
+    assert finished and other not in cleaner.done
+    assert load(page, f"{other}/blank?after") and site.cookies["/blank"] == "plogin=1"
+    assert run_js(tab.page, "localStorage.getItem('token')") == "new"
+
+
+def test_clearing_finds_storage_history_forgot(window, harness, site, fg):
+    """After a history-only clear, an origin with stored data is found in Chromium's storage folders."""
+    other = f"http://localhost:{site.port}"
+    tab = window.current_tab()
+    load_tab(tab, f"{other}/store")
+    poll_js(tab.page, "window.__done === true", timeout=15, what="the data to be stored")
+    load_tab(tab, f"{site.url}/blank?elsewhere")
+    window.clear_history_traces()
+    fg.CookieIndex.of(window.profile).delete_all()
+    assert other in fg.stored_origins(fg.Path(window.profile.persistentStoragePath()))
+    done = []
+    window.clear_site_data(None, lambda: done.append(True))
+    wait_until(lambda: done, 40, "the clearing")
+    after = stored(harness, other)
+    assert (after["ls"], after["idb"], after["cache"]) == (None, None, None)
+
+
+def test_clearing_left_running_is_recorded_and_finished(window, harness, site, fg, tmp_path):
+    for i in range(100):
+        window.history.add_visit(f"https://site{i}.example.test/", f"s{i}")
+    window.clear_site_data(None)
+    one = window.clear_site_data(origins=["https://a.example.test", "https://b.example.test"])
+    window.save_pending_clearing()
+    path = window.session_path.with_name(fg.PENDING_CLEAR)
+    pending = json.loads(path.read_text())
+    assert pending["all"] is True and pending["origins"] == one.pending()
+    assert set(pending["origins"]) <= {"https://a.example.test", "https://b.example.test"}
+    # the next start: every site's -> Chromium's storage folders go before the profile opens them
+    storage, profile_dir = tmp_path / "storage", tmp_path / "profile"
+    for name in ("IndexedDB/x", "Local Storage/leveldb", "Service Worker/Database", "Cookies-dir"):
+        (storage / name).mkdir(parents=True)
+    profile_dir.mkdir()
+    (profile_dir / fg.PENDING_CLEAR).write_text(json.dumps(pending))
+    assert fg.finish_clearing(profile_dir, storage) == ([], [])
+    assert sorted(p.name for p in storage.iterdir()) == ["Cookies-dir"] and not (profile_dir / fg.PENDING_CLEAR).exists()
+    # something was loaded since clearing every site began: not a wipe (that would take the new data too), the rest
+    path.unlink()
+    for cleaner in window._cleaners:
+        cleaner.visit(f"http://localhost:{site.port}")
+    window.save_pending_clearing()
+    pending = json.loads(path.read_text())
+    assert pending["all"] is False and "https://site0.example.test" in pending["storage"]
+    (profile_dir / fg.PENDING_CLEAR).write_text(json.dumps({**pending, "origins": ["https://a.example.test", "x"]}))
+    (storage / "IndexedDB").mkdir()
+    origins, quick = fg.finish_clearing(profile_dir, storage)
+    assert origins == ["https://a.example.test"] and quick == pending["storage"] and (storage / "IndexedDB").exists()
+    assert fg.finish_clearing(profile_dir, storage) == ([], [])
+
+
+def test_clearing_unfinished_at_quit_is_finished_at_next_start():
+    result = store_and_check("clear_close")
+    assert result.get("error") is None, result
+    assert (result["sent"], result["ls"], result["idb"], result["cache"], result["sw"]) == ("", None, None, None, 0), result

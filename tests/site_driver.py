@@ -78,6 +78,11 @@ def quit_now(win, how: str) -> None:
             else:
                 QTimer.singleShot(100, ready)
         QTimer.singleShot(100, ready)
+    elif how == "clear_close":  # Clear Browsing Data › Cookies and site data, and quit long before it's done
+        for i in range(400):
+            win.history.add_visit(f"https://site{i}.example.test/", "padding")
+        win.clear_site_data()
+        win.close()
     else:
         raise SystemExit(f"unknown quit path {how}")
 

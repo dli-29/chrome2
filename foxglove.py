@@ -589,15 +589,27 @@ def display_url(url: QUrl) -> str:
 
 
 _SECOND_LEVEL = {"co", "com", "net", "org", "gov", "edu", "ac", "or", "ne", "go", "gob", "mil", "nic", "sch", "ltd", "plc", "nhs"}
+# Hosting domains where every subdomain is someone else's site (the "private" part of the public suffix list, the
+# common ones): alice.github.io and bob.github.io are two sites, as in Chrome.
+PUBLIC_SUFFIXES = frozenset("""github.io githubusercontent.com gitlab.io bitbucket.io vercel.app vercel.dev now.sh
+netlify.app pages.dev workers.dev r2.dev web.app firebaseapp.com appspot.com run.app cloudfunctions.net
+googleusercontent.com translate.goog herokuapp.com blogspot.com azurewebsites.net azurestaticapps.net cloudapp.net
+cloudfront.net s3.amazonaws.com elasticbeanstalk.com onrender.com fly.dev glitch.me repl.co replit.app ngrok.io
+ngrok.app ngrok-free.app trycloudflare.com myshopify.com wixsite.com webflow.io neocities.org surge.sh codeberg.page
+readthedocs.io sourceforge.io deno.dev supabase.co carrd.co notion.site streamlit.app hf.space up.railway.app
+ondigitalocean.app digitaloceanspaces.com pythonanywhere.com gitpod.io stackblitz.io csb.app duckdns.org""".split())
 
 
 def site_of(host: str) -> str:
-    """The site a host belongs to, about its registrable domain (no public-suffix list): accounts.google.com ->
-    google.com, www.bbc.co.uk -> bbc.co.uk. IP addresses and localhost are their own site."""
+    """The site a host belongs to, about its registrable domain: accounts.google.com -> google.com, www.bbc.co.uk ->
+    bbc.co.uk, alice.github.io -> alice.github.io. IP addresses and localhost are their own site."""
     host = host.lower().strip(".").strip("[]")
     labels = host.split(".")
     if len(labels) <= 2 or re.fullmatch(r"[\d.]+|[0-9a-f:]+", host):
         return host
+    for n in range(len(labels) - 1, 1, -1):  # the longest known suffix, and one label more
+        if ".".join(labels[-n:]) in PUBLIC_SUFFIXES:
+            return ".".join(labels[-n - 1:])
     return ".".join(labels[-3:] if len(labels[-1]) == 2 and labels[-2] in _SECOND_LEVEL else labels[-2:])
 
 
@@ -2501,43 +2513,57 @@ class CookieIndex(QObject):
     by the site settings and chrome.cookies: CookieIndex.of(profile). Make it before the profile's first page: it starts
     from the cookies Chromium saved (its Cookies database, read before Chromium opens it), then follows every change.
     loadAllCookies() can't stand in for that: Qt asks Chromium to load the cookies and drops the answer, so cookies
-    that were already there are never reported."""
+    that were already there are never reported.
+
+    Qt reports a cookie set again unchanged (pages do that all the time) as removed, with no "added" after it, so a
+    removal is no proof: such a cookie stays listed ("unsure") - and deleted with its site - until Chromium's database,
+    which gets every change within 30 s, says it's gone. Cookies Foxglove deletes itself go at once."""
     added = pyqtSignal(object)    # QNetworkCookie
     removed = pyqtSignal(object)
     loaded = pyqtSignal()
     changed = pyqtSignal()        # at most every 150 ms (for views)
     LOAD_MS = 1500                # what loadAllCookies() may still report arrives well within this (it never says "done")
+    RECHECK_S = 40                # Chromium writes cookie changes to its database at least every 30 s
     SAME_SITE = {0: QNetworkCookie.SameSite.None_, 1: QNetworkCookie.SameSite.Lax, 2: QNetworkCookie.SameSite.Strict}
 
     def __init__(self, profile: QWebEngineProfile):
         super().__init__(profile)
         self.store = profile.cookieStore()
         self.cookies: dict[tuple, QNetworkCookie] = {}  # (name, domain, path) -> cookie; updated in place, never replaced
+        self.unsure: dict[tuple, float] = {}  # reported removed, maybe still there -> when (monotonic)
+        self.unknown_values: set[tuple] = set()  # read from the database encrypted: deletable, but can't be made again
         self.ready = False
+        self.db_path = None if profile.isOffTheRecord() else Path(profile.persistentStoragePath()) / "Cookies"
         self._notify = QTimer(self)
         self._notify.setSingleShot(True)
         self._notify.setInterval(150)
         self._notify.timeout.connect(self.changed)
-        if not profile.isOffTheRecord():
-            self._read_saved(Path(profile.persistentStoragePath()) / "Cookies")
+        self._recheck = QTimer(self)
+        self._recheck.setSingleShot(True)
+        self._recheck.timeout.connect(self._reconcile)
+        saved = self._read_saved() if self.db_path else None
+        if saved is not None:
+            self.cookies.update(saved[0])
+            self.unknown_values = saved[1]
         self.store.cookieAdded.connect(self._added)
         self.store.cookieRemoved.connect(self._removed)
         self.store.loadAllCookies()
         QTimer.singleShot(self.LOAD_MS, self._loaded)
 
-    def _read_saved(self, path: Path) -> None:
+    def _read_saved(self) -> tuple[dict, set] | None:
+        """The cookies in Chromium's database and those whose value it encrypted (None if it can't be read)."""
         try:
+            path = self.db_path
             db = sqlite3.connect(f"file:{quote(str(path))}?mode=ro", uri=True, timeout=0.5) if path.is_file() else None
-            rows = db.execute("SELECT host_key, name, value, path, expires_utc, is_secure, is_httponly, has_expires, "
-                              "samesite FROM cookies").fetchall() if db else []
+            rows = db.execute("SELECT host_key, name, value, length(encrypted_value), path, expires_utc, is_secure, "
+                              "is_httponly, has_expires, samesite FROM cookies").fetchall() if db else []
             if db:
                 db.close()
         except sqlite3.Error as exc:
             log(f"Couldn't read the saved cookies: {exc}")
-            return
-        now = time.time()
-        for host, name, value, cookie_path, expires, secure, http_only, has_expires, same_site in rows:
-            # (a value Chromium encrypted reads as "": cookies are deleted by name, so that doesn't matter)
+            return None
+        now, cookies, unknown = time.time(), {}, set()
+        for host, name, value, encrypted, cookie_path, expires, secure, http_only, has_expires, same_site in rows:
             cookie = QNetworkCookie(str(name).encode(), str(value or "").encode())
             cookie.setDomain(str(host))
             cookie.setPath(str(cookie_path or "/"))
@@ -2549,7 +2575,24 @@ class CookieIndex(QObject):
                 if seconds <= now:
                     continue
                 cookie.setExpirationDate(QDateTime.fromMSecsSinceEpoch(int(seconds * 1000)))
-            self.cookies[self.key(cookie)] = cookie
+            cookies[self.key(cookie)] = cookie
+            if encrypted and not value:
+                unknown.add(self.key(cookie))
+        return cookies, unknown
+
+    def _saved_keys(self) -> set[tuple] | None:
+        """The keys of the unexpired cookies in Chromium's database (None if it can't be read)."""
+        try:
+            db = sqlite3.connect(f"file:{quote(str(self.db_path))}?mode=ro", uri=True, timeout=0.5)
+            try:
+                rows = db.execute("SELECT name, host_key, path FROM cookies WHERE has_expires = 0 OR expires_utc > ?",
+                                  ((int(time.time()) + 11644473600) * 1_000_000,)).fetchall()
+            finally:
+                db.close()
+        except sqlite3.Error as exc:
+            log(f"Couldn't read the saved cookies: {exc}")
+            return None
+        return {(str(name), str(host).lower(), str(path or "/")) for name, host, path in rows}
 
     @classmethod
     def of(cls, profile: QWebEngineProfile) -> "CookieIndex":
@@ -2560,17 +2603,60 @@ class CookieIndex(QObject):
     def key(cookie: QNetworkCookie) -> tuple:
         return bytes(cookie.name()).decode("utf-8", "replace"), cookie.domain().lower(), cookie.path() or "/"
 
+    @staticmethod
+    def url_of(cookie: QNetworkCookie) -> QUrl:
+        return QUrl(f"{'https' if cookie.isSecure() else 'http'}://{cookie.domain().lstrip('.')}{cookie.path() or '/'}")
+
+    @staticmethod
+    def sent_to(cookie: QNetworkCookie, url: QUrl) -> bool:
+        """Whether a request to *url* carries *cookie* (what Chromium deletes by name and URL)."""
+        domain, host, path, at = cookie.domain().lower(), url.host().lower(), cookie.path() or "/", url.path() or "/"
+        return ((host == domain if not domain.startswith(".") else host == domain[1:] or host.endswith(domain))
+                and (at == path or at.startswith(path.rstrip("/") + "/")) and (not cookie.isSecure() or url.scheme() == "https"))
+
+    def _changed(self) -> None:
+        self._notify.isActive() or self._notify.start()
+
     def _added(self, cookie) -> None:
         cookie = QNetworkCookie(cookie)
-        self.cookies[self.key(cookie)] = cookie
+        key = self.key(cookie)
+        self.cookies[key] = cookie
+        self.unsure.pop(key, None)
+        self.unknown_values.discard(key)
         self.added.emit(cookie)
-        self._notify.isActive() or self._notify.start()
+        self._changed()
 
     def _removed(self, cookie) -> None:
         cookie = QNetworkCookie(cookie)
-        self.cookies.pop(self.key(cookie), None)
+        key = self.key(cookie)
+        if key in self.cookies:
+            if not cookie.isSessionCookie() and cookie.expirationDate() <= QDateTime.currentDateTime():
+                self._forget(key)  # expired
+            else:  # deleted, or set again unchanged: the database will tell
+                self.unsure[key] = time.monotonic()
+                if self.db_path is not None and not self._recheck.isActive():
+                    self._recheck.start(self.RECHECK_S * 1000)
         self.removed.emit(cookie)
-        self._notify.isActive() or self._notify.start()
+        self._changed()
+
+    def _forget(self, key: tuple) -> None:
+        self.cookies.pop(key, None)
+        self.unsure.pop(key, None)
+        self.unknown_values.discard(key)
+
+    def _reconcile(self) -> None:
+        if sip.isdeleted(self) or not self.unsure:
+            return
+        due = time.monotonic() - self.RECHECK_S + 1
+        saved = self._saved_keys()
+        settled = [key for key, when in self.unsure.items() if when <= due]
+        for key in settled:
+            del self.unsure[key]
+            if saved is not None and key not in saved:
+                self.cookies.pop(key, None)
+        if self.unsure:
+            self._recheck.start(max(1, int((min(self.unsure.values()) - due + 1) * 1000)))
+        self._changed()
 
     def _loaded(self) -> None:
         if not sip.isdeleted(self):
@@ -2589,19 +2675,47 @@ class CookieIndex(QObject):
             counts[site] = counts.get(site, 0) + 1
         return counts
 
-    def delete(self, cookie: QNetworkCookie) -> None:
-        """Delete it (Qt deletes the cookies of that name a request to this URL would carry)."""
-        host = cookie.domain().lstrip(".")
-        self.store.deleteCookie(cookie, QUrl(f"{'https' if cookie.isSecure() else 'http'}://{host}{cookie.path() or '/'}"))
+    def delete(self, cookies: list[QNetworkCookie], url: QUrl | None = None, keep_others: bool = True) -> list[QNetworkCookie]:
+        """Delete *cookies* (by default each at its own URL). Chromium deletes every cookie of that name a request to
+        the URL would carry - on parent paths, the domain and the host too: unless *keep_others* is False, those are
+        made again. Returns the ones that couldn't be (their value is encrypted in the database)."""
+        doomed, hit = {self.key(c) for c in cookies}, {}
+        for cookie in cookies:
+            target = url if url is not None else self.url_of(cookie)
+            hit.update((k, c) for k, c in self.cookies.items() if c.name() == cookie.name() and self.sent_to(c, target))
+            self.store.deleteCookie(cookie, target)
+        lost = []
+        for key, cookie in hit.items():
+            unknown = key in self.unknown_values
+            self._forget(key)
+            if key in doomed or not keep_others:
+                continue
+            if unknown:
+                lost.append(cookie)
+                continue
+            again = QNetworkCookie(cookie)
+            if not cookie.domain().startswith("."):
+                again.setDomain("")  # host-only: made from the URL (a domain= would make it a domain cookie)
+            self.store.setCookie(again, self.url_of(cookie))
+        for key in doomed:
+            self._forget(key)
+        self._changed()
+        return lost
+
+    def delete_all(self) -> None:
+        self.store.deleteAllCookies()
+        for key in list(self.cookies):
+            self._forget(key)
+        self._changed()
 
 
 class SiteDataCleaner(QObject):
     """Clears what web pages store in the browser - local storage, IndexedDB, Cache Storage, service workers - for some
     origins. Qt has no API for that, so a hidden page *in* each origin clears it with the web platform's own calls:
     first an empty document given the origin (no network, works offline; it can't reach service workers), then, when
-    *thorough*, the site's /robots.txt, a real document of the origin that can unregister them too. Limits: an IndexedDB
-    database a tab holds open goes when that tab lets go of it (the caller reloads such tabs); sessionStorage belongs
-    to each tab and goes with it."""
+    *thorough*, the site's /robots.txt, a real document of the origin that can unregister them too (a cookie the site
+    sets with it is deleted at once). Limits: an IndexedDB database a tab holds open goes when that tab lets go of it
+    (the caller reloads such tabs); sessionStorage belongs to each tab and goes with it."""
     finished = pyqtSignal()
     PARALLEL, STEP_MS = 4, 6000
     BLANK = "<!doctype html><title></title>"
@@ -2615,14 +2729,30 @@ class SiteDataCleaner(QObject):
   window.__foxgloveCleared = true;
 })(); true"""
 
-    def __init__(self, profile: QWebEngineProfile, origins: list[str], thorough: bool = False, parent: QObject | None = None):
+    def __init__(self, profile: QWebEngineProfile, origins: list[str], thorough: bool = False, parent: QObject | None = None,
+                 skip_visited: bool = False):
         super().__init__(parent)
         self.profile = profile
         self.origins = [o for o in dict.fromkeys(origins) if o]
         self.queue = list(self.origins)
         self.thorough = thorough
+        self.skip_visited = skip_visited
         self.cleared: set[str] = set()  # origins whose storage was reached
+        self.done: set[str] = set()     # origins dealt with
+        self.visited: set[str] = set()  # origins a tab loaded since clearing began
+        self._robots: dict[str, float | None] = {}  # origin -> until when its /robots.txt may still bring cookies
         self._workers = 0
+        if thorough:  # (Qt's cookie filter would do, but PyQt can't take it off again: every request would wait on it)
+            CookieIndex.of(profile).added.connect(self._robots_cookie)
+
+    def visit(self, origin: str) -> None:
+        """A tab loaded *origin*: with skip_visited, it's left alone if still waiting (what it stores now is new)."""
+        self.visited.add(origin)
+        if self.skip_visited and origin in self.queue:
+            self.queue.remove(origin)
+
+    def pending(self) -> list[str]:
+        return [o for o in self.origins if o not in self.done and not (self.skip_visited and o in self.visited)]
 
     def start(self) -> None:
         self._workers = min(self.PARALLEL, len(self.queue))
@@ -2633,6 +2763,16 @@ class SiteDataCleaner(QObject):
             self._next(page)
         if not self._workers:
             QTimer.singleShot(0, self.finished.emit)
+
+    def _robots_cookie(self, cookie: QNetworkCookie) -> None:
+        """A cookie for an origin whose /robots.txt is loading came with it: delete it (it must not sign you back in)."""
+        now = time.monotonic()
+        for origin, until in list(self._robots.items()):
+            if until is not None and until < now:
+                del self._robots[origin]
+            elif CookieIndex.sent_to(cookie, QUrl(f"https://{QUrl(origin).host()}{cookie.path() or '/'}")):
+                CookieIndex.of(self.profile).delete([cookie])
+                return
 
     def _next(self, page: QWebEnginePage) -> None:
         if not self.queue:
@@ -2646,13 +2786,19 @@ class SiteDataCleaner(QObject):
         loads = [lambda: page.setHtml(self.BLANK, QUrl(origin + "/"))]
         url = QUrl(origin)
         if self.thorough and (url.scheme() == "https" or url.host() in ("localhost", "127.0.0.1", "::1")):  # secure: may have workers
-            loads.append(lambda: page.load(QUrl(origin + "/robots.txt")))
+            def robots_txt() -> None:
+                self._robots[origin] = None  # until it's done: cookies for it meanwhile came with it
+                page.load(QUrl(origin + "/robots.txt"))
+            loads.append(robots_txt)
         self._step(page, origin, loads)
 
     def _step(self, page: QWebEnginePage, origin: str, loads: list) -> None:
         if sip.isdeleted(self) or sip.isdeleted(page):
             return
         if not loads:
+            self.done.add(origin)
+            if origin in self._robots:
+                self._robots[origin] = time.monotonic()  # (a cookie it set was reported long before this)
             self._next(page)
             return
         token = page._token = object()
@@ -2684,6 +2830,45 @@ class SiteDataCleaner(QObject):
         page._on_load = loaded
         QTimer.singleShot(self.STEP_MS + 500, advance)
         loads.pop(0)()
+
+
+SITE_STORAGE = ("Local Storage", "Session Storage", "IndexedDB", "Service Worker", "WebStorage", "File System",
+                "databases", "blob_storage")  # what web pages keep in Chromium's profile folder (not cookies or cache)
+PENDING_CLEAR = "clear-site-data.json"  # clearing still running when Foxglove quit
+_ORIGIN_BYTES = re.compile(rb"https?://[a-z0-9-]+(?:\.[a-z0-9-]+)*(?::\d{1,5})?")
+
+
+def stored_origins(storage: Path) -> list[str]:
+    """Origins with data in Chromium's storage folders, also ones history no longer knows of (best effort: IndexedDB's
+    folder names and the origins in the raw bytes of the storage databases)."""
+    found: dict[str, None] = {}
+    for item in (storage / "IndexedDB").glob("*.indexeddb.leveldb"):
+        if match := re.fullmatch(r"(https?)_([a-z0-9.-]+)_(\d+)\.indexeddb\.leveldb", item.name):
+            found[f"{match[1]}://{match[2]}{'' if match[3] == '0' else ':' + match[3]}"] = None
+    for pattern in ("Local Storage/leveldb/*", "Session Storage/*", "Service Worker/Database/*",
+                    "Service Worker/CacheStorage/*/index.txt", "WebStorage/QuotaManager*"):
+        for item in storage.glob(pattern):
+            try:
+                if item.is_file() and item.stat().st_size < 64 << 20:
+                    found.update(dict.fromkeys(m.decode() for m in _ORIGIN_BYTES.findall(item.read_bytes())))
+            except OSError:
+                pass
+    return [o for o in found if origin_of(QUrl(o)) == o]
+
+
+def finish_clearing(profile_dir: Path, storage: Path) -> tuple[list[str], list[str]]:
+    """Clearing that was still running when Foxglove last quit. Every site's, if nothing was loaded meanwhile:
+    Chromium's storage folders are deleted, before the profile opens them (complete, unlike page by page). Otherwise
+    returns the origins left: (one site's - thorough, every site's - storage only)."""
+    data = read_json(profile_dir / PENDING_CLEAR, None)
+    (profile_dir / PENDING_CLEAR).unlink(missing_ok=True)
+    data = data if isinstance(data, dict) else {}
+    if data.get("all"):
+        for name in SITE_STORAGE:
+            shutil.rmtree(storage / name, ignore_errors=True)
+    lists = [data.get(key) if isinstance(data.get(key), list) else [] for key in ("origins", "storage")]
+    return tuple([o for o in found if isinstance(o, str) and origin_of(QUrl(o)) == o] if not data.get("all") else []
+                 for found in lists)
 
 
 class FaviconCache(QObject):
@@ -5571,9 +5756,8 @@ class ExtensionBridge(QWebEngineUrlSchemeHandler):
 
     def api_cookies_remove(self, ext_id: str, a: dict, ctx: dict):
         url = self._cookie_url(ext_id, a.get("url"))
-        for key, cookie in list(self._cookies.items()):
-            if key[0] == a.get("name") and self._cookie_applies(self._cookie_info(cookie), url):
-                self.c.profile.cookieStore().deleteCookie(cookie, url)
+        name = QNetworkCookie(str(a.get("name") or "").encode())
+        CookieIndex.of(self.c.profile).delete([name], url, keep_others=False)  # Chrome's: every match for the URL
         return {"url": url.toString(), "name": str(a.get("name") or ""), "storeId": "0"}
 
     def _cookie_added(self, cookie) -> None:
@@ -7804,6 +7988,7 @@ class PopupWindow(QWidget):
         prefix = "🔒 " if secure else ""
         self.header.setText(prefix + elide(url.toDisplayString(), 90))
         self.win.extensions.bridge.tab_navigated(self, url)
+        self.win.site_visited(url)
 
     def url(self) -> QUrl:
         url = self.page.url()
@@ -8177,15 +8362,15 @@ class ClearDataDialog(QDialog):
         layout.addWidget(buttons)
 
     def _clear(self) -> None:
-        profile = self.win.profile
+        profile, win = self.win.profile, self.win
         if self.cookies.isChecked():  # first: history tells which sites may have stored data
-            self.win.clear_site_data()
+            win.clear_site_data(None, lambda: win.toast("Browsing data cleared."))
         if self.history.isChecked():
-            self.win.clear_history_traces()
+            win.clear_history_traces()
         if self.cache.isChecked():
             profile.clearHttpCache()
         self.accept()
-        self.win.toast("Browsing data cleared.")
+        win.toast("Clearing cookies and site data…" if self.cookies.isChecked() else "Browsing data cleared.")
 
 
 class SiteSettingsDialog(QDialog):
@@ -8398,10 +8583,10 @@ class SiteSettingsDialog(QDialog):
     def delete_cookies(self, selected: bool = False) -> None:
         keys = [tuple(i.data(0, Qt.ItemDataRole.UserRole)) for i in self.cookie_list.selectedItems()] if selected else \
             [CookieIndex.key(c) for c in self.index.for_site(self.site)]
-        for key in keys:
-            cookie = self.index.cookies.get(key)
-            if cookie is not None:
-                self.index.delete(cookie)
+        lost = self.index.delete([c for c in map(self.index.cookies.get, keys) if c is not None])
+        if lost:  # same name on a parent path or domain, value unknown: Chromium deletes those along with it
+            self.win.toast("Also deleted: " + ", ".join(sorted({bytes(c.name()).decode("utf-8", "replace") + " on " +
+                                                                c.domain().lstrip(".") + (c.path() or "/") for c in lost})))
 
     def clear_site(self) -> None:
         site = self.site
@@ -9121,6 +9306,7 @@ class BrowserWindow(QMainWindow):
         self._vpn_warned = False
         self.profile = profile
         self.cookie_index = CookieIndex.of(profile)  # (main() made it already, before any page)
+        self._cleaners: list[SiteDataCleaner] = []  # clearing site data, still running
         self.settings = settings
         self.bookmarks = bookmarks
         self.history = history
@@ -9734,6 +9920,8 @@ class BrowserWindow(QMainWindow):
                 tab.permission_bars.remove(bar)
                 if not sip.isdeleted(bar):
                     bar.dismiss()
+        if tab.loading:
+            self.site_visited(url)
         if not tab.loading and HistoryStore.recordable(url) and url.toString() != tab.last_recorded:
             tab.last_recorded = url.toString()
             self.history.add_visit(url.toString(), tab.page.title())
@@ -10895,44 +11083,67 @@ class BrowserWindow(QMainWindow):
             if site is None or site_of(QUrl(origin).host()) == site:
                 self.set_permission_state(origin, kind, "ask")
 
-    def site_origins(self, site: str | None = None) -> list[str]:
-        """The origins of *site* (None: of every site) Foxglove knows of - open pages, history, permissions, cookies.
-        Stored data belongs to origins, and Qt can't list the ones that have some."""
+    def site_origins(self, site: str | None = None, stored: bool = False) -> list[str]:
+        """The origins of *site* (None: of every site) Foxglove knows of - open pages, history, permissions, cookies and,
+        if *stored*, Chromium's storage folders. Stored data belongs to origins, and Qt can't list the ones that have some."""
         urls = [t.url() for t in self.tabs()] + [p.url() for p in self.popups]
         urls += [QUrl(row[0]) for row in self.history.recent(limit=5000)]
         found = dict.fromkeys(origin_of(url) for url in urls)
         found.update(dict.fromkeys(origin for origin, _kind, _state in self.permission_decisions()))
         found.update(dict.fromkeys(f"https://{c.domain().lstrip('.')}" for c in self.cookie_index.cookies.values()))
+        if stored and not self.profile.isOffTheRecord():
+            found.update(dict.fromkeys(stored_origins(Path(self.profile.persistentStoragePath()))))
         return [o for o in found if o and (site is None or site_of(QUrl(o).host()) == site)]
 
-    def clear_site_data(self, site: str | None = None, done=None) -> SiteDataCleaner:
-        """Delete *site*'s cookies and stored data (None: every site's). For one site its service workers go too, and
-        its open tabs are reloaded so they let go of what they hold."""
-        index = self.cookie_index
-        origins = self.site_origins(site)
-
-        def delete_cookies() -> None:
-            if site is None:
-                self.profile.cookieStore().deleteAllCookies()
-            else:
-                for cookie in index.for_site(site):
-                    index.delete(cookie)
+    def clear_site_data(self, site: str | None = None, done=None, origins: list[str] | None = None,
+                        thorough: bool = True) -> SiteDataCleaner:
+        """Delete *site*'s cookies and stored data (None: every site's), or finish clearing *origins* (their cookies went
+        already; *thorough*: service workers too). For one site its service workers go too. Tabs showing what was
+        cleared reload, to let go of what they hold. Clearing every site takes a while: origins you load again
+        meanwhile are left alone (what they store now is new), and if Foxglove quits first, the next start finishes."""
+        index, everything = self.cookie_index, site is None and origins is None
+        if origins is None:
+            origins = self.site_origins(site, stored=True)  # (the open tabs' first)
+            index.delete_all() if site is None else index.delete(index.for_site(site))
+        cleaner = SiteDataCleaner(self.profile, origins, thorough=not everything and (site is not None or thorough),
+                                  parent=self, skip_visited=everything)
+        cleaner.everything = everything
+        self._cleaners.append(cleaner)
 
         def finished() -> None:
-            delete_cookies()  # again: whatever the site set while its /robots.txt loaded
-            if site is not None:
-                for tab in self.tabs():
-                    if tab.pending is None and origin_of(tab.url()) in origins:
-                        tab.page.triggerAction(QWebEnginePage.WebAction.Reload)
+            if cleaner in self._cleaners:
+                self._cleaners.remove(cleaner)
+            for tab in self.tabs():
+                origin = origin_of(tab.url())
+                if tab.pending is None and origin in cleaner.done and not (everything and origin in cleaner.visited):
+                    tab.page.triggerAction(QWebEnginePage.WebAction.Reload)
             cleaner.deleteLater()
             if done is not None:
                 done()
 
-        delete_cookies()
-        cleaner = SiteDataCleaner(self.profile, origins, thorough=site is not None, parent=self)
         cleaner.finished.connect(finished)
         cleaner.start()
         return cleaner
+
+    def site_visited(self, url: QUrl) -> None:
+        if self._cleaners and (origin := origin_of(url)):
+            for cleaner in self._cleaners:
+                cleaner.visit(origin)
+
+    def save_pending_clearing(self) -> None:
+        """Clearing still running is finished at the next start (see finish_clearing)."""
+        running = [c for c in self._cleaners if not sip.isdeleted(c)]
+        if running:
+            path = self.session_path.with_name(PENDING_CLEAR)
+            data = read_json(path, {})
+            data = data if isinstance(data, dict) else {}
+            old = {key: [o for o in data.get(key) or [] if isinstance(o, str)] for key in ("origins", "storage")}
+            wipe = any(c.everything and not c.visited for c in running)  # nothing new to keep: delete it all
+            write_json(path, {"all": bool(data.get("all")) or wipe,
+                              "origins": list(dict.fromkeys(old["origins"] + [o for c in running if not c.everything
+                                                                              for o in c.pending()])),
+                              "storage": list(dict.fromkeys(old["storage"] + [o for c in running if c.everything
+                                                                              for o in c.pending()]))})
 
     def show_about(self) -> None:
         QMessageBox.about(self, f"About {APP_NAME}",
@@ -11064,6 +11275,7 @@ class BrowserWindow(QMainWindow):
         if self._fullscreen_tab is not None:
             self._leave_html_fullscreen()
         self.save_session()  # the important part: tabs + history are written before anything is torn down
+        self.save_pending_clearing()
         self._closing = True
         self._session_timer.stop()
         self._autosave.stop()
@@ -11138,59 +11350,51 @@ def set_macos_app_name(name: str) -> None:
 # ── Looking like the desktop Chrome Foxglove is built on ─────────────────────────────────────────────────────────────
 # Google sign-in ("This browser or app may not be secure") and bot checks distrust browsers that look embedded or
 # automated. Qt WebEngine is Chrome's engine but by default it announces itself as "Chromium" only (no "Google Chrome"
-# brand), sends no Accept-Language header, lacks the chrome.loadTimes/csi/app every Chrome page has and reports a 0 ms
-# network round trip (as headless Chrome does). Nothing here solves CAPTCHAs or automates anything.
-CHROME_SCRIPT = "foxglove-chrome-shape"
+# brand), sends no Accept-Language header and lacks the chrome.loadTimes/csi/app every Chrome page has. Nothing is
+# disguised beyond that: bot checks look hardest for tampering (a wrapped Function.prototype.toString, a patched getter
+# that workers don't see), so the stand-ins are plain functions. Nothing here solves CAPTCHAs or automates anything.
+CHROME_SCRIPT = "chrome"  # (shows in stack traces as userscript:<name>)
 CHROME_SHAPE_JS = r"""(() => {
   if (!/^(https?|file|about|blob|data):$/.test(location.protocol)) return;  // not extension or Foxglove pages
   const chrome = window.chrome || (window.chrome = {});
   if ("loadTimes" in chrome) return;  // already done (or a real Chrome binding)
-  // Our stand-ins print what Chrome's own functions print - asked from this frame or any same-origin one (one registry,
-  // handed to frames that know this launch's key).
-  const key = "%KEY%";
-  let looks = new WeakMap();
-  try {
-    const shared = window !== parent && Reflect.apply(parent.Function.prototype.toString, key, []);
-    if (shared instanceof parent.WeakMap) looks = shared;
-  } catch (error) {}  // a cross-origin parent
-  const native = (fn, text) => (looks.set(fn, text || `function ${fn.name}() { [native code] }`), fn);
-  Object.defineProperty(Function.prototype, "toString", {value: native(new Proxy(Function.prototype.toString, {
-    apply: (fn, self, args) => self === key ? looks : looks.has(self) ? looks.get(self) : Reflect.apply(fn, self, args)}),
-    "function toString() { [native code] }")});
-  const nav = () => performance.getEntriesByType("navigation")[0] || {};
-  const at = (ms) => ms > 0 ? (performance.timeOrigin + ms) / 1000 : 0;
-  chrome.loadTimes = native(function () {
-    const n = nav(), proto = n.nextHopProtocol || "http/1.1", alpn = location.protocol === "https:";
-    const paint = performance.getEntriesByName("first-paint")[0], start = performance.timeOrigin / 1000;
+  // What they use is taken now: page scripts can't step into them later, and their errors start at the caller.
+  const perf = performance, origin = perf.timeOrigin, entries = perf.getEntriesByType.bind(perf);
+  const named = perf.getEntriesByName.bind(perf), now = perf.now.bind(perf), later = setTimeout;
+  const capture = Error.captureStackTrace, alpn = location.protocol === "https:";
+  const nav = () => entries("navigation")[0] || {};
+  const at = (ms) => ms > 0 ? (origin + ms) / 1000 : 0;
+  chrome.loadTimes = function () {
+    const n = nav(), proto = n.nextHopProtocol || "http/1.1", paint = named("first-paint")[0], start = origin / 1000;
     return {requestTime: start, startLoadTime: start, commitLoadTime: at(n.responseStart),
       finishDocumentLoadTime: at(n.domContentLoadedEventEnd), finishLoadTime: at(n.loadEventEnd),
       firstPaintTime: at(paint && paint.startTime), firstPaintAfterLoadTime: 0,
       navigationType: {reload: "Reload", back_forward: "BackForward"}[n.type] || "Other",
       wasFetchedViaSpdy: /^h[23]/.test(proto), wasNpnNegotiated: alpn, npnNegotiatedProtocol: alpn ? proto : "unknown",
       wasAlternateProtocolAvailable: false, connectionInfo: proto};
-  }, "function() {  native function GetLoadTimes();  return GetLoadTimes();}");
-  chrome.csi = native(function () {
+  };
+  chrome.csi = function () {
     const n = nav();
-    return {startE: Math.round(performance.timeOrigin), onloadT: Math.round(at(n.domContentLoadedEventEnd) * 1000),
-      pageT: performance.now(), tran: 15};
-  }, "function() {  native function GetCSI();  return GetCSI();}");
+    return {startE: Math.round(origin), onloadT: Math.round(at(n.domContentLoadedEventEnd) * 1000), pageT: now(), tran: 15};
+  };
   if (!("app" in chrome)) {
-    const fail = (name) => new TypeError(`Error in invocation of app.${name}()`);
-    const plain = (name, value) => native({[name](...args) { if (args.length) throw fail(name); return value; }}[name]);
+    const fail = (name, fn) => {
+      const error = new TypeError(`Error in invocation of app.${name}()`);
+      if (capture) capture(error, fn);  // like a native function's: no frame of this script
+      return error;
+    };
+    const plain = (name, value) => {
+      const fn = {[name](...args) { if (args.length) throw fail(name, fn); return value; }}[name];
+      return fn;
+    };
+    const installState = {installState(callback) {
+      if (typeof callback !== "function") throw fail("installState", installState);
+      later(callback, 0, "not_installed");
+    }}.installState;
     chrome.app = {isInstalled: false, getDetails: plain("getDetails", null), getIsInstalled: plain("getIsInstalled", false),
-      installState: native({installState(callback) {
-        if (typeof callback !== "function") throw fail("installState");
-        setTimeout(() => callback("not_installed"));
-      }}.installState),
-      runningState: plain("runningState", "cannot_run"),
+      installState, runningState: plain("runningState", "cannot_run"),
       InstallState: {DISABLED: "disabled", INSTALLED: "installed", NOT_INSTALLED: "not_installed"},
       RunningState: {CANNOT_RUN: "cannot_run", READY_TO_RUN: "ready_to_run", RUNNING: "running"}};
-  }
-  const rtt = window.NetworkInformation && Object.getOwnPropertyDescriptor(NetworkInformation.prototype, "rtt");
-  if (rtt && rtt.get && navigator.connection.rtt === 0) {  // Qt never measures the network; Chrome always has an estimate
-    const get = rtt.get;
-    Object.defineProperty(NetworkInformation.prototype, "rtt", {get: native(Object.getOwnPropertyDescriptor(
-      {get rtt() { const value = Reflect.apply(get, this, []); return value === 0 ? 50 : value; }}, "rtt").get)});
   }
 })();"""
 
@@ -11228,7 +11432,9 @@ def apply_browser_identity(profile: QWebEngineProfile) -> str:
     if hints is not None:
         brands = {name: version for name, version in hints.fullVersionList().items() if isinstance(version, str)}
         chromium = brands.setdefault("Chromium", hints.fullVersion() or qWebEngineChromiumVersion())
-        brands.setdefault("Google Chrome", chromium)  # Qt shuffles them (stable per major version)
+        # Qt orders the brands itself: sorted, then shuffled by the major version - not Chrome's order (GREASE, Chromium,
+        # Google Chrome placed by major % 6), which no input can produce. Headers and JS still agree with each other.
+        brands.setdefault("Google Chrome", chromium)
         hints.setFullVersionList(brands)
         os_token = re.search(r"\((Macintosh|Windows|CrOS|Android|X11|Linux)", user_agent)
         platform = {"Macintosh": "macOS", "Windows": "Windows", "CrOS": "Chrome OS", "Android": "Android"}.get(
@@ -11245,7 +11451,7 @@ def apply_browser_identity(profile: QWebEngineProfile) -> str:
     script.setWorldId(QWebEngineScript.ScriptWorldId.MainWorld)
     script.setInjectionPoint(QWebEngineScript.InjectionPoint.DocumentCreation)
     script.setRunsOnSubFrames(True)
-    script.setSourceCode(CHROME_SHAPE_JS.replace("%KEY%", secrets.token_hex(16)))
+    script.setSourceCode(CHROME_SHAPE_JS)
     scripts.insert(script)
     return user_agent
 
@@ -11317,6 +11523,7 @@ def main(argv: list[str] | None = None) -> int:
     # Note: we deliberately keep Qt's default storage folder - changing it after creating the profile
     # breaks Qt WebEngine's extension system.
     profile = QWebEngineProfile(profile_name, app)
+    leftover = finish_clearing(profile_dir, Path(profile.persistentStoragePath()))  # before anything opens the storage
     profile.setPersistentCookiesPolicy(QWebEngineProfile.PersistentCookiesPolicy.ForcePersistentCookies)
     profile.setHttpCacheType(QWebEngineProfile.HttpCacheType.DiskHttpCache)
     profile.setPersistentPermissionsPolicy(QWebEngineProfile.PersistentPermissionsPolicy.StoreOnDisk)
@@ -11344,6 +11551,9 @@ def main(argv: list[str] | None = None) -> int:
     window = BrowserWindow(profile, settings, bookmarks, history, favicons, extensions,
                            profile_dir / "session.json", options.urls, vpn, restart_request)
     window.show()
+    for origins, thorough in zip(leftover, (True, False)):
+        if origins:
+            window.clear_site_data(origins=origins, thorough=thorough)
 
     # Ctrl+C in the terminal (or a stop request from VS Code) closes the window cleanly so nothing is lost.
     def handle_signal(*_args) -> None:

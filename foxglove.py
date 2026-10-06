@@ -63,12 +63,12 @@ try:
     from PyQt6 import sip
     from PyQt6.QtCore import (
         QT_VERSION_STR, QBuffer, QByteArray, QCoreApplication, QDataStream, QDateTime, QEvent, QIODevice, QItemSelectionModel,
-        QLocale, QLockFile, QObject, QPoint, QRect, QRectF, QSize, QStandardPaths, Qt, QTimer, QUrl,
+        QLocale, QLockFile, QObject, QPoint, QPointF, QRect, QRectF, QSize, QStandardPaths, Qt, QTimer, QUrl,
         pyqtSignal,
     )
     from PyQt6.QtGui import (
-        QAction, QColor, QDesktopServices, QFont, QFontDatabase, QGuiApplication, QIcon, QIntValidator, QKeySequence, QPainter,
-        QPalette, QPen, QPixmap, QStandardItem, QStandardItemModel,
+        QAction, QColor, QDesktopServices, QFont, QFontDatabase, QGuiApplication, QIcon, QIntValidator, QKeySequence, QMouseEvent,
+        QPainter, QPalette, QPen, QPixmap, QStandardItem, QStandardItemModel,
     )
     from PyQt6.QtNetwork import (
         QAuthenticator, QNetworkAccessManager, QNetworkCookie, QNetworkProxy, QNetworkProxyFactory, QNetworkReply,
@@ -79,7 +79,7 @@ try:
         QAbstractItemView, QApplication, QButtonGroup, QCheckBox, QComboBox, QCompleter, QDialog, QDialogButtonBox,
         QFileDialog, QFormLayout, QFrame, QGridLayout, QHBoxLayout, QHeaderView, QLabel, QLineEdit, QMainWindow,
         QMenu, QMenuBar, QMessageBox, QProgressBar, QPushButton, QRadioButton, QScrollArea, QSizePolicy, QSplitter,
-        QStackedWidget, QStyle, QStyledItemDelegate, QStyleOption, QTabBar, QToolButton, QTreeWidget,
+        QStackedWidget, QStyle, QStyledItemDelegate, QStyleOption, QStyleOptionTab, QTabBar, QToolButton, QTreeWidget,
         QTreeWidgetItem, QVBoxLayout, QWidget, QWidgetAction,
     )
     from PyQt6.QtWebEngineCore import (
@@ -106,6 +106,7 @@ VERBOSE = False               # --verbose: Chromium's and extensions' messages i
 
 TAB_MIN_WIDTH, TAB_MAX_WIDTH, TAB_HEIGHT = 80, 240, 40
 TAB_CLOSE_AREA = 32           # room for the close button on the right of each tab
+PINNED_TAB_WIDTH = 44         # a pinned tab: just its icon, like Chrome
 MAX_CLOSED_TABS = 25
 ZOOM_LEVELS = (0.3, 0.5, 0.67, 0.8, 0.9, 1.0, 1.1, 1.2, 1.33, 1.5, 1.7, 2.0, 2.4, 3.0, 4.0, 5.0)
 
@@ -221,6 +222,9 @@ ICONS = {
     "shield": '<path d="M12 2.5 4.5 5.5v6c0 4.6 3.2 8.6 7.5 10 4.3-1.4 7.5-5.4 7.5-10v-6z"/>',
     "shield-on": '<path fill="{c}" d="M12 2.5 4.5 5.5v6c0 4.6 3.2 8.6 7.5 10 4.3-1.4 7.5-5.4 7.5-10v-6z"/>'
                  '<path stroke="#1c1b22" stroke-width="2.2" d="m8.5 12 2.5 2.5 4.5-5"/>',
+    "pin": '<path d="M9 3.5h6M10 3.5v5.2L6.5 13v1.5h11V13L14 8.7V3.5"/><path d="M12 14.5v6"/>',
+    "split": '<rect x="2.5" y="4.5" width="19" height="15" rx="2.5"/><path d="M12 4.5v15"/>',
+    "swap": '<path d="M16 3.5 20 7.5l-4 4M20 7.5H8M8 20.5l-4-4 4-4M4 16.5h12"/>',
 }
 
 LOGO_SVG = """<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128">
@@ -411,6 +415,12 @@ QProgressBar { background: rgba(251, 251, 254, 0.12); border: none; border-radiu
 QProgressBar::chunk { background: %(accent)s; border-radius: 2px; }
 QSplitter::handle { background: %(line)s; }
 QSplitter::handle:vertical { height: 1px; }
+#SplitView { background: %(frame)s; }
+#SplitPane { background: %(frame)s; border: 2px solid transparent; border-radius: 6px; }
+#SplitPane[focused="true"] { border-color: %(accent)s; }
+#SplitPane[solo="true"] { border: none; border-radius: 0; }
+QSplitter#SplitViewSplitter::handle { background: transparent; }
+QSplitter#SplitViewSplitter::handle:hover, QSplitter#SplitViewSplitter::handle:pressed { background: %(accent_soft)s; }
 QScrollArea { background: transparent; border: none; }
 QScrollArea > QWidget > QWidget { background: transparent; }
 
@@ -4698,7 +4708,8 @@ class ExtensionBridge(QWebEngineUrlSchemeHandler):
         page, url = tab.page, tab.url().toString()
         active = popup or (win is not None and tab is win.current_tab())
         info = {"id": tab.tab_id, "index": 0 if popup or win is None else win.index_of(tab), "windowId": tab.window_id,
-                "active": active, "highlighted": active, "selected": active, "pinned": False, "incognito": False,
+                "active": active, "highlighted": active, "selected": active, "pinned": bool(getattr(tab, "pinned", False)),
+                "incognito": False,
                 "audible": page.recentlyAudible(), "mutedInfo": {"muted": page.isAudioMuted()},
                 "discarded": tab.pending is not None, "autoDiscardable": True, "frozen": False, "groupId": -1,
                 "status": "unloaded" if tab.pending is not None else "loading" if tab.loading else "complete",
@@ -5176,6 +5187,8 @@ class ExtensionBridge(QWebEngineUrlSchemeHandler):
         opener = next((t for t in win.tabs() if t.tab_id == a.get("openerTabId")), None)
         index = a.get("index") if isinstance(a.get("index"), int) and a.get("index") >= 0 else None
         tab = win.new_tab(url, background=not active, index=index, opener=opener)
+        if a.get("pinned") is True:
+            win.set_pinned(tab, True)
         if active:
             win.close_extension_popups()
         return self.tab_info(ext_id, tab)
@@ -5195,6 +5208,8 @@ class ExtensionBridge(QWebEngineUrlSchemeHandler):
             tab.page.setAudioMuted(a["muted"])
             if win.index_of(tab) >= 0:
                 win._refresh_tab(tab)
+        if isinstance(a.get("pinned"), bool) and win.index_of(tab) >= 0:
+            win.set_pinned(tab, a["pinned"])
         return self.tab_info(ext_id, tab)
 
     def api_tabs_remove(self, ext_id: str, a: dict, ctx: dict):
@@ -5219,8 +5234,7 @@ class ExtensionBridge(QWebEngineUrlSchemeHandler):
         win, tab = self._win(), self._tab(a.get("tabId"))
         if isinstance(tab, PopupWindow):
             raise ApiError("Pop-up windows can't be duplicated.")
-        win.duplicate_tab(tab)
-        return self.tab_info(ext_id, win.tab_at(win.index_of(tab) + 1))
+        return self.tab_info(ext_id, win.duplicate_tab(tab))
 
     def api_tabs_move(self, ext_id: str, a: dict, ctx: dict):
         win = self._win()
@@ -5229,6 +5243,7 @@ class ExtensionBridge(QWebEngineUrlSchemeHandler):
         for offset, tab in enumerate(t for t in tabs if not isinstance(t, PopupWindow)):
             target = win.tab_bar.count() - 1 if index < 0 else clamp(index + offset, 0, win.tab_bar.count() - 1)
             win.tab_bar.moveTab(win.index_of(tab), target)
+        win._normalize_tab_order()  # pinned tabs stay first, split views together
         return [self.tab_info(ext_id, t) for t in tabs]
 
     def api_tabs_highlight(self, ext_id: str, a: dict, ctx: dict):
@@ -6695,6 +6710,9 @@ class Tab(QWidget):
         self.webstore_bar: InfoBar | None = None
         self.crash_bar: InfoBar | None = None
         self.permission_bars: list[InfoBar] = []
+        self.pinned = False                   # pinned tabs sit left of the others, icon only
+        self.split: SplitView | None = None   # shown side by side with another tab (split view)
+        self.uid = uuid.uuid4().hex           # survives restarts (session), unlike tab_id
 
     # State
     @property
@@ -6761,16 +6779,20 @@ class Tab(QWidget):
 
     def session_entry(self) -> dict:
         if self.pending is not None:
-            return dict(self.pending)
-        url = self.url()
-        entry: dict = {"url": url.toString() or NEWTAB, "title": self.title()}
-        data = QByteArray()
-        stream = QDataStream(data, QIODevice.OpenModeFlag.WriteOnly)
-        stream << self.page.history()
-        if not data.isEmpty() and self.page.history().count() > 0:
-            entry["history"] = bytes(data.toBase64()).decode("ascii")
-        if self.page.isAudioMuted():
-            entry["muted"] = True
+            entry = {k: v for k, v in self.pending.items() if k not in ("pinned", "split")}
+        else:
+            url = self.url()
+            entry = {"url": url.toString() or NEWTAB, "title": self.title()}
+            data = QByteArray()
+            stream = QDataStream(data, QIODevice.OpenModeFlag.WriteOnly)
+            stream << self.page.history()
+            if not data.isEmpty() and self.page.history().count() > 0:
+                entry["history"] = bytes(data.toBase64()).decode("ascii")
+            if self.page.isAudioMuted():
+                entry["muted"] = True
+        entry["uid"] = self.uid
+        if self.pinned:
+            entry["pinned"] = True
         return entry
 
     # Notification bars
@@ -6875,6 +6897,8 @@ class TabLabel(QWidget):
         self.icon = QIcon()
         self.loading = False
         self.audio = ""
+        self.pinned = False                       # just the icon, centred (the title is the tooltip)
+        self.close_button: QWidget | None = None  # Qt's close button, put away while the tab is pinned
         self.resize(120, self.HEIGHT)
 
     def set_state(self, title: str, icon_: QIcon, loading: bool, audio: str) -> None:
@@ -6884,15 +6908,21 @@ class TabLabel(QWidget):
             THROBBER.watch(self, loading)
         self.update()
 
+    def icon_rect(self) -> QRect:
+        return QRect((self.width() - 16) // 2 if self.pinned else self.ICON_X, (self.HEIGHT - 16) // 2, 16, 16)
+
     def audio_rect(self) -> QRect:
         if not self.audio:
             return QRect()
+        if self.pinned:  # a small speaker on the icon's corner
+            corner = self.icon_rect()
+            return QRect(corner.right() - 4, corner.top() - 4, 12, 12)
         return QRect(self.width() - 18, (self.HEIGHT - 16) // 2, 16, 16)
 
     def paintEvent(self, _event) -> None:
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-        icon_rect = QRect(self.ICON_X, (self.HEIGHT - 16) // 2, 16, 16)
+        icon_rect = self.icon_rect()
         if self.loading:
             THROBBER.paint(painter, QRectF(icon_rect))
         elif not self.icon.isNull():
@@ -6900,22 +6930,31 @@ class TabLabel(QWidget):
         right = self.width()
         audio = self.audio_rect()
         if not audio.isNull():
+            if self.pinned:
+                painter.setPen(Qt.PenStyle.NoPen)
+                painter.setBrush(QColor(P.FRAME))
+                painter.drawEllipse(QRectF(audio).adjusted(-1, -1, 1, 1))
             icon("speaker-muted" if self.audio == "muted" else "speaker", P.TEXT_2).paint(painter, audio)
             right = audio.left() - 4
         text_rect = QRect(self.TEXT_X, 0, max(0, right - self.TEXT_X), self.HEIGHT)
-        if text_rect.width() >= 28:  # narrow tabs show just the icon, like Firefox
+        if not self.pinned and text_rect.width() >= 28:  # narrow tabs show just the icon, like Firefox
             painter.setPen(QColor(P.TEXT))
             text = self.fontMetrics().elidedText(self.title, Qt.TextElideMode.ElideRight, text_rect.width())
             painter.drawText(text_rect, Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, text)
 
 
 class TabBar(QTabBar):
+    """The tabs. Pinned tabs come first, icon only; the two tabs of a split view share one outline and are
+    dragged together; a drag never mixes pinned and other tabs. (Tab objects say .pinned and .split.)"""
+
     newTabRequested = pyqtSignal()
     audioClicked = pyqtSignal(int)
+    dragFinished = pyqtSignal(object, int)  # the tab that was pressed (maybe dragged), and where it started
 
     def __init__(self, parent: QWidget):
         super().__init__(parent)
         self._available = 900  # set first: Qt asks for tab sizes while the setters below run
+        self._press: dict | None = None
         self.setObjectName("Tabs")
         self.setDocumentMode(True)
         self.setDrawBase(False)
@@ -6939,15 +6978,69 @@ class TabBar(QTabBar):
         self._size_labels()
         return index
 
+    def relayout(self) -> None:
+        self.setElideMode(self.elideMode())  # makes QTabBar lay its tabs out again
+        self.updateGeometry()
+        self.update()
+
     def set_available_width(self, width: int) -> None:
         width = max(TAB_MIN_WIDTH, width)
         if width != self._available:
             self._available = width
-            self.setElideMode(self.elideMode())  # makes QTabBar lay its tabs out again
-            self.updateGeometry()
+            self.relayout()
+
+    # ── pinned tabs and split views ──
+    def pinned_count(self) -> int:
+        """How many pinned tabs there are (they always come first)."""
+        count = 0
+        while count < self.count() and getattr(self.tabData(count), "pinned", False):
+            count += 1
+        return count
+
+    def set_pinned(self, index: int, pinned: bool) -> None:
+        """A pinned tab has no close button (and a centred icon); unpinned, it gets the same button back."""
+        label = self.label(index)
+        if label is None:
+            return
+        side = QTabBar.ButtonPosition.RightSide
+        if pinned and label.close_button is None:
+            label.close_button = self.tabButton(index, side)
+            if label.close_button is not None:
+                self.setTabButton(index, side, None)
+        elif not pinned and label.close_button is not None:
+            button, label.close_button = label.close_button, None
+            if not sip.isdeleted(button):
+                self.setTabButton(index, side, button)
+        label.pinned = pinned
+        self.relayout()
+        self._size_labels()
+        label.update()
+
+    def unit(self, index: int) -> tuple[int, int]:
+        """The tabs that move together with the one at *index*: itself, or both tabs of its split view."""
+        split = getattr(self.tabData(index), "split", None)
+        if split is not None:
+            if index > 0 and getattr(self.tabData(index - 1), "split", None) is split:
+                return index - 1, index
+            if index + 1 < self.count() and getattr(self.tabData(index + 1), "split", None) is split:
+                return index, index + 1
+        return index, index
+
+    def split_pairs(self) -> list[tuple[int, int]]:
+        pairs, i = [], 0
+        while i < self.count() - 1:
+            start, end = self.unit(i)
+            if end > start:
+                pairs.append((start, end))
+            i = end + 1
+        return pairs
 
     def tabSizeHint(self, index: int) -> QSize:
-        width = clamp(self._available // max(1, self.count()), TAB_MIN_WIDTH, TAB_MAX_WIDTH)
+        if getattr(self.tabData(index), "pinned", False):
+            return QSize(PINNED_TAB_WIDTH, TAB_HEIGHT)
+        pinned = self.pinned_count()
+        room = self._available - pinned * PINNED_TAB_WIDTH
+        width = clamp(room // max(1, self.count() - pinned), TAB_MIN_WIDTH, TAB_MAX_WIDTH)
         return QSize(width, TAB_HEIGHT)
 
     def minimumTabSizeHint(self, index: int) -> QSize:
@@ -6960,14 +7053,52 @@ class TabBar(QTabBar):
     def _size_labels(self) -> None:
         for i in range(self.count()):
             label = self.label(i)
-            if label is not None:
-                label.resize(max(0, self.tabRect(i).width() - TAB_CLOSE_AREA), TabLabel.HEIGHT)
+            if label is None:
+                continue
+            rect = self.tabRect(i)
+            if label.pinned:  # the tab's width less the same inset on both sides: a centred icon
+                option = QStyleOptionTab()
+                self.initStyleOption(option, i)
+                inset = self.style().subElementRect(QStyle.SubElement.SE_TabBarTabLeftButton, option, self).left() - rect.left()
+                width = rect.width() - 2 * max(0, inset)
+            else:
+                width = rect.width() - TAB_CLOSE_AREA
+            label.resize(max(0, width), TabLabel.HEIGHT)
 
     def resizeEvent(self, event) -> None:
         super().resizeEvent(event)
         self._size_labels()
 
+    def paintEvent(self, event) -> None:
+        # The two tabs of a split view share one rounded outline (accent-coloured while it's shown), like Chrome.
+        pairs = [(QRectF(self.tabRect(a).united(self.tabRect(b)).adjusted(1, 3, -1, -3)), self.currentIndex() in (a, b))
+                 for a, b in self.split_pairs()]
+        if pairs:
+            painter = QPainter(self)
+            painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+            painter.setPen(Qt.PenStyle.NoPen)
+            for rect, active in pairs:
+                painter.setBrush(QColor(251, 251, 254, 20 if active else 9))
+                painter.drawRoundedRect(rect, 8, 8)
+            painter.end()
+        super().paintEvent(event)
+        if pairs:
+            painter = QPainter(self)
+            painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            for rect, active in pairs:
+                color = QColor(P.ACCENT if active else P.TEXT_3)
+                color.setAlpha(230 if active else 150)
+                painter.setPen(QPen(color, 1.5))
+                painter.drawRoundedRect(rect.adjusted(0.75, 0.75, -0.75, -0.75), 8, 8)
+            painter.end()
+
+    # ── mouse ──
+    def index_of(self, tab) -> int:
+        return next((i for i in range(self.count()) if self.tabData(i) is tab), -1)
+
     def mousePressEvent(self, event) -> None:
+        self._press = None
         if event.button() == Qt.MouseButton.LeftButton:
             pos = event.position().toPoint()
             index = self.tabAt(pos)
@@ -6975,7 +7106,54 @@ class TabBar(QTabBar):
             if label is not None and label.audio and label.audio_rect().contains(label.mapFrom(self, pos)):
                 self.audioClicked.emit(index)
                 return
+            if index >= 0:
+                self._press = {"tab": self.tabData(index), "index": index, "x": pos.x(),
+                               "left": self.tabRect(self.unit(index)[0]).left(), "dragging": False}
         super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event) -> None:
+        press = self._press
+        index = self.index_of(press["tab"]) if press is not None else -1
+        if index < 0 or not event.buttons() & Qt.MouseButton.LeftButton or not self.isMovable():
+            super().mouseMoveEvent(event)
+            return
+        x = event.position().x()
+        start, end = self.unit(index)
+        if end > start:  # a split view: both tabs move, a step at a time (Qt only drags single tabs)
+            if press["dragging"] or abs(x - press["x"]) >= QApplication.startDragDistance():
+                press["dragging"] = True
+                self._drag_unit(press, x)
+            return
+        # the tab stops at the edge of its group: pinned tabs stay in front of the others
+        pinned = self.pinned_count()
+        low, high = (0, pinned - 1) if getattr(press["tab"], "pinned", False) else (pinned, self.count() - 1)
+        if low <= index <= high:
+            left = clamp(press["left"] + x - press["x"], self.tabRect(low).left(),
+                         self.tabRect(high).right() + 1 - self.tabRect(index).width())
+            event = QMouseEvent(event.type(), QPointF(press["x"] + left - press["left"], event.position().y()),
+                                event.globalPosition(), event.button(), event.buttons(), event.modifiers())
+        super().mouseMoveEvent(event)
+
+    def _drag_unit(self, press: dict, x: float) -> None:
+        """Move the dragged split view past a neighbour once its middle is past the neighbour's middle."""
+        low = self.pinned_count()
+        for _ in range(self.count()):
+            start, end = self.unit(self.index_of(press["tab"]))
+            width = self.tabRect(end).right() + 1 - self.tabRect(start).left()
+            centre = press["left"] + x - press["x"] + width / 2
+            if start - 1 >= low:
+                a, b = self.unit(start - 1)
+                if centre < (self.tabRect(a).left() + self.tabRect(b).right()) / 2:
+                    for k in range(end - start + 1):
+                        self.moveTab(start + k, a + k)
+                    continue
+            if end + 1 < self.count():
+                a, b = self.unit(end + 1)
+                if centre > (self.tabRect(a).left() + self.tabRect(b).right()) / 2:
+                    for k in range(end - start + 1):
+                        self.moveTab(end - k, b - k)
+                    continue
+            break
 
     def mouseReleaseEvent(self, event) -> None:
         if event.button() == Qt.MouseButton.MiddleButton:
@@ -6983,7 +7161,12 @@ class TabBar(QTabBar):
             if index >= 0:
                 self.tabCloseRequested.emit(index)
                 return
+        press = self._press if event.button() == Qt.MouseButton.LeftButton else None
+        if press is not None:
+            self._press = None
         super().mouseReleaseEvent(event)
+        if press is not None and self.index_of(press["tab"]) not in (-1, press["index"]):
+            self.dragFinished.emit(press["tab"], press["index"])
 
     def mouseDoubleClickEvent(self, event) -> None:
         if event.button() == Qt.MouseButton.LeftButton and self.tabAt(event.position().toPoint()) < 0:
@@ -7322,14 +7505,15 @@ class StatusBubble(QLabel):
         self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
         self.hide()
 
-    def show_text(self, text: str) -> None:
+    def show_text(self, text: str, area: QRect | None = None) -> None:
+        """*area*: the part of the window the page is in (one side of a split view), else all of it."""
         if not text:
             self.hide()
             return
-        parent = self.parentWidget()
-        self.setText(self.fontMetrics().elidedText(text, Qt.TextElideMode.ElideMiddle, int(parent.width() * 0.55)))
+        area = area or self.parentWidget().rect()
+        self.setText(self.fontMetrics().elidedText(text, Qt.TextElideMode.ElideMiddle, int(area.width() * 0.55)))
         self.adjustSize()
-        self.move(4, parent.height() - self.height() - 4)
+        self.move(area.left() + 4, area.bottom() + 1 - self.height() - 4)
         self.raise_()
         self.show()
 
@@ -7423,6 +7607,98 @@ class ContentArea(QWidget):
             self.bubble.move(4, self.height() - self.bubble.height() - 4)
         if self.toast.isVisible():
             self.toast.move(max(8, self.width() - self.toast.width() - 12), 10)
+
+
+class SplitPane(QFrame):
+    """One side of a split view: a tab, outlined while it is the focused side."""
+
+    def __init__(self, parent: QWidget):
+        super().__init__(parent)
+        self.setObjectName("SplitPane")
+        self.tab: Tab | None = None
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(2, 2, 2, 2)  # room for the outline
+        layout.setSpacing(0)
+
+    def hold(self, tab: "Tab") -> None:
+        self.tab = tab
+        self.layout().addWidget(tab)
+        tab.show()  # (QStackedWidget hid it when it let go of it)
+
+    def set_flag(self, name: str, on: bool) -> None:
+        if bool(self.property(name)) != on:
+            self.setProperty(name, on)
+            self.style().unpolish(self)
+            self.style().polish(self)
+
+
+class SplitView(QWidget):
+    """Chrome's split view: two tabs side by side with a draggable divider, both live. The focused side is the
+    window's current tab (address bar, find, zoom...); clicking into the other side focuses that one."""
+
+    changed = pyqtSignal()  # the divider moved, or the sides swapped
+
+    def __init__(self, left: "Tab", right: "Tab", ratio: float = 0.5):
+        super().__init__()
+        self.setObjectName("SplitView")
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground)
+        self.splitter = QSplitter(Qt.Orientation.Horizontal, self)
+        self.splitter.setObjectName("SplitViewSplitter")
+        self.splitter.setChildrenCollapsible(False)
+        self.splitter.setHandleWidth(6)
+        self.splitter.splitterMoved.connect(self._on_moved)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(2, 2, 2, 2)
+        layout.addWidget(self.splitter)
+        self.panes = [SplitPane(self.splitter), SplitPane(self.splitter)]
+        for pane, tab in zip(self.panes, (left, right)):
+            self.splitter.addWidget(pane)
+            pane.hold(tab)
+            tab.split = self
+        self.solo: Tab | None = None
+        self.ratio = 0.5
+        self.set_ratio(ratio)
+
+    @property
+    def tabs(self) -> list["Tab"]:
+        """Left first."""
+        return [pane.tab for pane in self.panes]
+
+    def other(self, tab: "Tab") -> "Tab":
+        return self.panes[1].tab if self.panes[0].tab is tab else self.panes[0].tab
+
+    def set_ratio(self, ratio) -> None:
+        self.ratio = clamp(float(ratio), 0.1, 0.9) if isinstance(ratio, (int, float)) else 0.5
+        self.splitter.setSizes([round(self.ratio * 10000), round((1 - self.ratio) * 10000)])  # (scaled to fit)
+
+    def _on_moved(self, *_args) -> None:
+        sizes = self.splitter.sizes()
+        if len(sizes) == 2 and all(sizes):
+            self.ratio = sizes[0] / sum(sizes)
+            self.changed.emit()
+
+    def reverse(self) -> None:
+        self.splitter.insertWidget(0, self.panes[1])
+        self.panes.reverse()
+        self.set_ratio(1 - self.ratio)
+        self.changed.emit()
+
+    def set_focused(self, tab: "Tab") -> None:
+        for pane in self.panes:
+            pane.set_flag("focused", pane.tab is tab and self.solo is None)
+
+    def set_solo(self, tab: "Tab | None") -> None:
+        """Show only *tab* (its page went full screen), or both again (None)."""
+        self.solo = tab
+        margin = 0 if tab is not None else 2
+        self.layout().setContentsMargins(margin, margin, margin, margin)
+        for pane in self.panes:
+            pane.layout().setContentsMargins(margin, margin, margin, margin)
+            pane.set_flag("solo", tab is not None)
+            pane.set_flag("focused", False)
+            pane.setVisible(tab is None or pane.tab is tab)
+        if tab is None:
+            self.set_ratio(self.ratio)
 
 
 class FindBar(QFrame):
@@ -9340,6 +9616,8 @@ class BrowserWindow(QMainWindow):
         self._closing = False
         self._force_close = False
         self._fullscreen_tab: Tab | None = None
+        self._active_tab: Tab | None = None   # the tab _activate() last showed (tab moves don't change it)
+        self._keep_focus = False              # activating the side of a split view you clicked into
         self._state_before_fullscreen = Qt.WindowState.WindowNoState
         self._printer: QPrinter | None = None
         self._dialogs: dict[str, QDialog] = {}
@@ -9374,6 +9652,9 @@ class BrowserWindow(QMainWindow):
         self.tab_bar.currentChanged.connect(self._on_current_changed)
         self.tab_bar.tabCloseRequested.connect(lambda index: self.close_tab(self.tab_at(index)))
         self.tab_bar.tabMoved.connect(lambda *_: self.schedule_session_save())
+        self.tab_bar.dragFinished.connect(
+            lambda tab, start: QTimer.singleShot(0, lambda: self._normalize_tab_order(tab, start)))
+        QApplication.instance().focusChanged.connect(self._on_focus_changed)
         self.tab_bar.newTabRequested.connect(self.open_new_tab)
         self.tab_bar.audioClicked.connect(lambda index: self.toggle_mute(self.tab_at(index)))
         self.tab_bar.customContextMenuRequested.connect(self._tab_context_menu)
@@ -9436,6 +9717,13 @@ class BrowserWindow(QMainWindow):
         self.url_bar.zoom_action.triggered.connect(lambda *_: self.zoom_reset())
         layout.addWidget(self.url_bar, 1)
         layout.addSpacing(6)
+        self.split_button = tool_button(icon("split"), "Split view")  # shown while the current tab is in one
+        self.split_button.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        split_menu = Menu("", self.split_button)
+        split_menu.aboutToShow.connect(lambda: self._fill_split_menu(split_menu))
+        self.split_button.setMenu(split_menu)
+        self.split_button.hide()
+        layout.addWidget(self.split_button)
         self.vpn_button = tool_button(icon("shield", P.TEXT_2), "VPN / Proxy")
         self.vpn_button.clicked.connect(lambda *_: self.show_vpn_panel(toggle=True))
         layout.addWidget(self.vpn_button)
@@ -9527,6 +9815,8 @@ class BrowserWindow(QMainWindow):
         self.act_exit_fullscreen = a("Exit Full Screen", self._exit_html_fullscreen, ["Esc"])
         self.act_exit_fullscreen.setEnabled(False)
         self.act_mute = a("Mute Tab", lambda: self.toggle_mute(self.current_tab()), [] if mac else ["Ctrl+M"])
+        self.act_pin_tab = a("Pin Tab", lambda: (tab := self.current_tab()) is not None and self.set_pinned(tab, not tab.pinned))
+        self.act_split_view = a("New Split View", self._toggle_split_view)
         self.act_settings = a("Settings", self.show_settings, ["Ctrl+,"], role=QAction.MenuRole.PreferencesRole)
         self.act_site_settings = a("Site Settings and Cookies…", lambda: self.show_site_settings())
         self.act_about = a(f"About {APP_NAME}", self.show_about, [], role=QAction.MenuRole.AboutRole)
@@ -9616,6 +9906,10 @@ class BrowserWindow(QMainWindow):
         window_menu = self.mac_menubar.addMenu("Window")
         window_menu.addAction(self.act_next_tab)
         window_menu.addAction(self.act_prev_tab)
+        window_menu.addSeparator()
+        window_menu.addAction(self.act_pin_tab)
+        window_menu.addAction(self.act_split_view)
+        window_menu.aboutToShow.connect(self._update_tab_actions)
         help_menu = self.mac_menubar.addMenu("Help")
         help_menu.addAction(self.act_shortcuts)
         help_menu.addAction(self.act_about)
@@ -9637,7 +9931,15 @@ class BrowserWindow(QMainWindow):
         return -1
 
     def current_tab(self) -> Tab | None:
+        """The tab the toolbar is about: in a split view, the focused side."""
         return self.tab_at(self.tab_bar.currentIndex())
+
+    def visible_tabs(self) -> list[Tab]:
+        """What the window shows: the current tab, or both tabs of its split view (left first)."""
+        tab = self.current_tab()
+        if tab is None:
+            return []
+        return list(tab.split.tabs) if tab.split is not None else [tab]
 
     def current_url(self) -> QUrl:
         tab = self.current_tab()
@@ -9646,16 +9948,23 @@ class BrowserWindow(QMainWindow):
     def new_tab(self, url: QUrl | None = None, background: bool = False, index: int | None = None,
                 entry: dict | None = None, opener: Tab | None = None, activate: bool = True) -> Tab:
         tab = Tab(self)
+        if entry is not None:  # (a restored, reopened or duplicated tab)
+            tab.pinned = entry.get("pinned") is True
+            uid = entry.get("uid")
+            if isinstance(uid, str) and uid and all(t.uid != uid for t in self.tabs()):
+                tab.uid = uid
         self._wire_tab(tab)
         self.stack.addWidget(tab)
         if opener is not None:
             tab.opener_ref = weakref.ref(opener)
             tab.return_to_opener = not background
-        position = self.tab_bar.count() if index is None else clamp(index, 0, self.tab_bar.count())
+        position = self._legal_index(self.tab_bar.count() if index is None else index, tab.pinned)
         position = self.tab_bar.add_tab(position)
         self.tab_bar.setTabData(position, tab)
+        if tab.pinned:
+            self.tab_bar.set_pinned(position, True)
         if entry is not None:
-            tab.pending = dict(entry)
+            tab.pending = {k: v for k, v in entry.items() if k not in ("pinned", "split", "uid")}
         elif url is not None:
             tab.load(url)
         self._refresh_tab(tab)
@@ -9666,6 +9975,17 @@ class BrowserWindow(QMainWindow):
             self._on_current_changed(position)
         self.schedule_session_save()
         return tab
+
+    def _legal_index(self, position: int, pinned: bool) -> int:
+        """Where a tab may go: pinned tabs before all others, and never between the two tabs of a split view."""
+        count, pinned_count = self.tab_bar.count(), self.tab_bar.pinned_count()
+        position = clamp(position, 0, count)
+        if pinned:
+            return min(position, pinned_count)
+        position = max(position, pinned_count)
+        if position < count and self.tab_bar.unit(position)[0] < position:
+            position += 1
+        return position
 
     def open_new_tab(self) -> None:
         self.new_tab(self._home_url())
@@ -9692,10 +10012,12 @@ class BrowserWindow(QMainWindow):
             self.new_tab(url, background=(where == "background"), index=index, opener=opener or self.current_tab())
 
     def _insert_position(self, opener: Tab | None) -> int | None:
+        """Tabs opened from a tab go right after it (after its split view; from a pinned tab, after the pinned
+        ones), following the ones it opened before."""
         index = self.index_of(opener)
         if index < 0:
             return None
-        position = index + 1
+        position = self.tab_bar.pinned_count() if opener.pinned else self.tab_bar.unit(index)[1] + 1
         while position < self.tab_bar.count() and getattr(self.tab_at(position), "opener", None) is opener:
             position += 1
         return position
@@ -9723,9 +10045,18 @@ class BrowserWindow(QMainWindow):
         if tab is self._fullscreen_tab:
             self._leave_html_fullscreen()
         entry = tab.session_entry()
+        split = tab.split
+        if split is not None:  # closing one side ends the split view; reopening the tab brings it back
+            partner = split.other(tab)
+            entry["split"] = {"with": partner.uid, "side": split.tabs.index(tab), "ratio": round(split.ratio, 4)}
         if display_url(QUrl(entry.get("url", ""))) or entry.get("history"):
             self.closed_tabs.append(entry)
             del self.closed_tabs[:-MAX_CLOSED_TABS]
+        if split is not None:
+            if index == self.tab_bar.currentIndex():
+                self.tab_bar.setCurrentIndex(self.index_of(partner))  # the other side stays in front
+            self.separate_split(split)
+            index = self.index_of(tab)
         if self.tab_bar.count() == 1:  # keep the window open with a fresh New Tab, like Firefox can
             self.new_tab(self._home_url())
             index = self.index_of(tab)
@@ -9737,6 +10068,10 @@ class BrowserWindow(QMainWindow):
         label = self.tab_bar.label(index)
         if label is not None:
             THROBBER.watch(label, False)
+            if label.close_button is not None and not sip.isdeleted(label.close_button):
+                label.close_button.deleteLater()  # (a pinned tab's, put away)
+        if tab is self._active_tab:
+            self._active_tab = None
         self.tab_bar.removeTab(index)
         self.stack.removeWidget(tab)
         bridge = self.extensions.bridge
@@ -9750,14 +10085,188 @@ class BrowserWindow(QMainWindow):
 
     def reopen_closed_tab(self) -> None:
         if self.closed_tabs:
-            entry = self.closed_tabs.pop()
-            tab = self.new_tab(entry=entry)
-            tab.ensure_loaded()
+            self._reopen_entry(self.closed_tabs[-1])
 
-    def duplicate_tab(self, tab: Tab) -> None:
-        entry = tab.session_entry()
+    def duplicate_tab(self, tab: Tab) -> Tab:
+        entry = {k: v for k, v in tab.session_entry().items() if k != "uid"}
         new = self.new_tab(entry=entry, index=self.index_of(tab) + 1)
         new.ensure_loaded()
+        return new
+
+    # ── pinned tabs and split views ─────────────────────────────────────────────────────
+    def set_pinned(self, tab: Tab | None, pinned: bool) -> None:
+        """Pin or unpin *tab*, like Chrome: pinned tabs go left of the others, show only their icon and are never
+        in a split view (pinning one ends its split view)."""
+        if tab is None or tab.pinned == pinned or self.index_of(tab) < 0:
+            return
+        if tab.split is not None:
+            self.separate_split(tab.split)
+        count = self.tab_bar.pinned_count()
+        tab.pinned = pinned
+        self.tab_bar.moveTab(self.index_of(tab), count if pinned else count - 1)  # last pinned / first unpinned
+        self.tab_bar.set_pinned(self.index_of(tab), pinned)
+        self._refresh_tab(tab)
+        self._tab_updated(tab, {"pinned": pinned})
+        self.schedule_session_save()
+
+    def add_tab_to_split(self, tab: Tab | None) -> SplitView | None:
+        """Chrome's "Add tab to new split view": *tab* beside the current tab - or beside a New Tab when it is the
+        current tab itself (or the current one can't join: it's pinned, or in a split view already)."""
+        if tab is None or tab.split is not None or self.index_of(tab) < 0:
+            return None
+        if tab.pinned:
+            self.toast("Pinned tabs can't be in a split view.", "info")
+            return None
+        active = self.current_tab()
+        if active is not None and active is not tab and not active.pinned and active.split is None:
+            return self.create_split(active, tab, focus=tab, keep=active)
+        new = self.new_tab(self._home_url(), index=self.index_of(tab) + 1, activate=False)
+        return self.create_split(tab, new, focus=new, keep=tab)
+
+    def create_split(self, left: Tab, right: Tab, ratio=0.5, focus: Tab | None = None, keep: Tab | None = None,
+                     activate: bool = True) -> SplitView | None:
+        """Show *left* and *right* side by side. They become neighbours in the strip, where *keep* is (default
+        *left*); *focus* (default *right*) becomes the current tab if *activate*."""
+        if (left is right or self.index_of(left) < 0 or self.index_of(right) < 0 or left.pinned or right.pinned
+                or left.split is not None or right.split is not None):
+            return None
+        keep = keep if keep is right else left
+        moving = left if keep is right else right
+        order = [t for t in self.tabs() if t is not moving]
+        order.insert(order.index(keep) + (1 if moving is right else 0), moving)
+        self._apply_order(order)
+        current = self.current_tab()
+        for tab in (left, right):
+            self.stack.removeWidget(tab)
+        split = SplitView(left, right, ratio)
+        split.changed.connect(self.schedule_session_save)
+        self.stack.addWidget(split)
+        if activate:
+            focus = focus if focus is left else right
+            self.tab_bar.setCurrentIndex(self.index_of(focus))
+            self._activate(focus)
+        elif current is left or current is right:
+            self.stack.setCurrentWidget(split)
+            split.set_focused(current)
+            self._sync_split_button(current)
+        self.tab_bar.update()
+        self.schedule_session_save()
+        return split
+
+    def separate_split(self, split: SplitView | None) -> None:
+        """End a split view: both tabs stay open, each on its own."""
+        if split is None or sip.isdeleted(split):
+            return
+        current = self.current_tab()
+        shown = self.stack.currentWidget() is split
+        focus_inside = (focused := QApplication.focusWidget()) is not None and split.isAncestorOf(focused)
+        for tab in split.tabs:
+            tab.split = None
+            self.stack.addWidget(tab)  # (out of the split view)
+        if shown and current is not None:
+            self.stack.setCurrentWidget(current)
+            if focus_inside:
+                current.view.setFocus()
+        self.stack.removeWidget(split)
+        split.deleteLater()
+        self.tab_bar.update()
+        self._sync_split_button(current)
+        self.schedule_session_save()
+
+    def reverse_split(self, split: SplitView | None) -> None:
+        """Swap the two sides (in the strip too)."""
+        if split is None or sip.isdeleted(split):
+            return
+        left, right = split.tabs
+        split.reverse()
+        self.tab_bar.moveTab(self.index_of(right), self.index_of(left))
+        self.tab_bar.update()
+        self.schedule_session_save()
+
+    def _toggle_split_view(self) -> None:
+        tab = self.current_tab()
+        if tab is not None and tab.split is not None:
+            self.separate_split(tab.split)
+        else:
+            self.add_tab_to_split(tab)
+
+    def focus_tab(self, tab: Tab, keep_focus: bool = False) -> None:
+        """Make *tab* the current tab (in a split view: the focused side). *keep_focus*: the keyboard focus is
+        already where it should be (in that page)."""
+        index = self.index_of(tab)
+        if index < 0:
+            return
+        self._keep_focus = keep_focus
+        try:
+            self.tab_bar.setCurrentIndex(index)
+        finally:
+            self._keep_focus = False
+
+    def _on_focus_changed(self, _old, new) -> None:
+        """Clicking (or tabbing) into the other side of a split view makes it the current tab."""
+        if new is None or self._closing or sip.isdeleted(self):
+            return
+        current = self.current_tab()
+        if current is None or current.split is None:
+            return
+        other = current.split.other(current)
+        if other is not None and (other is new or other.isAncestorOf(new)):
+            self.focus_tab(other, keep_focus=True)
+
+    def _apply_order(self, order: list[Tab]) -> None:
+        if order == self.tabs():
+            return
+        for target, tab in enumerate(order):
+            index = self.index_of(tab)
+            if index != target:
+                self.tab_bar.moveTab(index, target)
+
+    def _normalize_tab_order(self, anchor: Tab | None = None, start: int = -1) -> None:
+        """Pinned tabs first, the two tabs of a split view side by side - where *anchor* (just dragged from index
+        *start*) put them. A tab dropped between them goes past them, in the direction it was dragged."""
+        if self._closing or sip.isdeleted(self):
+            return
+        tabs = self.tabs()
+        rest = [t for t in tabs if not t.pinned]
+        order, placed = [t for t in tabs if t.pinned], set()
+        leftward = anchor is not None and anchor.split is None and 0 <= self.index_of(anchor) < start
+        for i, tab in enumerate(rest):
+            if tab in placed:
+                continue
+            if tab.split is None:
+                order.append(tab)
+                placed.add(tab)
+                continue
+            partner = tab.split.other(tab)
+            if anchor is partner:  # the pair goes where the dragged half is
+                continue
+            if leftward and rest[i + 1:i + 3] == [anchor, partner]:
+                order.append(anchor)
+                placed.add(anchor)
+            order += tab.split.tabs
+            placed.update(tab.split.tabs)
+        self._apply_order(order)
+
+    def _sync_split_button(self, tab: Tab | None) -> None:
+        self.split_button.setVisible(tab is not None and tab.split is not None)
+
+    def _fill_split_menu(self, menu: QMenu) -> None:
+        reset_menu(menu)
+        tab = self.current_tab()
+        split = tab.split if tab is not None else None
+        if split is None:
+            return
+        menu.addAction(icon("swap"), "Reverse Views").triggered.connect(lambda *_: self.reverse_split(split))
+        menu.addAction(icon("split"), "Separate Views").triggered.connect(lambda *_: self.separate_split(split))
+        menu.addSeparator()
+        for side, shown in zip(("Left", "Right"), split.tabs):
+            menu.addAction(f"Close {side} View").triggered.connect(lambda *_, t=shown: self.close_tab(t))
+
+    def _update_tab_actions(self) -> None:
+        tab = self.current_tab()
+        self.act_pin_tab.setText("Unpin Tab" if tab is not None and tab.pinned else "Pin Tab")
+        self.act_split_view.setText("Separate Views" if tab is not None and tab.split is not None else "New Split View")
+        self.act_split_view.setEnabled(tab is not None and not tab.pinned)
 
     def cycle_tab(self, step: int) -> None:
         count = self.tab_bar.count()
@@ -9804,7 +10313,7 @@ class BrowserWindow(QMainWindow):
 
     def _on_current_changed(self, index: int) -> None:
         tab = self.tab_at(index)
-        if tab is not None:
+        if tab is not None and tab is not self._active_tab:  # (not when the current tab just moved in the strip)
             self._activate(tab)
             self._refresh_extension_buttons()
             self.extensions.bridge.tab_event("tabs.onActivated", tab, lambda _ext: [{"tabId": tab.tab_id, "windowId": MAIN_WINDOW_ID}])
@@ -9812,22 +10321,36 @@ class BrowserWindow(QMainWindow):
     def _activate(self, tab: Tab) -> None:
         if self._closing:
             return
+        previous, self._active_tab = self._active_tab, tab
         if self._fullscreen_tab is not None and self._fullscreen_tab is not tab:
             self._exit_html_fullscreen()
         for other in self.tabs():
             if other is not tab and other.return_to_opener and other.opener is not tab:
                 other.return_to_opener = False
-        if self.stack.currentWidget() is not tab:
+        shown = tab.split if tab.split is not None else tab
+        if self.stack.currentWidget() is not shown:
             if self.find_bar.isVisible():
+                if previous is not None and not sip.isdeleted(previous) and previous.pending is None:
+                    previous.page.findText("")  # (no highlights left behind)
                 self.find_bar.close_bar()
-            self.stack.setCurrentWidget(tab)
-        tab.ensure_loaded()
+            self.stack.setCurrentWidget(shown)
+        elif previous is not None and previous is not tab and not sip.isdeleted(previous) and self.find_bar.isVisible():
+            if previous.pending is None:  # the other side of the split view: finding moves over with the focus
+                previous.page.findText("")
+            self.find_bar.find()
+        if tab.split is not None:
+            tab.split.set_focused(tab)
+        for visible in self.visible_tabs():
+            visible.ensure_loaded()
         self.content.bubble.hide()
         self._sync_chrome(tab)
-        if not self.url_bar.text() and not self.url_bar.hasFocus():
+        if self._keep_focus:  # you clicked into this side of the split view: the focus is where you put it
+            pass
+        elif not self.url_bar.text() and not self.url_bar.hasFocus():
             self.url_bar.setFocus()
         elif not self.url_bar.hasFocus() or not self.url_bar.isModified():
             tab.view.setFocus()
+        self.tab_bar.update()  # (a split view's outline follows the current tab)
         self.schedule_session_save()
 
     def _sync_chrome(self, tab: Tab) -> None:
@@ -9839,6 +10362,7 @@ class BrowserWindow(QMainWindow):
         self._update_star()
         self._update_identity(tab)
         self._update_zoom_indicator()
+        self._sync_split_button(tab)
         self.content.loading_bar.set_progress(tab.progress, tab.loading)
         title = tab.title()
         self.setWindowTitle(APP_NAME if is_newtab(tab.url()) else f"{title} — {APP_NAME}")
@@ -10009,8 +10533,9 @@ class BrowserWindow(QMainWindow):
             tab.page.load(insecure)  # the site doesn't speak HTTPS: fall back like Firefox's HTTPS-First mode
 
     def _on_link_hovered(self, tab: Tab, url: str) -> None:
-        if tab is self.current_tab():
-            self.content.bubble.show_text(QUrl(url).toDisplayString() if url else "")
+        if tab in self.visible_tabs():
+            area = QRect(tab.mapTo(self.content, QPoint(0, 0)), tab.size()) if tab.split is not None else None
+            self.content.bubble.show_text(QUrl(url).toDisplayString() if url else "", area)
 
     def _on_crashed(self, tab: Tab, status) -> None:
         if status == QWebEnginePage.RenderProcessTerminationStatus.NormalTerminationStatus or self._closing:
@@ -10157,6 +10682,8 @@ class BrowserWindow(QMainWindow):
             self._fullscreen_tab = tab
             for widget in (self.tab_strip, self.nav_bar, self.bookmarks_bar, self.separator, self.find_bar):
                 widget.hide()
+            if tab.split is not None:
+                tab.split.set_solo(tab)  # only this side of the split view goes full screen
             self.act_exit_fullscreen.setEnabled(True)
             self.showFullScreen()
             self.toast("Press Esc to exit full screen.", "info")
@@ -10173,7 +10700,10 @@ class BrowserWindow(QMainWindow):
     def _leave_html_fullscreen(self) -> None:
         if self._fullscreen_tab is None:
             return
-        self._fullscreen_tab = None
+        tab, self._fullscreen_tab = self._fullscreen_tab, None
+        if not sip.isdeleted(tab) and tab.split is not None:
+            tab.split.set_solo(None)
+            tab.split.set_focused(tab)
         self.act_exit_fullscreen.setEnabled(False)
         self.content.toast.hide()  # the "Press Esc to exit full screen" hint
         for widget in (self.tab_strip, self.nav_bar, self.separator):
@@ -10891,32 +11421,47 @@ class BrowserWindow(QMainWindow):
         menu.popup(global_pos)
 
     def _tab_context_menu(self, pos: QPoint) -> None:
-        index = self.tab_bar.tabAt(pos)
-        tab = self.tab_at(index)
+        menu = self.tab_menu(self.tab_at(self.tab_bar.tabAt(pos)))
+        menu.exec(self.tab_bar.mapToGlobal(pos))
+        menu.deleteLater()
+        self.act_reopen.setEnabled(True)
+
+    def tab_menu(self, tab: Tab | None) -> QMenu:
+        """The tab strip's context menu, for *tab* (None: the empty part of the strip)."""
         menu = Menu("", self)
         menu.addAction(self.act_new_tab)
         if tab is not None:
+            index = self.index_of(tab)
             menu.addSeparator()
             menu.addAction("Reload Tab", lambda: (tab.ensure_loaded(), tab.page.triggerAction(QWebEnginePage.WebAction.Reload)))
             muted = tab.audio_state() == "muted"
             menu.addAction("Unmute Tab" if muted else "Mute Tab", lambda: self.toggle_mute(tab))
             menu.addAction("Duplicate Tab", lambda: self.duplicate_tab(tab))
+            menu.addAction(icon("pin", P.TEXT_2), "Unpin Tab" if tab.pinned else "Pin Tab").triggered.connect(
+                lambda *_: self.set_pinned(tab, not tab.pinned))
+            if tab.split is None:
+                split = menu.addAction(icon("split", P.TEXT_2), "Add Tab to New Split View")
+                split.triggered.connect(lambda *_: self.add_tab_to_split(tab))
+                split.setEnabled(not tab.pinned)  # (Chrome doesn't split pinned tabs either)
+            else:
+                menu.addAction(icon("swap", P.TEXT_2), "Reverse Views").triggered.connect(lambda *_: self.reverse_split(tab.split))
+                menu.addAction("Separate Views").triggered.connect(lambda *_: self.separate_split(tab.split))
             if display_url(tab.url()):
                 menu.addAction("Bookmark Tab…", lambda: self.add_bookmark_dialog(tab.url().toString(), tab.title()))
             menu.addSeparator()
             menu.addAction("Close Tab", lambda: self.close_tab(tab))
-            others = [t for t in self.tabs() if t is not tab]
+            # like Chrome, these leave pinned tabs (and the other side of this tab's split view) open
+            keep = {tab, *(tab.split.tabs if tab.split is not None else ())}
+            others = [t for t in self.tabs() if t not in keep and not t.pinned]
             close_others = menu.addAction("Close Other Tabs", lambda: [self.close_tab(t) for t in others])
             close_others.setEnabled(bool(others))
-            right = [self.tab_at(i) for i in range(index + 1, self.tab_bar.count())]
-            close_right = menu.addAction("Close Tabs to the Right", lambda: [self.close_tab(t) for t in right if t is not None])
+            right = [t for t in self.tabs()[index + 1:] if t not in keep and not t.pinned]
+            close_right = menu.addAction("Close Tabs to the Right", lambda: [self.close_tab(t) for t in right])
             close_right.setEnabled(bool(right))
         menu.addSeparator()
         menu.addAction(self.act_reopen)
         self.act_reopen.setEnabled(bool(self.closed_tabs))
-        menu.exec(self.tab_bar.mapToGlobal(pos))
-        menu.deleteLater()
-        self.act_reopen.setEnabled(True)
+        return menu
 
     def _fill_tab_list(self) -> None:
         menu = self.tab_strip.list_button.menu()
@@ -10950,9 +11495,16 @@ class BrowserWindow(QMainWindow):
             action.triggered.connect(lambda *_, u=url: self.open_url(QUrl(u), "current"))
 
     def _reopen_entry(self, entry: dict) -> None:
+        """A closed tab back: pinned if it was, and in its split view again if the other side is still open."""
         if entry in self.closed_tabs:
             self.closed_tabs.remove(entry)
-        self.new_tab(entry=entry).ensure_loaded()
+        tab = self.new_tab(entry=entry)
+        tab.ensure_loaded()
+        info = entry.get("split")
+        partner = next((t for t in self.tabs() if t.uid == info.get("with")), None) if isinstance(info, dict) else None
+        if partner is not None and partner is not tab:
+            left, right = (tab, partner) if info.get("side") == 0 else (partner, tab)
+            self.create_split(left, right, info.get("ratio", 0.5), focus=tab, keep=partner)
 
     # ── windows & dialogs ───────────────────────────────────────────────────────────────
     def _single_dialog(self, key: str, factory) -> None:
@@ -11242,6 +11794,7 @@ class BrowserWindow(QMainWindow):
             "saved": time.time(),
             "current": self.tab_bar.currentIndex(),
             "tabs": [tab.session_entry() for tab in self.tabs()],
+            "splits": [[a, b, round(self.tab_at(a).split.ratio, 4)] for a, b in self.tab_bar.split_pairs()],
             "closed_tabs": self.closed_tabs[-MAX_CLOSED_TABS:],
             "geometry": bytes(self.saveGeometry().toBase64()).decode("ascii"),
         }
@@ -11267,15 +11820,24 @@ class BrowserWindow(QMainWindow):
             self.move(screen.center() - self.rect().center())
         closed = data.get("closed_tabs")
         self.closed_tabs = [e for e in closed if isinstance(e, dict)] if isinstance(closed, list) else []
-        entries = data.get("tabs") if self.settings.get("restore_session") else None
-        entries = [e for e in entries if isinstance(e, dict)] if isinstance(entries, list) else []
-        if entries:
+        entries = data.get("tabs") if isinstance(data.get("tabs"), list) else []
+        everything = self.settings.get("restore_session")
+        if not everything:  # pinned tabs come back anyway, as in Chrome
+            entries = [e if isinstance(e, dict) and e.get("pinned") is True else None for e in entries]
+        if any(isinstance(e, dict) for e in entries):
             current = clamp(int(data.get("current", 0)) if str(data.get("current", 0)).lstrip("-").isdigit() else 0,
                             0, len(entries) - 1)
-            for entry in entries:  # restored tabs stay unloaded until you open them, like Firefox
-                self.new_tab(entry=entry, background=True, activate=False)
-            self.tab_bar.setCurrentIndex(current)
-            self._on_current_changed(current)
+            # restored tabs stay unloaded until you open them, like Firefox
+            tabs = {i: self.new_tab(entry=e, background=True, activate=False) for i, e in enumerate(entries) if isinstance(e, dict)}
+            splits = data.get("splits") if everything else None
+            for item in splits if isinstance(splits, list) else []:
+                pair = item[:2] if isinstance(item, list) else []
+                if len(pair) == 2 and all(type(i) is int and i in tabs for i in pair):
+                    self.create_split(tabs[pair[0]], tabs[pair[1]], item[2] if len(item) > 2 else 0.5, activate=False)
+            shown = tabs[current] if current in tabs else next(iter(tabs.values()))
+            self.focus_tab(shown)
+            self._on_current_changed(self.index_of(shown))
+        opened = False
         for text in startup_urls:
             if not re.match(r"^[a-zA-Z][a-zA-Z0-9+.\-]*://", text) and os.path.exists(text):
                 url = QUrl.fromLocalFile(os.path.abspath(text))  # e.g. "python3 foxglove.py page.html"
@@ -11283,7 +11845,8 @@ class BrowserWindow(QMainWindow):
                 url = url_from_input(text, self.settings.search_template())
             if url.isValid() and not url.isEmpty():
                 self.new_tab(url)
-        if not self.tab_bar.count():
+                opened = True
+        if not self.tab_bar.count() or not (everything or opened):  # (only pinned tabs back: and a New Tab)
             self.new_tab(self._home_url())
 
     # ── quitting ────────────────────────────────────────────────────────────────────────

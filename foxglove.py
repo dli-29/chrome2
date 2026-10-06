@@ -331,7 +331,6 @@ QToolButton:pressed, QToolButton:checked { background: rgba(251, 251, 254, 0.18)
 QToolButton:disabled { background: transparent; }
 QToolButton::menu-indicator { image: none; width: 0; }
 QToolButton#BookmarkItem { padding: 0 6px; color: %(text)s; }
-QLabel#BookmarksHint { color: %(text_3)s; padding-left: 6px; }
 
 /* Address bar */
 QLineEdit#UrlBar { background: %(field)s; color: %(text)s; border: 2px solid transparent; border-radius: 6px;
@@ -9197,9 +9196,6 @@ class BookmarksBar(QWidget):
         self.layout_.setContentsMargins(6, 2, 6, 4)
         self.layout_.setSpacing(2)
         self.buttons: list[BookmarkButton] = []
-        self.hint = QLabel("For quick access, place your bookmarks here: click ☆ in the address bar "
-                           f"or press {shortcut_text('Ctrl+D')}.")
-        self.hint.setObjectName("BookmarksHint")
         self.overflow = tool_button(icon("chevrons-right"), "More bookmarks", 26)
         self.overflow.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
         self.overflow_menu = Menu("", self.overflow)
@@ -9219,15 +9215,13 @@ class BookmarksBar(QWidget):
         while self.layout_.count():
             item = self.layout_.takeAt(0)
             widget = item.widget()
-            if widget is not None and widget not in (self.hint, self.overflow):
+            if widget is not None and widget is not self.overflow:
                 widget.deleteLater()
         self.buttons = [BookmarkButton(self.win, node) for node in self.win.bookmarks.children("toolbar")]
         for button in self.buttons:
             self.layout_.addWidget(button)
-        self.layout_.addWidget(self.hint)
         self.layout_.addStretch(1)
         self.layout_.addWidget(self.overflow)
-        self.hint.setVisible(not self.buttons)
         self._fit()
 
     def resizeEvent(self, event) -> None:
@@ -9348,7 +9342,8 @@ class BrowserWindow(QMainWindow):
             column.addWidget(widget)
         column.addWidget(self.content, 1)
         column.addWidget(self.find_bar)
-        self.bookmarks_bar.setVisible(settings.get("show_bookmarks_bar"))
+        self._sync_bookmarks_bar()
+        bookmarks.changed.connect(self._sync_bookmarks_bar)
 
         self.tab_bar.currentChanged.connect(self._on_current_changed)
         self.tab_bar.tabCloseRequested.connect(lambda index: self.close_tab(self.tab_at(index)))
@@ -9488,7 +9483,7 @@ class BrowserWindow(QMainWindow):
         self.act_zoom_out = a("Zoom Out", self.zoom_out, ["Ctrl+-"])
         self.act_zoom_reset = a("Actual Size", self.zoom_reset, ["Ctrl+0"])
         self.act_bookmark = a("Bookmark Current Tab…", self.bookmark_current_page, ["Ctrl+D"])
-        self.act_bookmarks_bar = a("Bookmarks Toolbar", lambda: self.set_bookmarks_bar_visible(not self.bookmarks_bar.isVisible()),
+        self.act_bookmarks_bar = a("Bookmarks Toolbar", lambda: self.set_bookmarks_bar_visible(not self.settings.get("show_bookmarks_bar")),
                                    ["Ctrl+Shift+B"], checkable=True)
         self.act_bookmarks_bar.setChecked(self.settings.get("show_bookmarks_bar"))
         self.act_manage_bookmarks = a("Manage Bookmarks", self.show_bookmarks_manager, ["Ctrl+Shift+O"])
@@ -10157,7 +10152,7 @@ class BrowserWindow(QMainWindow):
         self.content.toast.hide()  # the "Press Esc to exit full screen" hint
         for widget in (self.tab_strip, self.nav_bar, self.separator):
             widget.show()
-        self.bookmarks_bar.setVisible(self.settings.get("show_bookmarks_bar"))
+        self._sync_bookmarks_bar()
         self.setWindowState(self._state_before_fullscreen)
 
     def toggle_fullscreen(self) -> None:
@@ -10376,9 +10371,13 @@ class BrowserWindow(QMainWindow):
 
     def set_bookmarks_bar_visible(self, visible: bool) -> None:
         self.settings.set("show_bookmarks_bar", bool(visible))
-        if self._fullscreen_tab is None:
-            self.bookmarks_bar.setVisible(bool(visible))
+        self._sync_bookmarks_bar()
         self.act_bookmarks_bar.setChecked(bool(visible))
+
+    def _sync_bookmarks_bar(self) -> None:
+        """Shown when the user wants it and there is something on it (an empty bar is hidden)."""
+        if self._fullscreen_tab is None:
+            self.bookmarks_bar.setVisible(bool(self.settings.get("show_bookmarks_bar") and self.bookmarks.children("toolbar")))
 
     def add_bookmark_node_to_menu(self, menu: QMenu, node: dict) -> None:
         if node["type"] == "folder":

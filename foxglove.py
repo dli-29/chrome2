@@ -838,9 +838,11 @@ def run_dialog(dialog: QDialog) -> bool:
     """Show a modal dialog and free it afterwards (dialogs parented to the window would otherwise pile up)."""
     try:
         QTimer.singleShot(0, DialogShields.shield_all)  # (once it's shown: a privacy screen of its own)
-        return dialog.exec() == QDialog.DialogCode.Accepted
+        accepted = dialog.exec() == QDialog.DialogCode.Accepted
+        return accepted and not sip.isdeleted(dialog)  # (its window closed under it - quitting: as if cancelled)
     finally:
-        dialog.deleteLater()
+        if not sip.isdeleted(dialog):
+            dialog.deleteLater()
 
 
 def menu_text(text: str) -> str:
@@ -7356,6 +7358,33 @@ class WebPage(QWebEnginePage):
         if VERBOSE:
             log(f"console {source}:{line}: {message}")
 
+    # The page's alert(), confirm() and prompt(): Qt's own dialogs - noted while open, for Claude (AgentBrowser).
+    # While Claude works on the page, an alert() isn't shown at all: it's noted for Claude's tool result instead (it only
+    # says something; a confirm() or prompt() asks the user for a decision, so those are still the user's to answer).
+    js_dialog: tuple[str, str] | None = None
+    agent_alerts: list[str] | None = None  # (a list while Claude works on the page: AgentBrowser.watch_alerts())
+
+    def _js_dialog(self, kind: str, message: str, show):
+        self.js_dialog = (kind, message or "")
+        QTimer.singleShot(0, DialogShields.shield_all)  # (once it's shown: a privacy screen of its own)
+        try:
+            return show()
+        finally:
+            if not sip.isdeleted(self):
+                self.js_dialog = None
+
+    def javaScriptAlert(self, origin: QUrl, message: str) -> None:
+        if self.agent_alerts is not None:
+            self.agent_alerts[:] = (self.agent_alerts + [message or ""])[-5:]
+            return
+        self._js_dialog("alert", message, lambda: super(WebPage, self).javaScriptAlert(origin, message))
+
+    def javaScriptConfirm(self, origin: QUrl, message: str) -> bool:
+        return self._js_dialog("confirm", message, lambda: super(WebPage, self).javaScriptConfirm(origin, message))
+
+    def javaScriptPrompt(self, origin: QUrl, message: str, default: str):
+        return self._js_dialog("prompt", message, lambda: super(WebPage, self).javaScriptPrompt(origin, message, default))
+
     def _dialog_parent(self) -> QWidget | None:
         view = QWebEngineView.forPage(self)
         return view.window() if view is not None else QApplication.activeWindow()
@@ -7548,7 +7577,7 @@ class Tab(QWidget):
             stream = QDataStream(data, QIODevice.OpenModeFlag.WriteOnly)
             stream << self.page.history()
             # (the back/forward list carries Chromium's form state: never once autofill put a password or card in)
-            if not data.isEmpty() and self.page.history().count() > 0 and not Autofill.filled_secrets([self.page]):
+            if not data.isEmpty() and self.page.history().count() > 0 and Autofill.keeps_history(self.page, bytes(data)):
                 entry["history"] = bytes(data.toBase64()).decode("ascii")
             if self.page.isAudioMuted():
                 entry["muted"] = True
@@ -9018,6 +9047,17 @@ class PrivacyScreen(QWidget):
     FADE_MS = 120
     DELAY_MS = 40  # an app that is inactive for less (a full-screen switch, a system prompt flashing by) isn't covered
     COLOR = "#5f6368"
+    app_state = None  # the application's state as last announced (None: not yet - just started)
+
+    @classmethod
+    def follow_app_state(cls) -> None:
+        if not getattr(cls, "_following", False):
+            cls._following = True
+            QGuiApplication.instance().applicationStateChanged.connect(lambda state: setattr(cls, "app_state", state))
+
+    @classmethod
+    def app_inactive(cls) -> bool:
+        return cls.app_state is not None and cls.app_state != Qt.ApplicationState.ApplicationActive
 
     def __init__(self, window: QWidget, settings: Settings):
         from PyQt6.QtCore import QVariantAnimation
@@ -9038,8 +9078,13 @@ class PrivacyScreen(QWidget):
         self._delay.setInterval(self.DELAY_MS)
         self._delay.timeout.connect(self.cover)
         window.installEventFilter(self)
+        self.follow_app_state()
         QGuiApplication.instance().applicationStateChanged.connect(self._on_state)
         settings.changed.connect(self._on_setting)
+        if self.app_inactive() and settings.get("privacy_screen"):  # (a window that opens while the app is in the background)
+            self.cover()
+            self._fade.stop()
+            self._set_opacity(1.0)
 
     def _on_state(self, state) -> None:
         if state == Qt.ApplicationState.ApplicationActive:
@@ -9100,13 +9145,37 @@ class PrivacyScreen(QWidget):
 class DialogShields(QObject):
     """Gives every dialog window the app shows (Passwords, History, Settings, cookies, the edit dialogs...) a
     PrivacyScreen of its own: they'd show in the app switcher and screen sharing as much as the browser window.
-    (A shown dialog takes the focus: that's when it's checked.)"""
+    (A shown dialog takes the focus: that's when it's checked. One shown while the app is in the background takes
+    none: while it is, every window is checked as it's shown.)"""
     _installed: "DialogShields | None" = None
 
     def __init__(self, settings: Settings):
         super().__init__(QApplication.instance())
         self.settings = settings
+        self._screens: dict[int, PrivacyScreen] = {}
+        self._filtering = False
+        PrivacyScreen.follow_app_state()
         QGuiApplication.instance().focusWindowChanged.connect(lambda *_: self.shield())
+        QGuiApplication.instance().applicationStateChanged.connect(lambda *_: self._follow())
+        self._follow()
+
+    def _follow(self) -> None:
+        """Watch every window being shown while the app is in the background (only then: it's every event of the app)."""
+        background = PrivacyScreen.app_inactive()
+        if background != self._filtering:
+            self._filtering = background
+            if background:
+                QApplication.instance().installEventFilter(self)
+            else:
+                QApplication.instance().removeEventFilter(self)
+
+    def eventFilter(self, obj, event) -> bool:
+        if event.type() == QEvent.Type.Show and isinstance(obj, QDialog) and obj.isWindow():
+            try:
+                self.shield_one(obj)
+            except RuntimeError:  # (going away)
+                pass
+        return False
 
     @classmethod
     def install(cls, settings: Settings) -> None:
@@ -9120,16 +9189,22 @@ class DialogShields(QObject):
 
     def shield(self) -> None:
         for widget in QApplication.topLevelWidgets():
-            if not isinstance(widget, QDialog) or not widget.isVisible() or \
-                    widget.findChild(PrivacyScreen, options=Qt.FindChildOption.FindDirectChildrenOnly) is not None:
-                continue
-            settings, owner = self.settings, widget.parentWidget()
-            while owner is not None:  # (the settings of the window it belongs to: its profile's)
-                if isinstance(getattr(owner, "settings", None), Settings):
-                    settings = owner.settings
-                    break
-                owner = owner.parentWidget()
-            PrivacyScreen(widget, settings)
+            if isinstance(widget, QDialog) and widget.isVisible():
+                self.shield_one(widget)
+
+    def shield_one(self, widget: QDialog) -> None:
+        if sip.isdeleted(widget) or widget.findChild(PrivacyScreen, options=Qt.FindChildOption.FindDirectChildrenOnly) is not None:
+            return
+        settings, owner = self.settings, widget.parentWidget()
+        while owner is not None:  # (the settings of the window it belongs to: its profile's)
+            if isinstance(getattr(owner, "settings", None), Settings):
+                settings = owner.settings
+                break
+            owner = owner.parentWidget()
+        screen = PrivacyScreen(widget, settings)
+        # (a dialog Qt made itself - a page's alert() - has no Python object to hold the screen's: hold it here)
+        self._screens[id(screen)] = screen
+        screen.destroyed.connect(lambda _obj=None, key=id(screen): self._screens.pop(key, None))
 
 
 class PopupWindow(QWidget):
@@ -11084,6 +11159,22 @@ AUTOFILL_JS = r"""(() => {
     if (type === "country") return el instanceof HTMLSelectElement ? a.countries : a.country;
     return a[type];
   };
+  // a field filled along with the one picked must be one the user can see: not hidden, see-through or off the page
+  // (a form can't collect an address or a card number in fields the user doesn't know are there)
+  const seeable = (f) => {
+    if (!shown(f)) return false;
+    const r = f.getBoundingClientRect();
+    if (r.right + scrollX <= 0 || r.bottom + scrollY <= 0) return false;  // (off the page's top or left edge)
+    let o = 1;
+    for (let e = f; e && e.nodeType === 1 && o >= 0.1; e = e.parentElement || (e.parentNode && e.parentNode.host) || null)
+      o *= parseFloat(getComputedStyle(e).opacity || "1");
+    if (o < 0.1) return false;
+    for (let e = f.parentElement; e; e = e.parentElement) {  // (clipped away to nothing by a tiny ancestor)
+      const s = getComputedStyle(e);
+      if (s.overflow !== "visible" && s.display !== "contents") { const b = e.getBoundingClientRect(); if (b.width < 2 || b.height < 2) return false; }
+    }
+    return true;
+  };
   const fill = (id, data, origin) => {
     const el = byId(id);
     if (location.origin !== origin || !el) return 0;
@@ -11102,6 +11193,7 @@ AUTOFILL_JS = r"""(() => {
           const t = form.types.get(f);
           if (!t || t.type.startsWith("cc-") !== card || t.type === "cc-csc" || (f !== el && f.value && !(f instanceof HTMLSelectElement))) continue;
           if (!card && isOff(f) && f !== el) continue;  // autocomplete="off" address fields are left alone
+          if (f !== el && !seeable(f)) continue;  // hidden fields are left alone
           if (put(f, card ? cardValue(t.type, data.values, f) : addressValue(t.type, data.values, f))) n++;
         }
       }
@@ -11166,6 +11258,7 @@ class AutofillPageState:
         self.offered = 0.0
         self.closing = None                     # the page closed itself (its window, for offers still to come)
         self.filled: list[str] = []             # passwords and card numbers filled in (Claude's view of the page hides them)
+        self.cards: list[str] = []              # ... the card numbers among them (they'd be in the page's form state)
 
 
 class Autofill(QObject):
@@ -11186,6 +11279,8 @@ class Autofill(QObject):
         self.data.changed.connect(self.changed)
         self.poke = f"{AUTOFILL_POKE}{secrets.token_hex(12)}:"
         self.told_no_keychain = False
+        self.recent: list[str] = []  # every password and card number filled in since the app started, on any page
+                                     # (in memory only): never shown to Claude, wherever a page shows it
         scripts = profile.scripts()
         for old in scripts.find(AUTOFILL_SCRIPT):
             scripts.remove(old)
@@ -11240,6 +11335,18 @@ class Autofill(QObject):
             if state is not None:
                 found += [s for s in state.filled if s not in found]
         return found
+
+    @staticmethod
+    def keeps_history(page: QWebEnginePage, history: bytes) -> bool:
+        """May the page's back/forward list (*history*: as serialized, with Chromium's form state) be stored? Not once
+        a card number was filled in, nor when a filled-in password is in it (Chromium leaves password fields out of
+        form state - unless a "show password" button made one a text field)."""
+        state = getattr(page, "autofill_state", None) if page is not None and not sip.isdeleted(page) else None
+        if state is None or not state.filled:
+            return True
+        if state.cards:
+            return False
+        return not any(secret.encode(encoding) in history for secret in state.filled for encoding in ("utf-16-le", "utf-8"))
 
     # ── from the page script ──
     def poked(self, page: QWebEnginePage, message: str) -> bool:
@@ -11474,9 +11581,13 @@ class Autofill(QObject):
         else:
             return
         secret = payload.get("password") if what == "login" else payload["values"]["number"] if what == "card" else None
-        filled = self.state(target.page).filled
-        if secret and secret not in filled:
-            filled[:] = (filled + [secret])[-50:]
+        state = self.state(target.page)
+        if secret and secret not in state.filled:
+            state.filled[:] = (state.filled + [secret])[-50:]
+        if secret and what == "card" and secret not in state.cards:
+            state.cards.append(secret)
+        if secret and secret not in self.recent:
+            self.recent[:] = (self.recent + [secret])[-200:]
         frame.runJavaScript(f"typeof __fgAutofill === 'object' ? __fgAutofill.fill({int(target.field)}, {json.dumps(payload)}, "
                             f"{json.dumps(target.origin)}) : 0", AUTOFILL_WORLD, lambda _filled: None)
 
@@ -12708,7 +12819,8 @@ AGENT_TOOLS = [
     _agent_tool("click", "Click an element (scrolls it into view first, then clicks its centre with the mouse).",
                 {"label": _LABEL}, ("label",)),
     _agent_tool("click_at", "Click a point of your latest screenshot, in that image's pixels. For what has no number: "
-                "canvases, maps, or content inside frames from other sites. Take a new screenshot if the page changed.",
+                "canvases, maps, or content inside frames from other sites. It is refused when what is at that point now "
+                "isn't what the screenshot showed there: take a new screenshot if the page changed.",
                 {"x": {"type": "number"}, "y": {"type": "number"}}, ("x", "y")),
     _agent_tool("type_text", "Type text into text field [label], replacing what it holds (an empty text clears it); "
                 "without a label, type at the cursor of whatever has the keyboard focus (e.g. after click_at). "
@@ -12982,6 +13094,9 @@ const INTERACTIVE = "a[href],button,input:not([type=hidden]),select,textarea,sum
   "[role=checkbox],[role=tab],[role=menuitem],[role=option],[contenteditable=''],[contenteditable=true]";
 let labels = [], roles = [];  // element [n] is labels[n - 1], seen as roles[n - 1]
 let armed = null, typingInto = null;  // where the next real click should land; the field being typed into
+let shotFrames = [], aimedAt = null;  // other sites' frames in the latest screenshot; what click_at found at its point
+// password fields stay secret once a "show password" button made them type=text (AGENT_WATCH_JS notes them early on)
+const everPassword = window.__claudeEverPassword || (window.__claudeEverPassword = new WeakSet());
 
 const squash = (s) => String(s == null ? "" : s).replace(/\s+/g, " ").trim();
 const clip = (s, n) => { s = squash(s); return s.length > n ? s.slice(0, n - 1) + "…" : s; };
@@ -12990,7 +13105,9 @@ const textOf = (node) => !node ? "" : node.innerText !== undefined ? node.innerT
 const kind = (el) => (el.getAttribute("type") || "text").toLowerCase();
 
 function secret(el) {
-  return !!el && el.tagName === "INPUT" && (kind(el) === "password" || SECRET.test(el.getAttribute("autocomplete") || ""));
+  if (!el || el.tagName !== "INPUT") return false;
+  if (kind(el) === "password") { everPassword.add(el); return true; }
+  return everPassword.has(el) || SECRET.test(el.getAttribute("autocomplete") || "");
 }
 function roleOf(el) {
   const explicit = squash(el.getAttribute("role")).split(" ")[0].toLowerCase();
@@ -13077,8 +13194,9 @@ function frameDocument(frame) {
   try { return frame.contentDocument; } catch (e) { return null; }
 }
 
-function collect() {
+function collect(shot) {
   labels = []; roles = [];
+  if (shot) snapFrames();
   const items = [], vw = window.innerWidth, vh = window.innerHeight;
   let nodes = 0, cut = false;
   function walk(node, ox, oy, pointer) {
@@ -13137,9 +13255,11 @@ function collect() {
   kept = new Set(kept);
   const vv = window.visualViewport || {offsetLeft: 0, offsetTop: 0, scale: 1};
   const boxes = [];
-  let out = "";
+  let out = "", shown = false;
   for (const it of items) {
     if (typeof it === "string") { out += it; continue; }
+    // (a password field a "show password" button turned into a text field: a screenshot must cover it)
+    if (it.el.tagName === "INPUT" && it.el.value && secret(it.el) && kind(it.el) !== "password") shown = true;
     const name = nameOf(it.el);
     if (!kept.has(it)) { out += " " + name + " "; continue; }
     labels.push(it.el); roles.push(it.role);
@@ -13154,7 +13274,7 @@ function collect() {
   const se = document.scrollingElement || document.documentElement;
   return {url: location.href, title: document.title, text, count: labels.length, total: found.length, truncated,
           scroll: {x: Math.round(se.scrollLeft), y: Math.round(se.scrollTop), width: se.scrollWidth, height: se.scrollHeight},
-          viewport: {width: vw, height: vh}, boxes};
+          viewport: {width: vw, height: vh}, boxes, shown};
 }
 
 function deepHit(x, y) {  // the element at a point of the top viewport, through open shadow roots and same-origin frames
@@ -13342,6 +13462,22 @@ function other(el) {  // a short description of what's at a point instead of the
   const role = roleOf(el), name = nameOf(el);
   return (role || el.tagName.toLowerCase()) + (name ? " " + JSON.stringify(name) : "");
 }
+function watchPress(el, x, y) {  // note where the next real press lands (and whether the focus left this page)
+  if (armed) armed.stop();
+  const record = {down: null, click: null, blurred: false, el, x, y}, win = el.ownerDocument.defaultView;
+  const watch = (e) => {
+    if (!e.isTrusted || armed !== record) return;
+    const path = e.composedPath ? e.composedPath() : [e.target], target = path[0] || e.target;
+    const seen = {inside: path.includes(el), what: other(target && target.nodeType === 1 ? target : e.target)};
+    if (e.type === "click") record.click = record.click || seen; else record.down = record.down || seen;
+  };
+  const blur = (e) => { if (e.isTrusted && armed === record) record.blurred = true; };  // (into a frame, most likely)
+  const types = ["pointerdown", "mousedown", "click"];
+  for (const type of types) win.addEventListener(type, watch, true);
+  window.addEventListener("blur", blur, true);
+  record.stop = () => { for (const type of types) win.removeEventListener(type, watch, true); window.removeEventListener("blur", blur, true); };
+  armed = record;
+}
 function arm(n, x, y) {  // just before the real mouse press: [n] must still be at (x, y); then note where the press lands
   if (armed) armed.stop();
   armed = null;
@@ -13349,24 +13485,71 @@ function arm(n, x, y) {  // just before the real mouse press: [n] must still be 
   if (found.error) return found;
   const el = found.el, info = describe(el, n), hit = deepHit(x, y);
   if (!within(el, hit)) return Object.assign(info, {moved: true, over: other(hit)});
-  const record = {down: null, click: null}, win = el.ownerDocument.defaultView;
-  const watch = (e) => {
-    if (!e.isTrusted || armed !== record) return;
-    const path = e.composedPath ? e.composedPath() : [e.target], target = path[0] || e.target;
-    const seen = {inside: path.includes(el), what: other(target && target.nodeType === 1 ? target : e.target)};
-    if (e.type === "click") record.click = record.click || seen; else record.down = record.down || seen;
+  watchPress(el, x, y);
+  return Object.assign(info, {armed: true});
+}
+const foreignFrame = (el) => !!el && (el.tagName === "IFRAME" || el.tagName === "FRAME") && !frameDocument(el);
+function opacity(el) {  // how much of el shows: its opacity times its ancestors' (through same-site frames)
+  let o = 1;
+  for (let e = el, i = 0; e && i < 1000 && o > 0; i++) {
+    if (e.nodeType === 1) { try { o *= parseFloat(styleOf(e).opacity || "1"); } catch (err) {} }
+    let next = up(e);
+    if (!next && e.ownerDocument !== document) { try { next = e.ownerDocument.defaultView.frameElement; } catch (err) {} }
+    e = next;
+  }
+  return o;
+}
+function snapFrames() {  // (at a screenshot) the frames Claude can see in it that this page can't look into
+  shotFrames = [];
+  const visit = (doc, ox, oy, depth) => {
+    for (const f of doc.querySelectorAll("iframe, frame")) {
+      const inner = frameDocument(f);
+      if (inner && inner.documentElement) {
+        if (depth < 8) { const [fx, fy] = contentOffset(f); visit(inner, ox + fx, oy + fy, depth + 1); }
+        continue;
+      }
+      const r = f.getBoundingClientRect();
+      let visible = false;
+      try { visible = styleOf(f).visibility === "visible" && opacity(f) >= 0.5; } catch (e) {}
+      shotFrames.push({el: f, x: r.left + ox, y: r.top + oy, w: r.width, h: r.height, visible});
+    }
   };
-  const types = ["pointerdown", "mousedown", "click"];
-  for (const type of types) win.addEventListener(type, watch, true);
-  record.stop = () => { for (const type of types) win.removeEventListener(type, watch, true); };
-  armed = record;
+  visit(document, 0, 0, 0);
+}
+function checkAt(hit, x, y) {  // may click_at press at (x, y), where *hit* is?
+  if (!hit) return {error: "There's nothing at that point of the page."};
+  if (!foreignFrame(hit)) return {what: other(hit)};
+  const known = shotFrames.find((f) => f.el === hit);
+  if (!known || !hit.isConnected || x < known.x || y < known.y || x >= known.x + known.w || y >= known.y + known.h)
+    return {moved: true, over: other(hit)};  // (not there in the screenshot)
+  if (!known.visible) return {moved: true, invisible: true, over: other(hit)};
+  return {frame: true, what: other(hit)};
+}
+function aimAt(x, y) {  // click_at, before the mouse goes to (x, y): what's there (it must still be there for the press)
+  if (armed) armed.stop();
+  armed = null;
+  aimedAt = deepHit(x, y);
+  return checkAt(aimedAt, x, y);
+}
+function armAt(x, y) {  // click_at, the mouse at (x, y): still what aimAt() found (or inside it); then watch the press
+  if (armed) armed.stop();
+  armed = null;
+  const hit = deepHit(x, y), was = aimedAt;
+  aimedAt = null;
+  if (!was || !hit || !within(was, hit)) return {moved: true, over: other(hit)};
+  const info = checkAt(hit, x, y);
+  if (info.error || info.moved) return info;
+  watchPress(was, x, y);
   return Object.assign(info, {armed: true});
 }
 function landed(done) {  // where the press after arm() landed (known: false - the document has changed since)
   const record = armed;
   if (!record) return {known: false};
   if (done) { record.stop(); armed = null; }
-  return {known: true, down: record.down, click: record.click};
+  const a = deepActive();
+  return {known: true, down: record.down, click: record.click, blurred: record.blurred,
+          frameFocused: !!a && (a.tagName === "IFRAME" || a.tagName === "FRAME"),
+          still: record.x == null || within(record.el, deepHit(record.x, record.y))};
 }
 function masks(list) {  // where these secrets show (field values, text): boxes to paint over in a screenshot
   const plain = list.map(squash).filter((t) => t.length >= 4);
@@ -13418,8 +13601,40 @@ function masks(list) {  // where these secrets show (field values, text): boxes 
   return {rects, opaque, unplaced, found: rects.length > 0 || unplaced};
 }
 window.__claudeAgent = {collect, point, clickFallback, focus, fieldState, stillFocused, fieldValue, scroll, choose, arm,
-                        landed, masks};
+                        aimAt, armAt, landed, masks};
 })();"""
+
+AGENT_WATCH_SCRIPT = "chrome2-agent-watch"
+AGENT_WATCH_JS = r"""(() => {  // (Claude's world, from the start of every document) password fields, before any "show"
+  if (window.__claudeEverPassword) return;
+  const seen = new WeakSet();
+  Object.defineProperty(window, "__claudeEverPassword", {value: seen});
+  const note = (e) => {
+    const path = e.composedPath ? e.composedPath() : [e.target], el = path[0] || e.target;
+    if (el && el.tagName === "INPUT" && String(el.type).toLowerCase() === "password") seen.add(el);
+  };
+  for (const type of ["focusin", "input", "keydown", "pointerdown", "change"]) document.addEventListener(type, note, true);
+  new MutationObserver((records) => {
+    for (const r of records)
+      if (r.target.tagName === "INPUT" && String(r.oldValue || "").toLowerCase() === "password") seen.add(r.target);
+  }).observe(document, {subtree: true, attributes: true, attributeFilter: ["type"], attributeOldValue: true});
+})();"""
+
+
+def install_agent_watch(profile: QWebEngineProfile) -> None:
+    """AGENT_WATCH_JS on every page of *profile*: a password the user typed and then had shown (a "show password"
+    button makes the field type=text) still reads as [redacted] to Claude."""
+    scripts = profile.scripts()
+    if scripts.find(AGENT_WATCH_SCRIPT):
+        return
+    script = QWebEngineScript()
+    script.setName(AGENT_WATCH_SCRIPT)
+    script.setWorldId(AGENT_WORLD)
+    script.setInjectionPoint(QWebEngineScript.InjectionPoint.DocumentCreation)
+    script.setRunsOnSubFrames(True)
+    script.setSourceCode(AGENT_WATCH_JS)
+    scripts.insert(script)
+
 
 AGENT_KEY_ALIASES = {
     "enter": "Return", "return": "Return", "esc": "Esc", "escape": "Esc", "del": "Del", "delete": "Del",
@@ -13526,17 +13741,70 @@ class AgentBrowser:
     SCRIPT_TIMEOUT = 10.0
     LOAD_TIMEOUT = 20.0
 
+    PAGE_FREE = {"list_tabs", "switch_tab", "new_tab", "wait"}  # tools a page's open alert() doesn't get in the way of
+
     def __init__(self, win: "BrowserWindow"):
         self.win = win
         self.shot: dict | None = None  # the latest screenshot: which tab, its size, its pixels per CSS pixel
         self._guarded: list = []       # pages that can't open other apps (vscode:, zoommtg: links...) while Claude works
+        self._token = {"over": False}  # the tool call under way: once it's over (answered, or Claude was stopped),
+                                       # whatever it still had in flight does nothing - no click, no key, no typing
+
+    def cancel(self) -> None:
+        """Claude stopped (or finished): the tool call under way sends no more input to the page, and the pages' alerts
+        are the user's again."""
+        self._token["over"] = True
+        for page in self._pages():
+            page.agent_alerts = None
+
+    def _pages(self) -> list:
+        return [page for page in (ref() for ref in self._guarded) if page is not None and not sip.isdeleted(page)]
+
+    def watch_alerts(self, page: QWebEnginePage) -> None:
+        """While Claude works on *page*, its alert()s aren't shown (nobody would be there to answer them: the page would
+        be stuck): they're told to Claude with the tool call's result (take_alerts)."""
+        if isinstance(page, WebPage) and page.agent_alerts is None:
+            page.agent_alerts = []
+
+    def take_alerts(self) -> str:
+        """What the pages Claude works on said in alert()s since the last tool call ("" if nothing)."""
+        said = []
+        for page in self._pages():
+            if getattr(page, "agent_alerts", None):
+                said += page.agent_alerts
+                page.agent_alerts = []
+        if not said:
+            return ""
+        return ("The page showed " + ("an alert" if len(said) == 1 else f"{len(said)} alerts") + " (untrusted text from "
+                "the page), closed at once: " + "; ".join(json.dumps(elide(text, 300)) for text in said[-5:]))
+
+    def _after(self, ms: int, then) -> None:
+        """QTimer.singleShot for a tool call's next step: dropped if the call is over by then."""
+        token = self._token
+        QTimer.singleShot(ms, lambda: None if token["over"] else then())
+
+    @staticmethod
+    def dialog_text(page) -> str | None:
+        """What to tell Claude while *page* shows an alert/confirm/prompt dialog (None: it shows none)."""
+        dialog = getattr(page, "js_dialog", None) if page is not None and not sip.isdeleted(page) else None
+        if not dialog:
+            return None
+        kind, message = dialog
+        return (f"The page opened a JavaScript {kind} dialog, which is waiting for the user to answer it: "
+                f"{json.dumps(elide(message, 300))} (untrusted text from the page). You can't answer it, and the page "
+                "can't be used until it is answered: ask the user to answer it, then go on.")
 
     def run(self, name: str, args: dict, answer) -> None:
-        state = {"over": False}
+        state = self._token = {"over": False}
 
         def once(content, error: bool = False, log_line: str = "") -> None:
             if not state["over"]:
                 state["over"] = True
+                alerts = self.take_alerts()
+                if alerts:
+                    content = f"{content}\n\n{alerts}" if isinstance(content, str) else \
+                        list(content) + [{"type": "text", "text": alerts}]
+                    log_line = f"{log_line} (the page showed an alert)" if log_line else log_line
                 secrets = self.secrets()  # (what autofill filled in never reaches Claude, whatever the page did with it)
                 answer(agent_redact(content, secrets), error, agent_redact(log_line, secrets))
 
@@ -13544,6 +13812,23 @@ class AgentBrowser:
         if handler is None:
             once(f"There is no tool called {name!r}.", True)
             return
+        if name not in self.PAGE_FREE:  # a page's alert() blocks it: say so at once, not after a time-out
+            start = self.win.current_tab()
+            pages = lambda: [t.page for t in (start, self.win.current_tab()) if t is not None and not self._gone(t)]
+
+            def dialog_check() -> None:
+                if state["over"] or sip.isdeleted(self.win):
+                    return
+                text = next((t for t in map(self.dialog_text, pages()) if t), None)
+                if text:
+                    once(text, True, "The page is showing a dialog")
+                else:
+                    QTimer.singleShot(150, dialog_check)
+            text = next((t for t in map(self.dialog_text, pages()) if t), None)
+            if text:
+                once(text, True, "The page is showing a dialog")
+                return
+            QTimer.singleShot(150, dialog_check)
 
         def go() -> None:
             try:
@@ -13556,6 +13841,7 @@ class AgentBrowser:
         tab = self.win.current_tab()
         if tab is not None and not self._gone(tab):
             self.guard(tab.page)
+            self.watch_alerts(tab.page)
         if tab is not None and tab.pending is not None:  # a restored tab that hasn't loaded yet: load it first
             tab.ensure_loaded()
             self._settle(tab, go, expect_load=True)
@@ -13571,18 +13857,23 @@ class AgentBrowser:
             self._guarded.append(weakref.ref(page))
 
     def release(self) -> None:
-        for ref in self._guarded:
-            page = ref()
-            if page is not None and not sip.isdeleted(page):
-                page.settings().resetUnknownUrlSchemePolicy()
+        for page in self._pages():
+            page.settings().resetUnknownUrlSchemePolicy()
+            page.agent_alerts = None
         self._guarded = []
 
     def secrets(self) -> list[str]:
-        """The passwords and card numbers autofill filled into this window's tabs."""
+        """The passwords and card numbers autofill filled in during this run of the app: into this window's tabs, and
+        anywhere else (other windows, sign-in pop-ups, tabs closed since) - a page Claude reads may show any of them."""
         autofill = getattr(self.win, "autofill", None)
         if autofill is None or sip.isdeleted(self.win):
             return []
-        return autofill.filled_secrets(t.page for t in self.win.tabs() if not sip.isdeleted(t))
+        found = autofill.filled_secrets(t.page for t in self.win.tabs() if not sip.isdeleted(t))
+        everyone = [autofill] + [w.autofill for w in QApplication.topLevelWidgets()
+                                 if isinstance(w, BrowserWindow) and not sip.isdeleted(w) and getattr(w, "autofill", None)]
+        for one in dict.fromkeys(everyone):
+            found += [s for s in one.recent if s not in found]
+        return found
 
     def _tab(self, answer) -> "Tab | None":
         tab = self.win.current_tab()
@@ -13595,12 +13886,14 @@ class AgentBrowser:
     def _js(self, tab: "Tab", call: str, then) -> None:
         """window.__claudeAgent.<call> in the tab's page (Claude's world); then(dict) - or then(None) if the page
         didn't answer (it went away, or is in the middle of navigating)."""
-        state = {"over": False}
+        state, token = {"over": False}, self._token
 
         def finish(raw) -> None:
             if state["over"]:
                 return
             state["over"] = True
+            if token["over"]:  # (the tool call was answered meanwhile, or Claude was stopped: nothing more to do)
+                return
             try:
                 value = json.loads(raw) if isinstance(raw, str) else None
             except ValueError:
@@ -13623,6 +13916,8 @@ class AgentBrowser:
 
     def _mouse(self, tab: "Tab", x: float, y: float, press: bool = True, move: bool = True) -> None:
         """Real mouse input at (x, y) CSS px of the visible viewport: a move there, then a click (press and release)."""
+        if self._token["over"]:  # (Claude was stopped)
+            return
         view, target = tab.view, self._input_target(tab)
         zoom = tab.page.zoomFactor()
         local = QPointF(target.mapFrom(view, QPoint(round(x * zoom), round(y * zoom))))
@@ -13633,10 +13928,6 @@ class AgentBrowser:
             events += [(QEvent.Type.MouseButtonPress, left, left), (QEvent.Type.MouseButtonRelease, left, none)]
         for kind, button, buttons in events:
             QApplication.sendEvent(target, QMouseEvent(kind, local, screen, button, buttons, Qt.KeyboardModifier.NoModifier))
-
-    def _mouse_click(self, tab: "Tab", x: float, y: float) -> None:
-        """A real click at (x, y) CSS px of the visible viewport."""
-        self._mouse(tab, x, y)
 
     def _checked_click(self, tab: "Tab", n: int, point: dict, then) -> None:
         """Click element [n] at *point* (from point()) with the real mouse - making sure it's [n] the click lands on:
@@ -13664,7 +13955,7 @@ class AgentBrowser:
             else:
                 self._mouse(tab, x, y, move=False)
                 state["t0"] = time.monotonic()
-                QTimer.singleShot(30, poll)
+                self._after(30, poll)
 
         def poll() -> None:
             if self._gone(tab):
@@ -13679,11 +13970,13 @@ class AgentBrowser:
                 return
             down, click = result.get("down"), result.get("click")
             if (down is None or click is None) and elapsed < 0.6 and not (down and not down.get("inside")):
-                QTimer.singleShot(40, poll)
+                self._after(40, poll)
                 return
             self._js(tab, "landed(true)", lambda _r: None)
-            if down is None and click is None and not state["again"]:
-                # (a page that has only just loaded can drop the first press: check the place again, and press again)
+            dropped = not result.get("blurred") and not result.get("frameFocused")
+            if down is None and click is None and not state["again"] and dropped:
+                # (a page that has only just loaded can drop the first press: check the place again, and press again -
+                # but not when the focus went off into a frame: then the press went there, unseen)
                 state["again"] = True
                 self._js(tab, arm, armed)
             elif down is None and click is None:
@@ -13696,15 +13989,19 @@ class AgentBrowser:
 
         tab.view.setFocus()
         self._mouse(tab, x, y, press=False)
-        QTimer.singleShot(50, lambda: then("!The tab was closed.") if self._gone(tab) else self._js(tab, arm, armed))
+        self._after(50, lambda: then("!The tab was closed.") if self._gone(tab) else self._js(tab, arm, armed))
 
     def _key(self, tab: "Tab", key, modifiers, text: str) -> None:
+        if self._token["over"]:  # (Claude was stopped)
+            return
         target = self._input_target(tab)
         for kind in (QEvent.Type.KeyPress, QEvent.Type.KeyRelease):
             QApplication.sendEvent(target, QKeyEvent(kind, key, modifiers, text))
 
     def _type(self, tab: "Tab", text: str, multiline: bool) -> None:
         """Real typing into the focused field (it has its content selected, so this replaces it)."""
+        if self._token["over"]:  # (Claude was stopped)
+            return
         tab.view.setFocus()
         none = Qt.KeyboardModifier.NoModifier
         if not text:
@@ -13803,7 +14100,8 @@ class AgentBrowser:
                        "Couldn't take a screenshot")
                 return
             secrets = self.secrets()
-            if secrets:  # what autofill filled in mustn't reach Claude as pixels either
+            if secrets or info.get("shown"):  # what autofill filled in mustn't reach Claude as pixels either - nor a
+                                              # password on show
                 self._hidden_boxes(tab, secrets, lambda hidden: shoot(info, hidden))
             else:
                 shoot(info, [])
@@ -13825,7 +14123,7 @@ class AgentBrowser:
                                                  "data": base64.b64encode(png).decode("ascii")}}],
                    False, "Took a screenshot")
 
-        self._js(tab, "collect()", got)
+        self._js(tab, "collect(true)", got)
 
     def _hidden_boxes(self, tab: "Tab", secrets: list[str], then) -> None:
         """then(boxes): where *secrets* show in the tab (CSS px of the viewport) - or then(None) if that can't be told.
@@ -13903,7 +14201,7 @@ class AgentBrowser:
                         answer("The tab was closed.", True)
                         return
                     self._checked_click(tab, n, info, clicked)
-                QTimer.singleShot(60, fire)  # (lets the scroll into view reach the screen first)
+                self._after(60, fire)  # (lets the scroll into view reach the screen first)
             else:
                 self._js(tab, f"clickFallback({n})", lambda result: report(result or info, True)
                          if result is not None and "error" not in result
@@ -13912,6 +14210,10 @@ class AgentBrowser:
         self._js(tab, f"point({n})", aimed)
 
     def _tool_click_at(self, args: dict, answer) -> None:
+        """A real click at a point of the latest screenshot - with click's checks: what the screenshot showed there must
+        still be there once the mouse has arrived (a page can move another site's frame under the pointer as it moves),
+        and the press must reach it. Other sites' frames, which the page can't look into, only if the screenshot showed
+        them there (and not near-invisible)."""
         tab = self._tab(answer)
         if tab is None:
             return
@@ -13924,19 +14226,90 @@ class AgentBrowser:
             answer(f"({x:g}, {y:g}) is outside the {shot['width']}x{shot['height']} screenshot.", True, "Couldn't click")
             return
         before, tabs_before = tab.url(), len(self.win.tabs())
-        tab.view.setFocus()
-        self._mouse_click(tab, x / shot["factor"], y / shot["factor"])
+        cx, cy = x / shot["factor"], y / shot["factor"]
+        where, log_line = f"({x:g}, {y:g})", f"Clicked at ({x:.0f}, {y:.0f})"
+        state = {"t0": 0.0, "frame": False, "what": ""}
 
-        def done() -> None:
-            text = f"Clicked at ({x:g}, {y:g}) of the screenshot."
-            current = self.win.current_tab()
-            if len(self.win.tabs()) > tabs_before and current is not tab:
-                text += " A new tab opened and is now the current tab. " + self._where(current)
-            elif not self._gone(tab) and tab.url() != before:
-                text += " " + self._where(tab)
-            answer(text, False, f"Clicked at ({x:.0f}, {y:.0f})")
+        def refuse(info: dict) -> None:
+            if info.get("invisible"):
+                why = (f"at {where} there is an invisible embedded frame from another site ({info.get('over')}) over "
+                       "the page: the click would go into it")
+            else:
+                why = (f"{info.get('over')} is at {where} now, and wasn't there in your screenshot (the page moved it "
+                       "there - perhaps as the mouse arrived)")
+            answer(f"Didn't click: {why}. Nothing was clicked. Take a new screenshot before going on; if this keeps "
+                   "happening, the page may be trying to trick you into clicking something else.", True, "Didn't click")
 
-        self._settle(tab, done)
+        def aimed(info) -> None:
+            if info is None or self._gone(tab):
+                answer("The page didn't answer (it may be loading). Try again.", True, "Couldn't click")
+            elif "error" in info:
+                answer(info["error"], True, "Couldn't click")
+            elif info.get("moved"):
+                refuse(info)
+            else:
+                tab.view.setFocus()
+                self._mouse(tab, cx, cy, press=False)
+                self._after(50, lambda: self._js(tab, f"armAt({cx!r}, {cy!r})", armed))
+
+        def armed(info) -> None:
+            if self._gone(tab):
+                answer("The tab was closed.", True, "Couldn't click")
+            elif info is None or "error" in info:
+                answer((info or {}).get("error") or "The page didn't answer. Try again.", True, "Couldn't click")
+            elif info.get("moved"):
+                refuse(info)
+            else:
+                state.update(frame=bool(info.get("frame")), what=info.get("what") or "")
+                self._mouse(tab, cx, cy, move=False)
+                state["t0"] = time.monotonic()
+                self._after(30, poll)
+
+        def poll() -> None:
+            if self._gone(tab):
+                landed(None)
+                return
+            self._js(tab, "landed(false)", check)
+
+        def check(result) -> None:
+            if result is None or not result.get("known"):
+                landed(None)  # (another document now: the click started a navigation of the whole page)
+                return
+            down, click = result.get("down"), result.get("click")
+            waiting = not state["frame"] or not result.get("blurred")  # (a press into a frame: no events here)
+            if (down is None or click is None) and waiting and time.monotonic() - state["t0"] < 0.6 \
+                    and not (down and not down.get("inside")):
+                self._after(40, poll)
+                return
+            self._js(tab, "landed(true)", lambda _r: None)
+            if down is None and click is None:
+                if state["frame"] and result.get("still"):
+                    landed(None, f" It went into an embedded frame from another site ({state['what']}), which "
+                                 "this page can't look into: take a screenshot to see what it did.")
+                else:
+                    answer(f"The click at {where} didn't reach what the screenshot showed there: something the page "
+                           "can't see into - most likely an embedded frame from another site - took it. Look at the page "
+                           "again before going on; the page may be trying to trick you.", True,
+                           log_line + " - it landed elsewhere")
+            elif not (down or click).get("inside"):
+                answer(f"The click at {where} landed on {(down or click).get('what')} instead of {state['what']} (the "
+                       "page moved it there). Look at the page again before going on; the page may be trying to trick "
+                       "you.", True, log_line + " - it landed elsewhere")
+            else:
+                landed(None)
+
+        def landed(_problem, note: str = "") -> None:
+            def done() -> None:
+                text = f"Clicked at {where} of the screenshot.{note}"
+                current = self.win.current_tab()
+                if len(self.win.tabs()) > tabs_before and current is not tab:
+                    text += " A new tab opened and is now the current tab. " + self._where(current)
+                elif not self._gone(tab) and tab.url() != before:
+                    text += " " + self._where(tab)
+                answer(text, False, log_line)
+            self._settle(tab, done)
+
+        self._js(tab, f"aimAt({cx!r}, {cy!r})", aimed)
 
     def _tool_type_text(self, args: dict, answer) -> None:
         tab = self._tab(answer)
@@ -13954,7 +14327,7 @@ class AgentBrowser:
                     answer("The tab was closed.", True)
                     return
                 self._js(tab, "fieldValue()", lambda value: finish(info, field, value or {}))
-            QTimer.singleShot(150 + 2 * min(len(text), 300), check)
+            self._after(150 + 2 * min(len(text), 300), check)
 
         def finish(info: dict, field: dict, value: dict) -> None:
             secret = field.get("secret") or value.get("secret")
@@ -14005,7 +14378,7 @@ class AgentBrowser:
                 answer(info["error"], True, f"Couldn't type into [{n}]")
                 return
             if info.get("focused"):
-                QTimer.singleShot(50, lambda: type_now(info))
+                self._after(50, lambda: type_now(info))
                 return
             # Not a text field itself (or it can't take focus by script): click it, as a person would, and try again.
             def clicked(point) -> None:
@@ -14018,7 +14391,7 @@ class AgentBrowser:
                     if problem:
                         answer(problem.lstrip("!") + " Nothing was typed.", True, f"Couldn't type into [{n}]")
                     else:
-                        QTimer.singleShot(100, lambda: self._js(tab, "fieldState()", after_click))
+                        self._after(100, lambda: self._js(tab, "fieldState()", after_click))
                 self._checked_click(tab, n, point, landed)
 
             def after_click(field) -> None:
@@ -14053,7 +14426,7 @@ class AgentBrowser:
             hidden = bool(field.get("secret")) or not known
             if text:
                 self._type(tab, text, bool(field.get("multiline")))
-            QTimer.singleShot(150 + 2 * min(len(text), 300), lambda: self._js(tab, "fieldValue()", lambda value: after(hidden, value or {})))
+            self._after(150 + 2 * min(len(text), 300), lambda: self._js(tab, "fieldValue()", lambda value: after(hidden, value or {})))
 
         def after(hidden: bool, value: dict) -> None:
             if self._gone(tab):
@@ -14502,6 +14875,7 @@ class AgentSession(QObject):
     def _end(self, kind: str, text: str) -> None:
         self.running = False
         self.run_id += 1  # whatever is still under way for this run is ignored from now on
+        self.browser.cancel()  # ... and a tool call under way sends the page no more clicks or keys
         self._call = None
         self._round = None
         if kind and text:
@@ -15029,6 +15403,7 @@ class BrowserWindow(QMainWindow):
         self._cleaners: list[SiteDataCleaner] = []  # clearing site data, still running
         self.settings = settings
         self.autofill = Autofill.of(profile) or Autofill(profile, settings, session_path.parent)  # (before any page)
+        install_agent_watch(profile)
         self.bookmarks = bookmarks
         self.history = history
         self.favicons = favicons

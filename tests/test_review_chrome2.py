@@ -14,12 +14,13 @@ from urllib.parse import quote, quote_plus
 
 import keyring
 import pytest
+from PyQt6 import sip
 from PyQt6.QtCore import QObject, QPoint, QPointF, Qt, QTimer, QUrl, pyqtSlot
 from PyQt6.QtGui import QColor, QCursor, QDesktopServices, QEnterEvent, QGuiApplication, QImage
 from PyQt6.QtWidgets import QToolButton
 
 from helpers import load, poll_js, run_js, spin, wait_until
-from test_autofill import LOGIN, MemoryKeyring, key, popup, show, wait_popup
+from test_autofill import LOGIN, MemoryKeyring, click, key, keys, popup, show, value, wait_popup
 
 INACTIVE, ACTIVE = Qt.ApplicationState.ApplicationInactive, Qt.ApplicationState.ApplicationActive
 
@@ -555,3 +556,361 @@ def test_new_tab_page_can_restore_default_shortcuts(fg, window, harness):
     run_js(page, "document.getElementById('toast-restore').click(); 1")
     wait_until(lambda: settings.get("ntp_shortcuts_edited") is False)
     assert settings.get("ntp_shortcuts") == []
+
+
+# ══════════════════════════════════════════════════════════════════════════════════════════
+#  Review round 3
+# ══════════════════════════════════════════════════════════════════════════════════════════
+def frame_ready(tab) -> None:
+    wait_until(lambda: tab.page.mainFrame().children(), 10, "the frame")
+    spin(0.5)
+
+
+def canvas_page(victim_url: str, trap: bool) -> bytes:
+    script = """addEventListener('mousemove', (e) => {
+  if (!e.isTrusted) return;
+  const f = document.getElementById('f');
+  f.style.left = (e.clientX - 80) + 'px'; f.style.top = (e.clientY - 40) + 'px';
+}, true);""" if trap else ""
+    return f"""<!doctype html><html><head><title>Map</title></head><body style="margin:0">
+<canvas id=c width=400 height=300 style="position:absolute;left:0;top:0;background:#cde"></canvas>
+<iframe id=f src="{victim_url}" style="position:absolute;left:-2000px;top:0;width:160px;height:80px;border:0;opacity:0.02;z-index:5"></iframe>
+<script>document.getElementById('c').onclick = () => {{ document.title = 'canvas clicked'; }};
+{script}</script></body></html>""".encode()
+
+
+# SEC-R3-1: click_at checks what's at the point once the mouse is there, and where the press went
+def test_click_at_refuses_frame_moved_under_the_pointer(fg, window, server):
+    server.add("/r3-victim", VICTIM.replace(b"/victim-clicked", b"/r3-victim-clicked"), "text/html; charset=utf-8")
+    victim = f"http://localhost:{server.port}/r3-victim"
+    server.add("/r3-map-trap", canvas_page(victim, True), "text/html; charset=utf-8")
+    server.add("/r3-map", canvas_page(victim, False), "text/html; charset=utf-8")
+    tab = window.current_tab()
+    settled_load(tab, server.url("/r3-map-trap"))
+    frame_ready(tab)
+    shot_image(tool(fg, window, "screenshot"))
+    factor = window._test_agent_browser.shot["factor"]
+    before = len(server.requests)
+    result = tool(fg, window, "click_at", x=200 * factor, y=150 * factor)
+    spin(0.8)
+    assert "/r3-victim-clicked" not in server.requests[before:]
+    assert result["e"] and "Nothing was clicked" in result["c"], result["c"]
+    assert run_js(tab.page, "document.title") != "canvas clicked"
+    # (without the trap: the canvas gets the click; the near-invisible frame is off to the side)
+    settled_load(tab, server.url("/r3-map"))
+    frame_ready(tab)
+    shot_image(tool(fg, window, "screenshot"))
+    result = tool(fg, window, "click_at", x=200 * factor, y=150 * factor)
+    assert not result["e"], result["c"]
+    assert run_js(tab.page, "document.title") == "canvas clicked"
+    # ... but a near-invisible frame of another site over it isn't clicked into
+    run_js(tab.page, "const f = document.getElementById('f'); f.style.left = '120px'; f.style.top = '110px'; 1")
+    shot_image(tool(fg, window, "screenshot"))
+    before = len(server.requests)
+    result = tool(fg, window, "click_at", x=200 * factor, y=150 * factor)
+    spin(0.8)
+    assert result["e"] and "invisible" in result["c"], result["c"]
+    assert "/r3-victim-clicked" not in server.requests[before:]
+
+
+# SEC-R3-2: a press that went unseen into another site's frame is reported, not silently retried
+def test_press_into_foreign_frame_is_not_retried(fg, window, server, monkeypatch):
+    server.add("/r3-victim", VICTIM.replace(b"/victim-clicked", b"/r3-victim-clicked"), "text/html; charset=utf-8")
+    victim = f"http://localhost:{server.port}/r3-victim"
+    server.add("/r3-late", f"""<!doctype html><html><head><title>Late</title></head><body style="margin:0">
+<button id=next style="position:absolute;left:40px;top:40px;width:200px;height:50px">Next page</button>
+<iframe id=f src="{victim}" style="position:absolute;left:-2000px;top:0;width:300px;height:120px;border:0"></iframe>
+<script>
+document.getElementById('next').onclick = () => {{ document.title = 'next clicked'; }};
+window.cover = () => {{ const f = document.getElementById('f'); f.style.left = '0px'; f.style.top = '0px'; return 1; }};
+addEventListener('blur', () => setTimeout(() => {{ const f = document.getElementById('f'); if (f) f.remove(); }}, 150));
+</script></body></html>""".encode(), "text/html; charset=utf-8")
+    tab = window.current_tab()
+    settled_load(tab, server.url("/r3-late"))
+    frame_ready(tab)
+    original, presses = fg.AgentBrowser._mouse, []
+
+    def late(self, tab_, x, y, press=True, move=True):
+        if press and not move:
+            presses.append((x, y))
+            if len(presses) == 1:  # (the first press comes once the page has moved its frame there)
+                tab_.page.runJavaScript("cover()", 0, lambda _r: QTimer.singleShot(150, lambda: original(self, tab_, x, y, press, move)))
+                return
+        original(self, tab_, x, y, press, move)
+    monkeypatch.setattr(fg.AgentBrowser, "_mouse", late)
+    page_text = tool(fg, window, "read_page")["c"]
+    result = tool(fg, window, "click", label=label_of(page_text, "Next page"))
+    spin(0.5)
+    assert result["e"] and "didn't reach" in result["c"], result["c"]
+    assert len(presses) == 1 and run_js(tab.page, "document.title") != "next clicked"
+
+
+# SEC-R3-3: autofill never fills fields the user can't see
+NEWSLETTER = """<!doctype html><html><head><title>Newsletter</title></head><body style="margin:20px">
+<form id=f><input id=name autocomplete=name style="width:220px;height:24px"><br>
+<input id=email type=email autocomplete=email style="width:220px;height:24px"><br>
+<div style="display:none"><input id=street autocomplete=street-address><input id=city autocomplete=address-level2>
+  <input id=zip autocomplete=postal-code></div>
+<input id=tel autocomplete=tel style="visibility:hidden">
+<input id=org autocomplete=organization style="opacity:0">
+<input id=far autocomplete=address-line2 style="position:absolute;left:-5000px">
+<button>Subscribe</button></form></body></html>"""
+
+
+def test_hidden_address_fields_are_left_alone(fg, vault, harness, server):
+    win = harness.window()
+    win.autofill.data.add_address({"name": "Ada Lovelace", "line1": "12 Analytical Way", "line2": "Floor 3", "city": "Springfield",
+                                   "state": "CA", "zip": "90210", "phone": "+1 555 0100", "email": "ada@example.com",
+                                   "organization": "Engines Ltd"})
+    server.add("/r3-news", NEWSLETTER.encode(), "text/html; charset=utf-8")
+    tab = show(win, server.url("/r3-news"))
+    click(tab, "#name")
+    assert wait_popup(fg, win).widgets[0].text.text() == "Ada Lovelace"
+    key(tab, Qt.Key.Key_Down)
+    key(tab, Qt.Key.Key_Return)
+    poll_js(tab.page, "document.getElementById('name').value", lambda v: v == "Ada Lovelace", what="the name")
+    spin(0.3)
+    assert value(tab, "#email") == "ada@example.com"
+    hidden = json.loads(run_js(tab.page, "JSON.stringify(['street','city','zip','tel','org','far'].map(id => document.getElementById(id).value))"))
+    assert hidden == [""] * 6, hidden
+
+
+def test_hidden_card_number_is_left_alone(fg, vault, harness, server):
+    win = harness.window()
+    win.autofill.data.add_card("4111111111111111", "Ada Lovelace", "11", "2031", "")
+    server.add("/r3-pay", b"""<!doctype html><html><head><title>Pay</title></head><body style="margin:20px">
+<form><input id=ccname autocomplete=cc-name style="width:220px;height:24px">
+<div style="display:none"><input id=cc autocomplete=cc-number></div><button>Pay</button></form></body></html>""",
+               "text/html; charset=utf-8")
+    tab = show(win, server.url("/r3-pay"))
+    click(tab, "#ccname")
+    wait_popup(fg, win)
+    key(tab, Qt.Key.Key_Down)
+    key(tab, Qt.Key.Key_Return)
+    poll_js(tab.page, "document.getElementById('ccname').value", lambda v: v == "Ada Lovelace", what="the name on the card")
+    spin(0.3)
+    assert value(tab, "#cc") == ""
+
+
+# SEC-R3-4: what autofill filled anywhere is hidden from Claude everywhere
+def test_secret_filled_in_another_window_is_redacted(fg, vault, harness, server):
+    secret = "Hunter2-Very-Secret"
+    first = harness.window()
+    server.add("/r3-login", LOGIN.encode(), "text/html; charset=utf-8")
+    first.autofill.data.add_login(f"http://127.0.0.1:{server.port}", "alice", secret)
+    tab = show(first, server.url("/r3-login"))
+    click(tab, "#user")
+    wait_popup(fg, first)
+    key(tab, Qt.Key.Key_Down)
+    key(tab, Qt.Key.Key_Return)
+    poll_js(tab.page, "document.getElementById('pass').value", lambda v: v == secret, what="the password")
+    first.close_tab(tab)  # (and that tab is gone now)
+    spin(0.3)
+    second = harness.window()
+    server.add("/r3-echo", f"<!doctype html><title>Profile</title><p>Your password: {secret}</p>".encode(),
+               "text/html; charset=utf-8")
+    settled_load(second.current_tab(), server.url("/r3-echo"))
+    result = tool(fg, second, "read_page")
+    assert secret not in result["c"] and "[redacted]" in result["c"], result["c"]
+
+
+# SEC-R3-5: a typed password stays [redacted] after "show password"
+def test_shown_password_stays_hidden(fg, window, server):
+    server.add("/r3-show", b"""<!doctype html><html><head><title>Sign in</title></head><body style="margin:20px">
+<input id=u aria-label="User" style="width:200px;height:24px"><br>
+<input id=p type=password aria-label="Password" style="width:200px;height:24px">
+<button id=show onclick="const p = document.getElementById('p'); p.type = p.type === 'password' ? 'text' : 'password'">Show</button>
+</body></html>""", "text/html; charset=utf-8")
+    tab = window.current_tab()
+    settled_load(tab, server.url("/r3-show"))
+    window.activateWindow()
+    click(tab, "#p")
+    keys(tab, "TypedByUser-Secret9")
+    poll_js(tab.page, "document.getElementById('p').value", lambda v: v == "TypedByUser-Secret9", what="the typing")
+    click(tab, "#show")
+    poll_js(tab.page, "document.getElementById('p').type", lambda v: v == "text", what="the password to show")
+    result = tool(fg, window, "read_page")
+    assert "TypedByUser-Secret9" not in result["c"] and "value=[redacted]" in result["c"], result["c"]
+    # ... and a screenshot covers it (no password was filled in by autofill here)
+    image = shot_image(tool(fg, window, "screenshot"))
+    factor = window._test_agent_browser.shot["factor"]
+    r = json.loads(run_js(tab.page, "JSON.stringify(document.getElementById('p').getBoundingClientRect())"))
+    mask = QColor("#3c4043")
+    for x in (r["left"] + 10, r["left"] + r["width"] / 2):
+        assert image.pixelColor(round(x * factor), round((r["top"] + r["height"] / 2) * factor)) == mask, x
+    r = json.loads(run_js(tab.page, "JSON.stringify(document.getElementById('u').getBoundingClientRect())"))
+    assert image.pixelColor(round((r["left"] + r["width"] / 2) * factor), round((r["top"] + r["height"] / 2) * factor)) != mask
+
+
+# F1: Stop stops a tool call under way: no more keys or clicks reach the page
+STOP_PAGE = b"""<!doctype html><html><head><title>Message</title></head><body style="margin:20px">
+<form onsubmit="fetch('/r3-submitted'); document.title = 'submitted'; return false">
+<input id=name aria-label="Name" style="width:200px;height:24px"></form>
+<button id=send style="width:120px;height:30px" onclick="fetch('/r3-sent'); document.title = 'sent'">Send</button>
+<script>window.keys = []; addEventListener('keydown', (e) => { if (e.isTrusted) keys.push(e.key); }, true);</script>
+</body></html>"""
+
+
+def test_stop_cancels_the_tool_call_under_way(fg, window, server):
+    from test_agent import FakeClient, message, open_panel, use
+    server.add("/r3-stop", STOP_PAGE, "text/html; charset=utf-8")
+    tab = window.current_tab()
+    settled_load(tab, server.url("/r3-stop"))
+    page_text = tool(fg, window, "read_page")["c"]
+    name, send = label_of(page_text, "Name"), label_of(page_text, "Send")
+    for doing, step in (("Typing", use("type_text", label=name, text="hello", submit=True)), ("Clicking", use("click", label=send))):
+        client = FakeClient(message(step))
+        panel = open_panel(window, client)
+        stop = lambda kind, text, doing=doing: QTimer.singleShot(0, panel.session.stop) if (kind, text) == ("doing", doing) else None
+        panel.session.transcript.connect(stop)
+        before = len(server.requests)
+        panel.input.setPlainText("Go")
+        panel.submit()
+        wait_until(lambda: not panel.session.running, 30, "Claude to stop")
+        spin(2.5)
+        panel.session.transcript.disconnect(stop)
+        assert run_js(tab.page, "document.getElementById('name').value") == ""
+        assert run_js(tab.page, "keys.length") == 0
+        assert run_js(tab.page, "document.title") == "Message"
+        assert not {"/r3-submitted", "/r3-sent"} & set(server.requests[before:])
+
+
+# F2: while Claude works on a page, its alert() is closed at once and told to Claude; a confirm() is the user's to
+# answer, and Claude is told about it at once (not after a time-out)
+def message_boxes():
+    from PyQt6.QtWidgets import QApplication, QMessageBox
+    return [w for w in QApplication.topLevelWidgets() if isinstance(w, QMessageBox) and w.isVisible()]
+
+
+def test_page_dialogs_while_claude_works(fg, window, server):
+    server.add("/r3-alert", b"""<!doctype html><html><head><title>Alert</title></head><body>
+<button onclick="alert('Saved!'); document.title = 'after alert'">Go</button>
+<button onclick="document.title = confirm('Delete it?') ? 'deleted' : 'kept'">Delete</button></body></html>""",
+               "text/html; charset=utf-8")
+    tab = window.current_tab()
+    settled_load(tab, server.url("/r3-alert"))
+    page_text = tool(fg, window, "read_page")["c"]
+    browser, box, seen = window._test_agent_browser, {}, []
+    QTimer.singleShot(1500, lambda: seen.append(len(message_boxes())))
+    t0 = time.monotonic()
+    browser.run("click", {"label": label_of(page_text, "Go")},
+                lambda c, e=False, log="": box.setdefault("click", (c, e, log, time.monotonic() - t0)))
+    wait_until(lambda: "click" in box and seen, 30, "the click")
+    content, error, log_line, took = box["click"]
+    assert not error and "Saved!" in content and "alert" in content and "alert" in log_line and took < 3, (content, took)
+    assert seen == [0]  # (no dialog was shown)
+    assert run_js(tab.page, "document.title") == "after alert"
+    # a confirm(): the user answers it; Claude hears of it at once, and the page waits
+    box.clear()
+
+    def later_read() -> None:
+        t1 = time.monotonic()
+        browser.run("read_page", {}, lambda c, e=False, log="": box.setdefault("read", (c, e, time.monotonic() - t1)))
+
+    def answer() -> None:
+        boxes = message_boxes()
+        box["boxes"] = len(boxes)
+        for w in boxes:
+            w.done(0)
+    QTimer.singleShot(3000, later_read)  # (these run in the dialog's own event loop)
+    QTimer.singleShot(5000, answer)
+    t0 = time.monotonic()
+    browser.run("click", {"label": label_of(page_text, "Delete")},
+                lambda c, e=False, log="": box.setdefault("click", (c, e, time.monotonic() - t0)))
+    wait_until(lambda: {"click", "read", "boxes"} <= set(box), 30, "the dialog to be answered")
+    content, error, took = box["click"]
+    assert box["boxes"] == 1
+    assert error and "Delete it?" in content and "confirm" in content and took < 3, (content, took)
+    content, error, took = box["read"]
+    assert error and "Delete it?" in content and took < 1, (content, took)
+    result = tool(fg, window, "read_page")  # (answered: the page works again)
+    assert not result["e"] and "Delete" in result["c"]
+    assert run_js(tab.page, "document.title") == "kept"
+    # Claude done: the page's alerts are the user's again
+    browser.cancel()
+    seen.clear()
+
+    def look() -> None:
+        seen.append(len(message_boxes()))
+        for w in message_boxes():
+            w.done(0)
+    QTimer.singleShot(1500, look)
+    run_js(tab.page, "setTimeout(() => alert('for the user'), 0); 1")
+    wait_until(lambda: seen, 20, "the alert")
+    assert seen == [1]
+
+
+# F3: dialogs that open while the app is in the background are covered at once - a page's alert() too
+def test_dialogs_opened_in_the_background_are_covered(fg, window, server, qapp):
+    from PyQt6.QtWidgets import QApplication, QMessageBox
+    server.add("/r3-bg-alert", b"<!doctype html><title>Timer</title><p>hi</p>", "text/html; charset=utf-8")
+    tab = window.current_tab()
+    settled_load(tab, server.url("/r3-bg-alert"))
+    seen = {}
+
+    def look() -> None:
+        boxes = [w for w in QApplication.topLevelWidgets() if isinstance(w, QMessageBox) and w.isVisible()]
+        screens = [w.findChild(fg.PrivacyScreen, options=Qt.FindChildOption.FindDirectChildrenOnly) for w in boxes]
+        seen["alert"] = [(s is not None and s.covering and s.isVisible()) for s in screens]
+        for w in boxes:
+            w.done(0)
+    try:
+        qapp.applicationStateChanged.emit(INACTIVE)
+        spin(0.2)
+        window.show_history()
+        history = window._dialogs["history"]
+        QGuiApplication.processEvents()
+        screen = history.findChild(fg.PrivacyScreen, options=Qt.FindChildOption.FindDirectChildrenOnly)
+        assert screen is not None and screen.covering and screen.isVisible() and screen.opacity == 1.0
+        QTimer.singleShot(1500, look)
+        run_js(tab.page, "setTimeout(() => alert('secret page text'), 0); 1")
+        wait_until(lambda: "alert" in seen, 20, "the alert")
+        assert seen["alert"] == [True]
+    finally:
+        qapp.applicationStateChanged.emit(ACTIVE)
+
+
+# F4: quitting with a password manager edit dialog open
+def test_quit_with_an_edit_dialog_open(fg, harness, vault):
+    win = harness.window()
+    win.show_autofill_settings()
+    dialog = win._dialogs["autofill"]
+    spin(0.2)
+    QTimer.singleShot(300, dialog.close)  # (what closing the window does to it; it deletes itself, and the edit dialog)
+    dialog.add_password()  # (modal, until then: no RuntimeError once it returns)
+    spin(0.3)
+    assert sip.isdeleted(dialog)
+
+
+# F5: a filled-in password doesn't cost the tab its back/forward list
+def test_history_is_kept_after_a_password_was_filled(fg, window, server):
+    secret = "Pa55-Filled-In!"
+    server.add("/r3-signin", LOGIN.encode(), "text/html; charset=utf-8")
+    server.add("/r3-a", b"<!doctype html><title>A</title>", "text/html; charset=utf-8")
+    server.add("/r3-b", b"<!doctype html><title>B</title>", "text/html; charset=utf-8")
+    tab = window.current_tab()
+    assert load(tab.page, server.url("/r3-signin"))
+    run_js(tab.page, f"document.getElementById('user').value = 'alice'; document.getElementById('pass').value = {json.dumps(secret)}; 1")
+    fill_secret(window, tab, secret)
+    for path in ("/r3-a", "/r3-b"):
+        assert load(tab.page, server.url(path))
+    spin(0.5)
+    entry = tab.session_entry()
+    assert "history" in entry
+    blob = base64.b64decode(entry["history"])
+    assert secret.encode("utf-16-le") not in blob and secret.encode() not in blob
+    # ... unless the password is in it after all (a "show password" button made the field a text field)
+    assert load(tab.page, server.url("/r3-signin"))
+    run_js(tab.page, f"const p = document.getElementById('pass'); p.type = 'text'; p.value = {json.dumps(secret)}; 1")
+    assert load(tab.page, server.url("/r3-a"))
+    spin(0.5)
+    if secret.encode("utf-16-le") in bytes(base64.b64decode(tab_history(tab))):
+        assert "history" not in tab.session_entry()
+
+
+def tab_history(tab) -> bytes:
+    from PyQt6.QtCore import QByteArray, QDataStream, QIODevice
+    data = QByteArray()
+    stream = QDataStream(data, QIODevice.OpenModeFlag.WriteOnly)
+    stream << tab.page.history()
+    return bytes(data.toBase64())

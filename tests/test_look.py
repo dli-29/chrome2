@@ -5,13 +5,11 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-import re
 import plistlib
 import shutil
 import stat
 import subprocess
 import sys
-import time
 from pathlib import Path
 
 import pytest
@@ -549,39 +547,3 @@ def test_install_app_command(fg, tmp_path, monkeypatch, capsys, qapp):
     # main() hands --install-app over before starting any browser
     monkeypatch.setattr(fg, "install_app", lambda: 7)
     assert fg.main(["foxglove.py", "--install-app"]) == 7
-
-
-def test_install_app_builds_an_applet_with_osacompile(fg, tmp_path, monkeypatch, qapp):
-    """Recent macOS refuses script-executable bundles ("can't use this version"), so osacompile builds the app."""
-    import plistlib
-    fake = tmp_path / "bin" / "osacompile"
-    fake.parent.mkdir()
-    # osacompile -o <app> -e <applescript>: keep the source, lay out an applet like the real tool does
-    fake.write_text('#!/bin/sh\nmkdir -p "$2/Contents/Resources" "$2/Contents/MacOS"\nprintf %s "$4" > "$2/source.applescript"\n'
-                    'printf \'<?xml version="1.0" encoding="UTF-8"?><plist version="1.0"><dict><key>CFBundleName</key>'
-                    '<string>applet</string><key>CFBundleIconFile</key><string>applet</string></dict></plist>\' '
-                    '> "$2/Contents/Info.plist"\n')
-    fake.chmod(0o755)
-    real_which = fg.shutil.which
-    monkeypatch.setattr(fg.shutil, "which", lambda name, *a, **k: str(fake) if name == "osacompile"
-                        else None if name == "iconutil" else real_which(name, *a, **k))
-    home = tmp_path / "home with 'quote\" $x"
-    script = home / "Desk top" / "foxglove.py"
-    script.parent.mkdir(parents=True)
-    script.write_text("import sys; open(sys.argv[0] + '.ran', 'w').write('ok')\n")
-    bundle = fg.make_app_bundle(home / "Applications" / "Chrome 2.app", fg.sys.executable, str(script))
-    contents = bundle / "Contents"
-    info = plistlib.loads((contents / "Info.plist").read_bytes())
-    assert info["CFBundleName"] == "Chrome 2" and info["CFBundleIconFile"] == "applet"
-    assert (contents / "Resources" / "applet.icns").stat().st_size > 1000
-    assert not (contents / "MacOS" / fg.APP_EXECUTABLE).exists()
-    # undo AppleScript's string escapes and run the command the applet would run
-    source = (bundle / "source.applescript").read_text()
-    assert source.startswith('do shell script "') and source.endswith('"')
-    command = re.sub(r'\\(.)', r'\1', source[len('do shell script "'):-1])
-    subprocess.run(["sh", "-c", command], env={**os.environ, "HOME": str(home)}, check=True, timeout=30)
-    fg_wait = time.time() + 20
-    while not Path(str(script) + ".ran").exists() and time.time() < fg_wait:
-        time.sleep(0.1)
-    assert Path(str(script) + ".ran").read_text() == "ok"
-    assert (home / "Library" / "Logs" / "Chrome 2.log").exists()

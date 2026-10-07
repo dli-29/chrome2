@@ -49,8 +49,8 @@ and runs `~/chrome2-env/bin/python3 ~/Desktop/temp/foxglove.py`. The repo must b
 and anonymous downloads.
 
 ## User's machine (for instructions)
-- `foxglove.py` lives at `~/Desktop/temp/foxglove.py`; the repo is private-by-default in their mind, so send them
-  updated files directly (SendUserFile) rather than expecting them to pull from git.
+- `foxglove.py` lives at `~/Desktop/temp/foxglove.py`. They don't use git: after a change, send them the updated
+  file directly (SendUserFile) and tell them to replace that copy.
 - Environments: `~/chrome2-env` (codec engine, preferred), `~/foxglove-env` (old pip PyQt6, fallback).
 - They use a paid residential HTTP proxy in the browser's VPN panel and can't browse without it.
 

@@ -2042,6 +2042,9 @@ class Settings(QObject):
         "ask_download_location": False,
         "website_appearance": "dark",
         "force_dark_pages": False,
+        "offer_to_save_passwords": True,   # Autofill and passwords (Chrome's three switches)
+        "autofill_addresses": True,
+        "autofill_payments": True,
         "site_zoom": {},
         "site_permissions": {},  # origin -> {permission type name: "allow"/"block"} for the ones Qt doesn't remember
         "vpn": {"mode": "off", "type": "socks5", "host": "", "port": 1080, "username": "", "password": ""},
@@ -6577,6 +6580,9 @@ class WebPage(QWebEnginePage):
         self.proxyAuthenticationRequired.connect(lambda url, auth, host: self._on_authentication(url, auth, proxy=host))
 
     def javaScriptConsoleMessage(self, level, message, line, source) -> None:  # keep the terminal quiet
+        if message.startswith(AUTOFILL_POKE) and (autofill := Autofill.of(self.profile())) is not None \
+                and autofill.poked(self, message):
+            return  # (autofill's page script: never shown or logged)
         if VERBOSE:
             log(f"console {source}:{line}: {message}")
 
@@ -7093,6 +7099,9 @@ class UrlBar(QLineEdit):
         self.zoom_action = QAction(self)
         self.zoom_action.setVisible(False)
         self.addAction(self.zoom_action, QLineEdit.ActionPosition.TrailingPosition)
+        self.autofill_action = QAction(icon("key", P.TEXT_2), "Passwords", self)  # saved passwords, offers to save
+        self.autofill_action.setVisible(False)
+        self.addAction(self.autofill_action, QLineEdit.ActionPosition.TrailingPosition)
         self.star = QAction(icon("star", P.TEXT_2), "Bookmark this page", self)
         self.addAction(self.star, QLineEdit.ActionPosition.TrailingPosition)
         self.model = QStandardItemModel(self)
@@ -8379,7 +8388,7 @@ class ClearDataDialog(QDialog):
         self.cache.setChecked(True)
         for box in (self.history, self.cookies, self.cache):
             layout.addWidget(box)
-        layout.addWidget(tone_label("Your open tabs and bookmarks are not affected.", "dim"))
+        layout.addWidget(tone_label("Your open tabs, bookmarks and saved passwords are not affected.", "dim"))
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
         buttons.button(QDialogButtonBox.StandardButton.Ok).setText("Clear Now")
         buttons.accepted.connect(self._clear)
@@ -8844,6 +8853,15 @@ class SettingsDialog(QDialog):
         network_row.addWidget(vpn_button)
         layout.addLayout(network_row)
 
+        section("Autofill and passwords")
+        autofill_row = QHBoxLayout()
+        for text, key in (("Password Manager…", "passwords"), ("Payment methods…", "payments"), ("Addresses and more…", "addresses")):
+            button = make_button(text)
+            button.clicked.connect(lambda *_, k=key: win.show_autofill_settings(k))
+            autofill_row.addWidget(button)
+        autofill_row.addStretch(1)
+        layout.addLayout(autofill_row)
+
         section("Privacy")
         privacy_row = QHBoxLayout()
         sites = make_button("Site Settings and Cookies…")
@@ -9167,6 +9185,2097 @@ class VpnPanel(Panel):
 
 
 # ══════════════════════════════════════════════════════════════════════════════════════════
+#  Autofill and passwords
+# ══════════════════════════════════════════════════════════════════════════════════════════
+# Chrome's password manager and form autofill. Passwords and card numbers live only in the system keychain
+# (SecretStore); sites, usernames, addresses and the last digits of cards in autofill.json (your user only). In web
+# pages a script in an isolated world of its own (AUTOFILL_WORLD) finds login, address and payment forms: page scripts
+# can't see it, call it or read what it holds. When it has news it logs a console message that carries no data (a
+# "poke", which pages can't read); the browser then collects the news from that frame's isolated world. Saved data goes
+# into a page only when you pick it from the browser's own suggestion list - and only into the frame it was offered for.
+AUTOFILL_WORLD = 3                     # (APP_WORLD 1: other internal scripts; 4: the AI agent; 16+: extensions)
+KEYCHAIN_SERVICE = "Chrome 2"          # the keychain items' service: fixed, so renaming the app never orphans them
+AUTOFILL_SCRIPT = "chrome2-autofill"
+AUTOFILL_POKE = "⁣chrome2-autofill:"  # + a per-run token + the frame's address
+
+ICONS.update({
+    "key": '<circle cx="7.5" cy="15.5" r="4.5"/><path d="m10.7 12.3 9.8-9.8M17 6l3 3M14.5 8.5l2.5 2.5"/>',
+    "card": '<rect x="2.5" y="5" width="19" height="14" rx="2"/><path d="M2.5 10h19M6 15h4"/>',
+    "pin": '<path d="M19.5 10c0 6-7.5 12-7.5 12s-7.5-6-7.5-12a7.5 7.5 0 0 1 15 0z"/><circle cx="12" cy="10" r="2.6"/>',
+    "eye": '<path d="M1.5 12S5.5 4.5 12 4.5 22.5 12 22.5 12 18.5 19.5 12 19.5 1.5 12 1.5 12z"/><circle cx="12" cy="12" r="3"/>',
+    "eye-off": '<path d="M17.9 17.9A10 10 0 0 1 12 19.5C5.5 19.5 1.5 12 1.5 12a18 18 0 0 1 5-5.9M9.9 4.7A9 9 0 0 1 12 4.5'
+               'c6.5 0 10.5 7.5 10.5 7.5a18 18 0 0 1-2.2 3.2M14.1 14.1a3 3 0 1 1-4.2-4.2M2 2l20 20"/>',
+    "copy": '<rect x="9" y="9" width="12" height="12" rx="2"/><path d="M5 15H4.5A1.5 1.5 0 0 1 3 13.5v-9A1.5 1.5 0 0 1 4.5 3h9'
+            'A1.5 1.5 0 0 1 15 4.5V5"/>',
+})
+
+
+class SecretStore:
+    """Secrets - saved passwords, card numbers, API keys - in the system keychain (macOS Keychain, Windows Credential
+    Locker, the Secret Service on Linux) through Python's keyring package, all under one service name. Nothing secret is
+    written anywhere else: not to files, settings or logs. Without keyring (or a keychain it can use) secrets can't be
+    kept: available() is False and problem() says why. Shared by everything that keeps a secret: secret_store()."""
+    INSTALL = "pip install keyring"
+
+    def __init__(self, service: str = KEYCHAIN_SERVICE):
+        self.service = service
+        self._backend = None
+        self._problem: str | None = None  # None: not looked for yet; "": usable
+
+    def _keyring(self):
+        if self._problem is None:
+            try:
+                import keyring  # optional: everything else works without it
+                backend = keyring.get_keyring()
+            except ImportError:
+                self._problem = ("Python's keyring package isn't installed, so passwords and cards can't be saved. "
+                                 f"Install it with:  {self.INSTALL}")
+            except Exception as exc:  # a broken keyring configuration
+                self._problem = f"The system keychain can't be used ({type(exc).__name__}), so passwords and cards can't be saved."
+            else:
+                kind = f"{type(backend).__module__}.{type(backend).__name__}"
+                try:
+                    priority = float(backend.priority)
+                except Exception:
+                    priority = 0.0
+                if priority <= 0 or kind.startswith(("keyring.backends.fail", "keyring.backends.null")):
+                    self._problem = ("keyring found no system keychain to use, so passwords and cards can't be saved. On Linux "
+                                     "install a Secret Service (GNOME Keyring or KWallet), or:  pip install keyrings.alt")
+                else:
+                    self._backend, self._problem = backend, ""
+        return self._backend
+
+    def available(self) -> bool:
+        return self._keyring() is not None
+
+    def problem(self) -> str:
+        self._keyring()
+        return self._problem or ""
+
+    def get(self, key: str) -> str | None:
+        backend = self._keyring()
+        if backend is None:
+            return None
+        try:
+            value = backend.get_password(self.service, key)
+        except Exception as exc:
+            log(f"Couldn't read from the keychain ({type(exc).__name__})")  # (never the item or the error's text)
+            return None
+        return value if isinstance(value, str) else None
+
+    def set(self, key: str, value: str) -> bool:
+        backend = self._keyring()
+        if backend is None:
+            return False
+        try:
+            backend.set_password(self.service, key, value)
+            return True
+        except Exception as exc:
+            log(f"Couldn't save to the keychain ({type(exc).__name__})")
+            return False
+
+    def delete(self, key: str) -> bool:
+        backend = self._keyring()
+        if backend is None:
+            return False
+        try:
+            backend.delete_password(self.service, key)
+            return True
+        except Exception:  # (also: it wasn't there)
+            return self.get(key) is None
+
+
+_secret_store: SecretStore | None = None
+
+
+def secret_store() -> SecretStore:
+    """The app's one SecretStore (KEYCHAIN_SERVICE)."""
+    global _secret_store
+    if _secret_store is None:
+        _secret_store = SecretStore()
+    return _secret_store
+
+
+def write_private_json(path: Path, data) -> bool:
+    """write_json for a file only your user may read (0600 from the moment it exists)."""
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+        with os.fdopen(os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "w", encoding="utf-8") as fh:
+            if os.name == "posix":
+                os.fchmod(fh.fileno(), 0o600)  # (a temp file left from before kept its mode)
+            json.dump(data, fh, ensure_ascii=False, indent=1)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, path)
+        return True
+    except (OSError, TypeError, ValueError) as exc:
+        log(f"Could not save {path.name}: {exc}")
+        return False
+
+
+def secure_origin(origin: str) -> bool:
+    """Whether autofill treats a frame as secure: https, or this computer (like Chrome)."""
+    url = QUrl(origin)
+    host = url.host().lower()
+    return url.scheme() == "https" or host in ("localhost", "::1") or host.endswith(".localhost") or \
+        bool(re.fullmatch(r"127(?:\.\d{1,3}){3}", host))
+
+
+def same_document(a: QUrl, b: QUrl) -> bool:
+    fragment = QUrl.UrlFormattingOption.RemoveFragment
+    return a.adjusted(fragment) == b.adjusted(fragment)
+
+
+def luhn_ok(number: str) -> bool:
+    if not re.fullmatch(r"\d{12,19}", number):
+        return False
+    total = 0
+    for i, ch in enumerate(reversed(number)):
+        d = int(ch) * (2 if i % 2 else 1)
+        total += d - 9 if d > 9 else d
+    return total % 10 == 0
+
+
+def card_network(number: str) -> str:
+    for name, pattern in (("Visa", r"4"), ("Mastercard", r"5[1-5]|2[2-7]"), ("American Express", r"3[47]"),
+                          ("Discover", r"6011|65|64[4-9]"), ("JCB", r"35"), ("Diners Club", r"30[0-5]|3[689]"),
+                          ("UnionPay", r"62"), ("Maestro", r"5[06-9]|6")):
+        if re.match(pattern, number):
+            return name
+    return "Card"
+
+
+def card_label(card: dict) -> str:
+    return f"{card.get('network') or 'Card'} •••• {card.get('last4', '')}"
+
+
+def card_expiry(card: dict) -> str:
+    month, year = card.get("month", ""), card.get("year", "")
+    return f"{month}/{year[-2:]}" if month and year else ""
+
+
+def parse_expiry(month: str = "", year: str = "", both: str = "") -> tuple[str, str]:
+    """("MM", "YYYY") from what a form had: separate month and year, or "12/30", "12 / 2030", "1230"..."""
+    if both and not (month and year):
+        digits = re.findall(r"\d+", both)
+        if len(digits) >= 2:
+            month, year = digits[0], digits[1]
+        elif len(digits) == 1 and len(digits[0]) in (4, 6):
+            month, year = digits[0][:2], digits[0][2:]
+    month = re.sub(r"\D", "", month or "")
+    year = re.sub(r"\D", "", year or "")
+    if not month or not year or not 1 <= int(month) <= 12 or len(year) not in (2, 4):
+        return "", ""
+    return f"{int(month):02d}", year if len(year) == 4 else f"20{year}"
+
+
+US_STATES = dict(zip(
+    "AL AK AZ AR CA CO CT DE DC FL GA HI ID IL IN IA KS KY LA ME MD MA MI MN MS MO MT NE NV NH NJ NM NY NC ND OH OK OR PA RI "
+    "SC SD TN TX UT VT VA WA WV WI WY".split(),
+    ("Alabama", "Alaska", "Arizona", "Arkansas", "California", "Colorado", "Connecticut", "Delaware", "District of Columbia",
+     "Florida", "Georgia", "Hawaii", "Idaho", "Illinois", "Indiana", "Iowa", "Kansas", "Kentucky", "Louisiana", "Maine",
+     "Maryland", "Massachusetts", "Michigan", "Minnesota", "Mississippi", "Missouri", "Montana", "Nebraska", "Nevada",
+     "New Hampshire", "New Jersey", "New Mexico", "New York", "North Carolina", "North Dakota", "Ohio", "Oklahoma", "Oregon",
+     "Pennsylvania", "Rhode Island", "South Carolina", "South Dakota", "Tennessee", "Texas", "Utah", "Vermont", "Virginia",
+     "Washington", "West Virginia", "Wisconsin", "Wyoming")))
+ADDRESS_FIELDS = ("name", "organization", "line1", "line2", "city", "state", "zip", "country", "phone", "email")
+CARD_FIELDS = ("name", "nickname", "network", "last4", "month", "year")
+
+
+def country_names(value: str) -> list[str]:
+    """A country as forms may list it: what was saved, its ISO code and its English name."""
+    value = value.strip()
+    if not value:
+        return []
+    names = [value]
+    anywhere = QLocale.Country.AnyCountry  # (PyQt6 names Qt's Territory enum "Country")
+    territory = QLocale.codeToTerritory(value) if re.fullmatch(r"[A-Za-z]{2}", value) else anywhere
+    if territory == anywhere:
+        wanted = value.lower()
+        territory = next((t for t in QLocale.Country if t != anywhere and QLocale.territoryToString(t).lower() == wanted), anywhere)
+    if territory != anywhere:
+        names += [QLocale.territoryToCode(territory), QLocale.territoryToString(territory)]
+        names += {"US": ["USA", "United States of America"], "GB": ["UK", "Great Britain"]}.get(QLocale.territoryToCode(territory), [])
+    return list(dict.fromkeys(names))
+
+
+def address_summary(address: dict, include_name: bool = False) -> str:
+    place = " ".join(p for p in (address.get("state", ""), address.get("zip", "")) if p)
+    parts = ([address.get("name", "")] if include_name else []) + \
+        [address.get(k, "") for k in ("line1", "line2", "city")] + [place, address.get("country", "")]
+    return ", ".join(p for p in parts if p)
+
+
+def address_from_form(found: dict) -> dict:
+    """A saved-address record from the fields a form had (canonical types -> values)."""
+    get = lambda key: " ".join(str(found.get(key) or "").split())  # noqa: E731
+    name = get("name") or " ".join(p for p in (get("given"), get("additional"), get("family")) if p)
+    street = [line.strip() for line in str(found.get("street") or "").replace("\r", "").split("\n") if line.strip()]
+    line1 = get("line1") or (street[0] if street else "")
+    line2 = get("line2") or (", ".join(street[1:]) if len(street) > 1 else "")
+    return {"name": name, "organization": get("organization"), "line1": line1, "line2": line2, "city": get("city"),
+            "state": get("state"), "zip": get("zip"), "country": get("country"), "phone": get("phone"), "email": get("email")}
+
+
+def address_fill_values(address: dict) -> dict:
+    """What the page script fills an address form with: each field type, and the spellings a <select> may use."""
+    name = address.get("name", "").split()
+    state = address.get("state", "")
+    states = [state] + ([US_STATES[state.upper()]] if state.upper() in US_STATES else
+                        [code for code, full in US_STATES.items() if full.lower() == state.lower()])
+    return {**{k: address.get(k, "") for k in ADDRESS_FIELDS},
+            "given": " ".join(name[:-1]) if len(name) > 1 else " ".join(name), "family": name[-1] if len(name) > 1 else "",
+            "additional": "", "states": [s for s in states if s], "countries": country_names(address.get("country", ""))}
+
+
+def address_value(address: dict, kind: str) -> str:
+    """The value of one field type of a saved address (what the suggestion list shows for the field)."""
+    values = address_fill_values(address)
+    if kind == "street":
+        return ", ".join(p for p in (values["line1"], values["line2"]) if p)
+    return str(values.get(kind) or "") if kind not in ("states", "countries") else ""
+
+
+class AutofillData(QObject):
+    """What autofill keeps for a profile, in autofill.json (readable by your user only): saved logins (origin and
+    username - each password only in the keychain), sites never to offer saving for, addresses, and payment cards (name,
+    network, last 4 digits, expiry - the number only in the keychain, the security code nowhere)."""
+    changed = pyqtSignal()
+
+    def __init__(self, path: Path, store: SecretStore):
+        super().__init__()
+        self.path, self.store = path, store
+        data = read_json(path, {})
+        data = data if isinstance(data, dict) else {}
+
+        def records(name: str, fields: tuple) -> list[dict]:
+            found = data.get(name) if isinstance(data.get(name), list) else []
+            return [{"id": r["id"], **{k: str(r.get(k) or "") for k in fields}} for r in found
+                    if isinstance(r, dict) and isinstance(r.get("id"), str) and re.fullmatch(r"[0-9a-f]{8,32}", r["id"])]
+
+        self.logins = [dict(r, used=self._number(r.get("used")), created=self._number(r.get("created")))
+                       for r in records("passwords", ("origin", "username", "used", "created")) if origin_of(QUrl(r["origin"])) == r["origin"]]
+        self.never = [o for o in (data.get("never_save") if isinstance(data.get("never_save"), list) else [])
+                      if isinstance(o, str) and origin_of(QUrl(o)) == o]
+        self.addresses = records("addresses", ADDRESS_FIELDS)
+        self.cards = records("cards", CARD_FIELDS)
+
+    @staticmethod
+    def _number(value) -> int:
+        try:
+            return int(float(value))
+        except (TypeError, ValueError):
+            return 0
+
+    def save(self) -> None:
+        write_private_json(self.path, {"version": 1, "passwords": self.logins, "never_save": self.never,
+                                       "addresses": self.addresses, "cards": self.cards})
+        self.changed.emit()
+
+    # passwords
+    @staticmethod
+    def same_site(saved: str, origin: str) -> bool:
+        """Chrome's public-suffix match: another host of the same site with the same scheme and port (a login saved on
+        www.example.com, offered - with its domain shown - on accounts.example.com). Never for IP addresses."""
+        a, b = QUrl(saved), QUrl(origin)
+        host_a, host_b = a.host().lower(), b.host().lower()
+        if a.scheme() != b.scheme() or a.port(-1) != b.port(-1) or host_a == host_b or "." not in host_a or "." not in host_b:
+            return False
+        if re.fullmatch(r"[\d.]+|[0-9a-f:]+", host_a) or re.fullmatch(r"[\d.]+|[0-9a-f:]+", host_b):
+            return False
+        site = site_of(host_a)
+        return site == site_of(host_b) and site not in PUBLIC_SUFFIXES and "." in site
+
+    def logins_for(self, origin: str) -> list[tuple[dict, bool]]:
+        """Saved logins for a frame at *origin*: (login, exact) - its own first, then the same site's (exact False)."""
+        def order(r):
+            return -r.get("used", 0), r["username"].lower()
+        exact = sorted((r for r in self.logins if r["origin"] == origin), key=order)
+        other = sorted((r for r in self.logins if r["origin"] != origin and self.same_site(r["origin"], origin)), key=order)
+        return [(r, True) for r in exact] + [(r, False) for r in other]
+
+    def login(self, entry_id: str) -> dict | None:
+        return next((r for r in self.logins if r["id"] == entry_id), None)
+
+    def find_login(self, origin: str, username: str) -> dict | None:
+        return next((r for r in self.logins if r["origin"] == origin and r["username"] == username), None)
+
+    def password(self, entry_id: str) -> str | None:
+        return self.store.get(f"password:{entry_id}")
+
+    def add_login(self, origin: str, username: str, password: str) -> dict | None:
+        existing = self.find_login(origin, username)
+        if existing is not None:
+            return existing if self.update_login(existing["id"], password=password) else None
+        now = int(time.time())
+        entry = {"id": uuid.uuid4().hex, "origin": origin, "username": username, "used": now, "created": now}
+        if not password or not self.store.set(f"password:{entry['id']}", password):
+            return None
+        self.logins.append(entry)
+        self.allow_saving(origin, save=False)
+        self.save()
+        return entry
+
+    def update_login(self, entry_id: str, username: str | None = None, password: str | None = None) -> bool:
+        entry = self.login(entry_id)
+        if entry is None or (username is not None and username != entry["username"]
+                             and self.find_login(entry["origin"], username) is not None):
+            return False
+        if password is not None and (not password or not self.store.set(f"password:{entry_id}", password)):
+            return False
+        if username is not None:
+            entry["username"] = username
+        entry["used"] = int(time.time())
+        self.save()
+        return True
+
+    def touch_login(self, entry_id: str) -> None:
+        entry = self.login(entry_id)
+        if entry is not None:
+            entry["used"] = int(time.time())
+            self.save()
+
+    def delete_login(self, entry_id: str) -> None:
+        self.logins = [r for r in self.logins if r["id"] != entry_id]
+        self.save()
+        self.store.delete(f"password:{entry_id}")
+
+    def never_saved(self, origin: str) -> bool:
+        return origin in self.never
+
+    def never_save(self, origin: str) -> None:
+        if origin and origin not in self.never:
+            self.never.append(origin)
+            self.save()
+
+    def allow_saving(self, origin: str, save: bool = True) -> None:
+        if origin in self.never:
+            self.never.remove(origin)
+            if save:
+                self.save()
+
+    # addresses
+    def address(self, entry_id: str) -> dict | None:
+        return next((r for r in self.addresses if r["id"] == entry_id), None)
+
+    @staticmethod
+    def _address_key(values: dict) -> tuple:
+        squash = lambda s: re.sub(r"[^a-z0-9]", "", str(s).lower())  # noqa: E731
+        return squash(values.get("line1", "")), squash(values.get("zip", "")) or squash(values.get("city", ""))
+
+    def has_address(self, values: dict) -> bool:
+        key = self._address_key(values)
+        return any(self._address_key(r) == key for r in self.addresses)
+
+    def add_address(self, values: dict) -> dict:
+        entry = {"id": uuid.uuid4().hex, **{k: str(values.get(k) or "").strip() for k in ADDRESS_FIELDS}}
+        self.addresses.append(entry)
+        self.save()
+        return entry
+
+    def update_address(self, entry_id: str, values: dict) -> None:
+        entry = self.address(entry_id)
+        if entry is not None:
+            entry.update({k: str(values.get(k) or "").strip() for k in ADDRESS_FIELDS})
+            self.save()
+
+    def delete_address(self, entry_id: str) -> None:
+        self.addresses = [r for r in self.addresses if r["id"] != entry_id]
+        self.save()
+
+    # payment cards
+    def card(self, entry_id: str) -> dict | None:
+        return next((r for r in self.cards if r["id"] == entry_id), None)
+
+    def card_number(self, entry_id: str) -> str | None:
+        return self.store.get(f"card:{entry_id}")
+
+    def find_card(self, number: str) -> dict | None:
+        return next((c for c in self.cards if c["last4"] == number[-4:] and self.card_number(c["id"]) == number), None)
+
+    def add_card(self, number: str, name: str = "", month: str = "", year: str = "", nickname: str = "") -> dict | None:
+        number = re.sub(r"\D", "", number)
+        if not luhn_ok(number):
+            return None
+        existing = self.find_card(number)
+        if existing is not None:
+            self.update_card(existing["id"], name=name or existing["name"], month=month or existing["month"],
+                             year=year or existing["year"], nickname=nickname or existing["nickname"])
+            return existing
+        entry = {"id": uuid.uuid4().hex, "name": name.strip(), "nickname": nickname.strip(), "network": card_network(number),
+                 "last4": number[-4:], "month": month, "year": year}
+        if not self.store.set(f"card:{entry['id']}", number):
+            return None
+        self.cards.append(entry)
+        self.save()
+        return entry
+
+    def update_card(self, entry_id: str, number: str | None = None, **values) -> bool:
+        entry = self.card(entry_id)
+        if entry is None:
+            return False
+        if number:
+            number = re.sub(r"\D", "", number)
+            if not luhn_ok(number) or not self.store.set(f"card:{entry_id}", number):
+                return False
+            entry.update(network=card_network(number), last4=number[-4:])
+        entry.update({k: str(v).strip() for k, v in values.items() if k in ("name", "nickname", "month", "year")})
+        self.save()
+        return True
+
+    def delete_card(self, entry_id: str) -> None:
+        self.cards = [r for r in self.cards if r["id"] != entry_id]
+        self.save()
+        self.store.delete(f"card:{entry_id}")
+
+
+# The page side. It runs in every frame of every web page, in AUTOFILL_WORLD; nothing it holds is reachable from the
+# page's own scripts. Forms are grouped like Chrome does (a <form>, else every form-less field of the document); fields
+# are typed by their autocomplete attribute first, then by name/id/placeholder/label.
+AUTOFILL_JS = r"""(() => {
+  if (!/^https?:$/.test(location.protocol) || typeof __fgAutofill !== "undefined") return;
+  const POKE = __POKE__;
+  const queue = [];
+  let poked = false, filling = false, focused = 0, lastInput = -1e9, scrolled = 0;
+  const send = (event) => {
+    queue.push(event);
+    if (queue.length > 40) queue.splice(0, queue.length - 40);
+    if (!poked) { poked = true; queueMicrotask(() => { poked = false; console.debug(POKE + location.href); }); }
+  };
+  const ids = new WeakMap(), refs = new Map();
+  let nextId = 1;
+  const idOf = (el) => {
+    let id = ids.get(el);
+    if (!id) { id = nextId++; ids.set(el, id); refs.set(id, new WeakRef(el)); }
+    return id;
+  };
+  const byId = (id) => { const ref = refs.get(id), el = ref && ref.deref(); return el && el.isConnected ? el : null; };
+  const TEXTY = new Set(["text", "email", "tel", "number", "search", "url", "password"]);
+  const everPassword = new WeakSet();  // also once a "show password" button made it type=text
+  const isInput = (el) => el instanceof HTMLInputElement;
+  const fieldish = (el) => !!el && ((isInput(el) && TEXTY.has(el.type)) || el instanceof HTMLSelectElement || el instanceof HTMLTextAreaElement);
+  const isPassword = (el) => isInput(el) && (el.type === "password" || everPassword.has(el));
+  const deepActive = () => {
+    let a = document.activeElement;
+    while (a && a.shadowRoot && a.shadowRoot.activeElement) a = a.shadowRoot.activeElement;
+    return a;
+  };
+  const shown = (el) => {
+    if (el === deepActive()) return true;
+    const r = el.getBoundingClientRect();
+    if (r.width < 2 || r.height < 2) return false;
+    const s = getComputedStyle(el);
+    return s.visibility !== "hidden" && s.display !== "none";
+  };
+  const tokens = (el) => (el.getAttribute("autocomplete") || "").toLowerCase().trim().split(/\s+/)
+    .filter((t) => t && !/^(section-.*|shipping|billing|home|work|mobile|fax|pager|webauthn)$/.test(t));
+  const acOf = (el) => { const t = tokens(el); return t.length ? t[t.length - 1] : ""; };
+  const isOff = (el) => acOf(el) === "off" || (!el.getAttribute("autocomplete") && !!el.form && (el.form.getAttribute("autocomplete") || "").toLowerCase() === "off");
+  const labelText = (el) => {
+    let text = "";
+    try { for (const l of el.labels || []) text += " " + l.textContent; } catch (e) {}
+    const by = el.getAttribute("aria-labelledby");
+    if (by) for (const id of by.split(/\s+/)) { const n = el.getRootNode().getElementById ? el.getRootNode().getElementById(id) : null; if (n) text += " " + n.textContent; }
+    return text;
+  };
+  const describe = (el) => [el.name, el.id, el.getAttribute("placeholder"), el.getAttribute("aria-label"), labelText(el)]
+    .join(" ").toLowerCase().replace(/\s+/g, " ").slice(0, 300);
+  const groupOf = (el) => el.form || el.getRootNode();
+  const fieldsOf = (group) => {
+    const all = group instanceof HTMLFormElement ? [...group.elements] : [...group.querySelectorAll("input, select, textarea")].filter((e) => !e.form);
+    return all.filter((e) => fieldish(e) && !e.disabled);
+  };
+
+  // ── logins ──
+  const NEWISH = /new|create|choose|regist|sign.?up|neu|nouveau|nuevo/;
+  const CONFIRMISH = /confirm|again|repeat|re.?type|re.?enter|verif|twice|wiederhol|bestätig/;
+  const USERISH = /user|login|log.?in|e.?mail|account|ident|member|\bid\b|benutzer|usuario|utilisateur|phone|mobile/;
+  const NOT_USER = /search|query|captcha|otp|one.?time|coupon|promo|voucher|token|pin\b/;
+  const analyzeLogin = (fields) => {
+    const pws = fields.filter((e) => isPassword(e) && shown(e));
+    const texts = fields.filter((e) => isInput(e) && !isPassword(e) && ["text", "email", "tel", "number"].includes(e.type) && shown(e)
+      && !NOT_USER.test(describe(e)) && !/^(cc-|one-time-code$)/.test(acOf(e)));
+    const explicit = texts.find((e) => acOf(e) === "username");
+    if (!pws.length) {  // a username-only step (the password comes next)
+      if (explicit) return {user: explicit, current: [], fresh: [], only: true};
+      const named = texts.filter((e) => e.type === "email" || USERISH.test(describe(e)));
+      return texts.length === 1 && named.length === 1 ? {user: named[0], current: [], fresh: [], only: true} : null;
+    }
+    const current = pws.filter((e) => acOf(e) === "current-password"), fresh = pws.filter((e) => acOf(e) === "new-password");
+    const rest = pws.filter((e) => !current.includes(e) && !fresh.includes(e));
+    if (rest.length === 1) (NEWISH.test(describe(rest[0])) || CONFIRMISH.test(describe(rest[0])) || (fresh.length && !current.length) ? fresh : current).push(rest[0]);
+    else if (rest.length === 2 && !current.length && (NEWISH.test(describe(rest[0])) || CONFIRMISH.test(describe(rest[1]))
+             || (rest[0].value && rest[0].value === rest[1].value))) fresh.push(...rest);  // a new password and its confirmation
+    else if (rest.length >= 2) { if (!current.length) current.push(rest.shift()); fresh.push(...rest); }  // current, new (, again)
+    const first = pws[0];
+    const before = texts.filter((e) => e.compareDocumentPosition(first) & Node.DOCUMENT_POSITION_FOLLOWING);
+    const user = explicit || [...before].reverse().find((e) => e.type === "email" || USERISH.test(describe(e))) || before[before.length - 1] || null;
+    return {user, current, fresh, only: false};
+  };
+  const loginData = (login) => {
+    if (login.only) return null;
+    const cur = login.current.map((e) => e.value).filter(Boolean), neu = login.fresh.map((e) => e.value).filter(Boolean);
+    if (!cur.length && !neu.length) return null;
+    const mismatch = neu.some((v) => v !== neu[0]);  // a typo in the confirmation: nothing to save
+    return {username: login.user ? login.user.value.trim() : "", password: cur[0] || "", new_password: mismatch ? "" : (neu[0] || ""),
+            field: idOf(login.current[0] || login.fresh[0])};
+  };
+
+  // ── addresses and payment cards ──
+  const AC = {"name": "name", "given-name": "given", "additional-name": "additional", "family-name": "family",
+    "organization": "organization", "street-address": "street", "address-line1": "line1", "address-line2": "line2",
+    "address-line3": "line2", "address-level2": "city", "address-level1": "state", "postal-code": "zip", "country": "country",
+    "country-name": "country", "tel": "phone", "tel-national": "phone", "email": "email",
+    "cc-name": "cc-name", "cc-given-name": "cc-given", "cc-family-name": "cc-family", "cc-number": "cc-number",
+    "cc-exp": "cc-exp", "cc-exp-month": "cc-exp-month", "cc-exp-year": "cc-exp-year", "cc-csc": "cc-csc", "cc-type": "cc-type"};
+  const EXCLUDE = /user.?name|login|search|query|captcha|coupon|promo|voucher|gift.?card|otp|one.?time|nick.?name|password/;
+  const CARD = [
+    ["cc-csc", /cvc|cvv|csc|cvn|\bcid\b|security.?code|card.?verif|verification.?(code|value|number)|ccv/],
+    ["cc-number", /card.?(number|no\b|num|#)|cc.?num|ccnum|credit.?card|cardnumber|kartennummer|tarjeta|num.?ro.?de.?carte/],
+    ["cc-name", /name.?on.?(the.?)?card|card.?holder|cardholder|cc.?name|card.?name|holder.?name|nameoncard/],
+  ];
+  const CARD_CONTEXT = [  // only next to a card number
+    ["cc-exp-month", /exp\w*[\s_-]*mo|card[\s_-]*mo|cc[\s_-]*mo|month|\bmm\b(?!\s*\/)/],
+    ["cc-exp-year", /exp\w*[\s_-]*y|card[\s_-]*y|cc[\s_-]*y|year|^\s*yy(yy)?\s*$/],
+    ["cc-exp", /expir|exp.?date|valid.?(thru|through|until)|mm\s*\/\s*yy|\bexp\b|ablauf|vencimiento/],
+  ];
+  const ADDRESS = [
+    ["email", /e.?mail|courriel|correo/],
+    ["phone", /phone|\bmobile|\btel\b|tel[_-]|telefon|\bcell/],
+    ["zip", /\bzip|postal|post.?code|postcode|\bplz\b|c[oó]digo.?postal|code.?postal|pin.?code/],
+    ["city", /city|town|locality|suburb|\bort\b|stadt|ciudad|ville/],
+    ["country", /country|nation|\bland\b|pa[ií]s|pays/],
+    ["state", /\bstate|province|region|county|prefecture|bundesland|provincia/],
+    ["organization", /company|organi[sz]ation|business.?name|firma|empresa|entreprise/],
+    ["line2", /address.?(line)?.?2|addr.?2|street.?2|apartment|\bapt\b|suite|\bunit\b|line2|adresszusatz/],
+    ["line1", /address|addr\b|addr.?1|street|line1|stra(ss|ß)e|direcci|adresse/],
+    ["given", /first.?name|given.?name|\bfname\b|forename|vorname|pr[eé]nom|firstname/],
+    ["family", /last.?name|family.?name|surname|\blname\b|nachname|apellido|lastname/],
+    ["additional", /middle.?name|\bmname\b|middle.?initial/],
+    ["name", /full.?name|your.?name|\bname\b|fullname|recipient/],
+  ];
+  const fieldType = (el, cardContext) => {
+    const ac = acOf(el);
+    if (AC[ac]) return {type: AC[ac], explicit: true};
+    if (isPassword(el)) return null;
+    const d = describe(el);
+    if (EXCLUDE.test(d)) return null;
+    for (const [type, re] of CARD) if (re.test(d)) return {type, explicit: false};
+    if (cardContext) for (const [type, re] of CARD_CONTEXT) if (re.test(d)) return {type, explicit: false};
+    for (const [type, re] of ADDRESS) if (re.test(d)) return {type, explicit: false};
+    if (isInput(el) && el.type === "email") return {type: "email", explicit: false};
+    if (isInput(el) && el.type === "tel") return {type: "phone", explicit: false};
+    return null;
+  };
+  const analyzeForm = (fields) => {
+    let types = new Map(fields.map((e) => [e, fieldType(e, false)]));
+    const card = [...types.values()].some((t) => t && t.type === "cc-number");
+    if (card) types = new Map(fields.map((e) => [e, fieldType(e, true)]));
+    const kinds = new Set([...types.values()].filter((t) => t && !t.type.startsWith("cc-")).map((t) => t.type));
+    return {types, card, address: kinds.size >= 3};
+  };
+  const valuesOf = (fields, types, card) => {
+    const out = {};
+    let first = 0;
+    for (const el of fields) {
+      const t = types.get(el);
+      if (!t || t.type.startsWith("cc-") !== card || t.type === "cc-csc" || !el.value || (!card && isOff(el))) continue;  // (never a CVC)
+      if (!(t.type in out)) out[t.type] = String(el.value).trim();
+      first = first || idOf(el);
+    }
+    out.field = first;
+    return out;
+  };
+
+  // ── what the user does ──
+  const focusInfo = (el) => {
+    const fields = fieldsOf(groupOf(el));
+    const login = analyzeLogin(fields), form = analyzeForm(fields), t = form.types.get(el);
+    const r = el.getBoundingClientRect();
+    const info = {id: idOf(el), origin: location.origin, rect: [r.left, r.top, r.width, r.height], kind: "", role: "", ftype: "",
+                  value: isPassword(el) ? "" : String(el.value || "")};
+    if (login && el === login.user) Object.assign(info, {kind: "login", role: "username"});
+    else if (login && login.current.includes(el)) Object.assign(info, {kind: "login", role: "password"});
+    else if (isPassword(el) || !t) return null;  // (a new password: nothing to offer)
+    else if (t.type.startsWith("cc-")) { if (!form.card || t.type === "cc-csc") return null; Object.assign(info, {kind: "card", ftype: t.type}); }
+    else if (form.address || t.explicit) Object.assign(info, {kind: "address", ftype: t.type, off: isOff(el)});
+    else return null;
+    if (info.kind === "login" && t && !t.type.startsWith("cc-") && (form.address || t.explicit)) Object.assign(info, {alt: t.type, off: isOff(el)});
+    return info;
+  };
+  const target = (e) => { const path = e.composedPath ? e.composedPath() : []; return path[0] || e.target; };
+  const userInput = (e) => { if (e.isTrusted) lastInput = performance.now(); };
+  for (const type of ["mousedown", "pointerdown", "touchstart", "keydown"]) document.addEventListener(type, userInput, true);
+  document.addEventListener("focusin", (e) => {
+    const el = target(e);
+    if (!fieldish(el)) return;
+    if (isPassword(el)) everPassword.add(el);
+    const info = focusInfo(el);
+    focused = info ? info.id : 0;
+    // suggestions open when you go to a field - not when the page moves the focus by itself
+    if (info) send({type: "focus", show: e.isTrusted && performance.now() - lastInput < 1000, ...info});
+  }, true);
+  document.addEventListener("focusout", (e) => {
+    if (focused && ids.get(target(e)) === focused) { send({type: "blur", id: focused}); focused = 0; }
+  }, true);
+  document.addEventListener("mousedown", (e) => {  // a click on the field that has the focus shows the suggestions again
+    const el = target(e);
+    if (e.isTrusted && fieldish(el) && el === deepActive()) { const info = focusInfo(el); if (info) send({type: "focus", show: true, ...info}); }
+  }, true);
+  let typedTimer = 0;
+  const typed = (el) => { const login = analyzeLogin(fieldsOf(groupOf(el))), data = login && loginData(login); if (data) send({type: "typed", origin: location.origin, url: location.href, login: data}); };
+  document.addEventListener("input", (e) => {
+    const el = target(e);
+    if (filling || !fieldish(el)) return;
+    if (isPassword(el)) { everPassword.add(el); clearTimeout(typedTimer); typedTimer = setTimeout(() => typed(el), 300); }
+    if (focused && ids.get(el) === focused) send({type: "input", id: focused, value: isPassword(el) ? "" : String(el.value || "")});
+  }, true);
+  document.addEventListener("change", (e) => { const el = target(e); if (!filling && isPassword(el)) typed(el); }, true);
+  const attempt = (group, how) => {
+    if (!group || filling) return;
+    const fields = fieldsOf(group);
+    if (!fields.some((f) => f.value && !(f instanceof HTMLSelectElement))) return;  // (most clicks: nothing typed anywhere)
+    const out = {type: "submit", how, origin: location.origin, url: location.href};
+    const login = analyzeLogin(fields);
+    if (login && login.only && login.user.value.trim()) out.username = login.user.value.trim();
+    else if (login) { const data = loginData(login); if (data) out.login = data; }
+    const form = analyzeForm(fields);
+    if (form.card) { const card = valuesOf(fields, form.types, true); if (card["cc-number"]) out.card = card; }
+    if (form.address) { const address = valuesOf(fields, form.types, false); if (Object.keys(address).length > 3) out.address = address; }
+    if (out.login || out.username || out.card || out.address) send(out);
+  };
+  document.addEventListener("submit", (e) => attempt(target(e), "submit"), true);
+  document.addEventListener("keydown", (e) => {
+    const el = target(e);
+    if (!e.isTrusted || !fieldish(el)) return;
+    if (e.key === "Enter" && !e.isComposing && !(el instanceof HTMLTextAreaElement)) attempt(groupOf(el), "enter");
+    else if (e.key === "ArrowDown" && el === deepActive()) { const info = focusInfo(el); if (info) send({type: "focus", show: true, ...info}); }
+  }, true);
+  document.addEventListener("click", (e) => {
+    const el = target(e), button = el && el.closest ? el.closest("button, input[type=submit], input[type=button], input[type=image], [role=button]") : null;
+    if (button) attempt(button.form || button.getRootNode(), "click");
+  }, true);
+  document.addEventListener("scroll", () => {
+    if (focused && performance.now() - scrolled > 150) { scrolled = performance.now(); send({type: "scroll"}); }
+  }, {capture: true, passive: true});
+
+  // ── filling (what the browser sends after you pick a suggestion) ──
+  const pick = (el, wanted) => {
+    const norm = (s) => String(s || "").toLowerCase().replace(/[^\p{L}\p{N}]/gu, "");
+    const options = [...el.options];
+    for (const w of wanted.map(norm).filter(Boolean)) {
+      const hit = options.find((o) => norm(o.value) === w || norm(o.text) === w);
+      if (hit) return hit.value;
+      if (/^\d+$/.test(w)) { const n = options.find((o) => /^\d+$/.test(norm(o.value)) && Number(norm(o.value)) === Number(w)); if (n) return n.value; }
+    }
+    return null;
+  };
+  const put = (el, value) => {
+    if (el.readOnly || el.disabled || value == null || value === "" || (Array.isArray(value) && !value.length)) return false;
+    let v = value;
+    if (el instanceof HTMLSelectElement) { v = pick(el, Array.isArray(value) ? value : [value]); if (v == null) return false; }
+    else if (Array.isArray(value)) v = value[0];
+    v = String(v);
+    if (isInput(el) && el.maxLength > 0 && v.length > el.maxLength) v = v.slice(0, el.maxLength);
+    const proto = el instanceof HTMLSelectElement ? HTMLSelectElement.prototype : el instanceof HTMLTextAreaElement ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+    Object.getOwnPropertyDescriptor(proto, "value").set.call(el, v);  // (the page's own value setters are never involved)
+    el.dispatchEvent(el instanceof HTMLSelectElement ? new Event("input", {bubbles: true, composed: true})
+      : new InputEvent("input", {bubbles: true, composed: true, inputType: "insertReplacementText", data: v}));
+    el.dispatchEvent(new Event("change", {bubbles: true}));
+    return true;
+  };
+  const hint = (el) => ((el.getAttribute("placeholder") || "") + " " + (el.getAttribute("aria-label") || "") + " " + labelText(el)).toLowerCase();
+  const cardValue = (type, c, el) => {
+    const month = c.month, year = c.year, select = el instanceof HTMLSelectElement;
+    switch (type) {
+      case "cc-number": return c.number;
+      case "cc-name": return c.name;
+      case "cc-given": return c.name.split(" ").slice(0, -1).join(" ") || c.name;
+      case "cc-family": return c.name.split(" ").length > 1 ? c.name.split(" ").pop() : "";
+      case "cc-type": return [c.network];
+      case "cc-exp-month": return select ? [month, String(Number(month)), c.monthName] : month;
+      case "cc-exp-year": return select ? [year, year.slice(2)] : (el.maxLength === 2 || /(^|[^y])yy([^y]|$)/.test(hint(el)) ? year.slice(2) : year);
+      case "cc-exp": {
+        if (select) return null;
+        const h = hint(el), long = /yyyy|aaaa|jjjj/.test(h) || el.maxLength === 7 || el.maxLength === 9;
+        const sep = /mm\s+\/\s+yy/.test(h) ? " / " : /mm\s*-\s*yy/.test(h) ? "-" : (el.maxLength === 4 ? "" : "/");
+        return month + sep + (long ? year : year.slice(2));
+      }
+    }
+    return null;
+  };
+  const addressValue = (type, a, el) => {
+    if (type === "street") return el instanceof HTMLTextAreaElement ? [a.line1, a.line2].filter(Boolean).join("\n") : [a.line1, a.line2].filter(Boolean).join(", ");
+    if (type === "state") return el instanceof HTMLSelectElement ? a.states : a.state;
+    if (type === "country") return el instanceof HTMLSelectElement ? a.countries : a.country;
+    return a[type];
+  };
+  const fill = (id, data, origin) => {
+    const el = byId(id);
+    if (location.origin !== origin || !el) return 0;
+    const fields = fieldsOf(groupOf(el));
+    let n = 0;
+    filling = true;
+    try {
+      if (data.kind === "login") {
+        const login = analyzeLogin(fields);
+        if (!login) return 0;
+        if (login.user && typeof data.username === "string" && put(login.user, data.username)) n++;
+        if (!login.only) for (const p of login.current) if (put(p, data.password)) n++;  // (new-password fields stay empty)
+      } else {
+        const form = analyzeForm(fields), card = data.kind === "card";
+        for (const f of fields) {
+          const t = form.types.get(f);
+          if (!t || t.type.startsWith("cc-") !== card || t.type === "cc-csc" || (f !== el && f.value && !(f instanceof HTMLSelectElement))) continue;
+          if (!card && isOff(f) && f !== el) continue;  // autocomplete="off" address fields are left alone
+          if (put(f, card ? cardValue(t.type, data.values, f) : addressValue(t.type, data.values, f))) n++;
+        }
+      }
+    } finally { filling = false; }
+    return n;
+  };
+  const api = Object.freeze({
+    drain() {
+      for (const e of queue) if (e.type === "focus" && byId(e.id)) e.rect = api.rect(e.id);  // (after the focus scrolled it into view)
+      const out = JSON.stringify(queue);
+      queue.length = 0;
+      return out;
+    },
+    fill(id, data, origin) { try { return fill(id, data, origin); } catch (e) { return 0; } },
+    present(id) { const el = byId(id); return !!el && shown(el); },
+    rect(id) { const el = byId(id), r = el && el.getBoundingClientRect(); return r ? [r.left, r.top, r.width, r.height] : null; },
+    passwordsShown() { return [...document.querySelectorAll("input")].some((e) => isPassword(e) && shown(e)); },
+    frameRect() {  // where the frame that has the focus is, in this one
+      const f = document.activeElement;
+      if (!f || !/^(IFRAME|FRAME)$/.test(f.tagName)) return null;
+      const r = f.getBoundingClientRect(), s = getComputedStyle(f);
+      return [r.left + f.clientLeft + parseFloat(s.paddingLeft || 0), r.top + f.clientTop + parseFloat(s.paddingTop || 0)];
+    },
+  });
+  Object.defineProperty(globalThis, "__fgAutofill", {value: api});
+})();"""
+AUTOFILL_DRAIN = "typeof __fgAutofill === 'object' ? __fgAutofill.drain() : '[]'"
+
+
+@dataclass
+class AutofillTarget:
+    """A form field the suggestions are for: its page and frame (the frame's origin when it was focused), the field's
+    number in the page script, what kind of field it is and where (CSS pixels, in its frame)."""
+    page: QWebEnginePage
+    frame: object                      # QWebEngineFrame
+    path: tuple                        # the frames around it, outermost first
+    origin: str
+    field: int
+    kind: str                          # "login", "address" or "card"
+    role: str = ""                     # login: "username" / "password"
+    type: str = ""                     # address/card: the field type ("city", "cc-number", ...)
+    alt: str = ""                      # a login field that's also an address field (its type)
+    off: bool = False                  # autocomplete="off" (addresses respect it)
+    value: str = ""
+    rect: tuple = (0.0, 0.0, 0.0, 0.0)
+    dismissed: bool = False
+
+    def same_field(self, frame, field) -> bool:
+        return field == self.field and frame == self.frame
+
+
+class AutofillPageState:
+    """What autofill knows about one page (a tab's or a pop-up's)."""
+
+    def __init__(self) -> None:
+        self.pokes: list[float] = []
+        self.attempt: dict | None = None        # the latest form submission, until it's judged
+        self.navigated = False                  # ... and the page went on to another document since
+        self.typed: dict | None = None          # the latest login typed (before a submission was seen)
+        self.username: tuple[str, str, float] | None = None  # a username-only step: (origin, username, when)
+        self.prompts: list[dict] = []           # offers waiting for an answer (the key icon)
+        self.offered = 0.0
+        self.closing = None                     # the page closed itself (its window, for offers still to come)
+
+
+class Autofill(QObject):
+    """Chrome's password manager and form autofill for one profile (Autofill.of(profile)): the page script, the
+    suggestions, filling, and offering to save what was typed into forms."""
+    changed = pyqtSignal()                  # saved data changed
+    prompts_changed = pyqtSignal(object)    # a page's offers changed (QWebEnginePage)
+    POKES_PER_SECOND = 40
+    CHECK_MS = (1500, 4000)                 # a submission without navigation counts once its form went away
+    ATTEMPT_S = 10                          # a navigation this soon after a submission is its result
+    USERNAME_S = 300                        # a username-only step pairs with a password form this soon after it
+
+    def __init__(self, profile: QWebEngineProfile, settings: Settings, directory: Path, store: SecretStore | None = None):
+        super().__init__(profile)
+        self.profile, self.settings = profile, settings
+        self.store = store if store is not None else secret_store()
+        self.data = AutofillData(directory / "autofill.json", self.store)
+        self.data.changed.connect(self.changed)
+        self.poke = f"{AUTOFILL_POKE}{secrets.token_hex(12)}:"
+        self.told_no_keychain = False
+        scripts = profile.scripts()
+        for old in scripts.find(AUTOFILL_SCRIPT):
+            scripts.remove(old)
+        script = QWebEngineScript()
+        script.setName(AUTOFILL_SCRIPT)
+        script.setWorldId(AUTOFILL_WORLD)
+        script.setInjectionPoint(QWebEngineScript.InjectionPoint.DocumentCreation)
+        script.setRunsOnSubFrames(True)
+        script.setSourceCode(AUTOFILL_JS.replace("__POKE__", json.dumps(self.poke)))
+        scripts.insert(script)
+
+    @classmethod
+    def of(cls, profile: QWebEngineProfile | None) -> "Autofill | None":
+        return profile.findChild(cls) if profile is not None and not sip.isdeleted(profile) else None
+
+    # settings
+    def offers_passwords(self) -> bool:
+        return self.settings.get("offer_to_save_passwords")
+
+    def fills_addresses(self) -> bool:
+        return self.settings.get("autofill_addresses")
+
+    def fills_cards(self) -> bool:
+        return self.settings.get("autofill_payments")
+
+    def state(self, page: QWebEnginePage) -> AutofillPageState:
+        state = getattr(page, "autofill_state", None)
+        if state is None:
+            state = page.autofill_state = AutofillPageState()
+            page.loadStarted.connect(lambda p=page: self._load_started(p))
+            page.loadFinished.connect(lambda ok, p=page: self._load_finished(p, ok))
+            page.scrollPositionChanged.connect(lambda _pos, p=page: self._scrolled(p))
+            page.windowCloseRequested.connect(lambda p=page: self._closing(p))
+        return state
+
+    def prompts(self, page: QWebEnginePage | None) -> list[dict]:
+        state = getattr(page, "autofill_state", None) if page is not None and not sip.isdeleted(page) else None
+        return state.prompts if state is not None else []
+
+    # ── from the page script ──
+    def poked(self, page: QWebEnginePage, message: str) -> bool:
+        """For WebPage.javaScriptConsoleMessage: True if *message* is the page script's (never shown or logged). The
+        frames' news is collected at once - before a form submission can replace the document."""
+        if not message.startswith(self.poke):
+            return False
+        if not hasattr(page, "mainFrame"):
+            return True
+        state = self.state(page)
+        now = time.monotonic()
+        state.pokes = [t for t in state.pokes if now - t < 1] + [now]
+        if len(state.pokes) > self.POKES_PER_SECOND:
+            return True
+        href = QUrl(message[len(self.poke):])
+        frames = self.frames(page)
+        for frame, path in [(f, p) for f, p in frames if same_document(f.url(), href)] or frames:
+            frame.runJavaScript(AUTOFILL_DRAIN, AUTOFILL_WORLD,
+                                lambda raw, pg=page, fr=frame, pa=path: self._drained(pg, fr, pa, raw))
+        return True
+
+    @staticmethod
+    def frames(page: QWebEnginePage) -> list[tuple]:
+        """Every frame of *page* with the frames around it: [(frame, (outermost, ..., parent))]."""
+        found, todo = [], [(page.mainFrame(), ())]
+        while todo and len(found) < 300:
+            frame, path = todo.pop(0)
+            found.append((frame, path))
+            todo += [(child, path + (frame,)) for child in frame.children()]
+        return found
+
+    def _drained(self, page: QWebEnginePage, frame, path: tuple, raw) -> None:
+        if sip.isdeleted(page) or not isinstance(raw, str) or not frame.isValid():
+            return
+        try:
+            events = json.loads(raw)
+        except ValueError:
+            return
+        origin = origin_of(frame.url())  # the browser's own record of what the frame shows
+        if not origin or not isinstance(events, list):
+            return
+        for event in events[:40]:
+            if isinstance(event, dict) and event.get("origin", origin) == origin:
+                try:
+                    self._event(page, frame, path, origin, event)
+                except (TypeError, ValueError, KeyError, AttributeError):
+                    pass  # (malformed: the page script never sends such)
+
+    def _event(self, page: QWebEnginePage, frame, path: tuple, origin: str, event: dict) -> None:
+        kind = event.get("type")
+        state = self.state(page)
+        popup = self.popup(page, create=False)
+        if kind == "focus":
+            rect = event.get("rect")
+            target = AutofillTarget(page, frame, path, origin, int(event["id"]), str(event.get("kind") or ""),
+                                    str(event.get("role") or ""), str(event.get("ftype") or ""), str(event.get("alt") or ""),
+                                    bool(event.get("off")), str(event.get("value") or ""),
+                                    tuple(float(v) for v in rect[:4]) if isinstance(rect, list) and len(rect) >= 4 else (0, 0, 0, 0))
+            if target.kind in ("login", "address", "card"):
+                self.suggest(target, show=bool(event.get("show")))
+        elif kind == "blur" and popup is not None and popup.target is not None and popup.target.same_field(frame, event.get("id")):
+            popup.close_popup()
+        elif kind == "scroll":
+            self._scrolled(page)
+        elif kind == "input" and popup is not None and popup.target is not None and popup.target.same_field(frame, event.get("id")):
+            target = popup.target
+            target.value = str(event.get("value") or "")
+            if target.kind == "login" and target.role == "password":  # typing a password: the list makes way
+                target.dismissed = True
+                popup.close_popup(forget=False)
+            elif not target.dismissed:
+                self.suggest(target, show=True, typing=True)
+        elif kind == "typed" and isinstance(event.get("login"), dict):
+            state.typed = {"origin": origin, "frame": frame, "url": str(event.get("url") or ""), "login": event["login"],
+                           "time": time.monotonic()}
+        elif kind == "submit":
+            self._submitted(page, frame, origin, event)
+
+    # ── suggestions ──
+    def popup(self, page: QWebEnginePage, create: bool = True) -> "AutofillPopup | None":
+        view = QWebEngineView.forPage(page)
+        host = view.window() if view is not None else None
+        if host is None:
+            return None
+        popup = host.findChild(AutofillPopup, options=Qt.FindChildOption.FindDirectChildrenOnly)
+        if popup is None and create:
+            popup = AutofillPopup(host, self)
+        return popup
+
+    def hide_suggestions(self, page: QWebEnginePage) -> None:
+        popup = self.popup(page, create=False) if not sip.isdeleted(page) else None
+        if popup is not None and popup.target is not None and popup.target.page is page:
+            popup.close_popup()
+
+    def _scrolled(self, page: QWebEnginePage) -> None:
+        """The page (or a box in it) scrolled: the list follows its field, or goes when the field is out of sight."""
+        popup = self.popup(page, create=False) if not sip.isdeleted(page) else None
+        target = popup.target if popup is not None else None
+        if target is None or target.page is not page or not popup.isVisible() or popup.placing:
+            return
+        popup.placing = True
+
+        def moved(rect) -> None:
+            if sip.isdeleted(popup):
+                return
+            popup.placing = False
+            if popup.target is not target or not popup.isVisible():
+                return
+            if not isinstance(rect, list) or len(rect) < 4:
+                popup.close_popup()
+                return
+            target.rect = tuple(float(v) for v in rect[:4])
+            self._place(target, lambda where: popup.place(target, where))
+        if not target.frame.isValid():
+            popup.close_popup()
+            return
+        target.frame.runJavaScript(f"typeof __fgAutofill === 'object' ? __fgAutofill.rect({int(target.field)}) : null",
+                                   AUTOFILL_WORLD, moved)
+
+    def suggestions(self, target: AutofillTarget) -> list[dict]:
+        """The rows of the suggestion list for *target* ("pick": what choosing it fills; none for notes)."""
+        rows: list[dict] = []
+        kind, field_type = target.kind, target.type
+        if kind == "login":
+            prefix = target.value.strip().lower() if target.role == "username" else ""
+            for entry, exact in self.data.logins_for(target.origin):
+                if not prefix or entry["username"].lower().startswith(prefix):
+                    rows.append({"text": entry["username"] or "(no username)", "icon": "key", "pick": ("login", entry["id"]),
+                                 "sub": "••••••••" if exact else QUrl(entry["origin"]).host()})
+            if rows:
+                if not secure_origin(target.origin):
+                    rows.insert(0, {"text": "This site isn't secure", "icon": "warning", "note": True,
+                                    "sub": "Others on this network could see a password you fill in here"})
+                return rows + [{"text": "Manage passwords…", "icon": "key", "pick": ("manage", "passwords"), "footer": True}]
+            if not target.alt:
+                return []
+            kind, field_type = "address", target.alt  # (the email field of a sign-in form on a checkout page...)
+        if kind == "address":
+            if not self.fills_addresses() or target.off:
+                return []
+            prefix = target.value.strip().lower()
+            for address in self.data.addresses:
+                value = address_value(address, field_type)  # (addresses without one for this field aren't offered)
+                if value and (not prefix or value.lower().startswith(prefix)):
+                    rows.append({"text": value, "sub": address_summary(address, include_name=field_type != "name"),
+                                 "icon": "pin", "pick": ("address", address["id"])})
+            return rows + [{"text": "Manage addresses…", "icon": "pin", "pick": ("manage", "addresses"), "footer": True}] if rows else []
+        if kind == "card":
+            if not self.fills_cards() or not self.data.cards or (field_type == "cc-number" and target.value.strip()):
+                return []
+            if not secure_origin(target.origin):
+                return [{"text": "Automatic payment filling is turned off", "icon": "warning", "note": True,
+                         "sub": "This form doesn't use a secure connection"}]
+            prefix = target.value.strip().lower() if field_type == "cc-name" else ""
+            for card in self.data.cards:
+                if not prefix or card["name"].lower().startswith(prefix):
+                    expiry = card_expiry(card)
+                    rows.append({"text": card_label(card), "icon": "card", "pick": ("card", card["id"]),
+                                 "sub": " · ".join(p for p in (card.get("nickname", ""), f"Expires {expiry}" if expiry else "",
+                                                               card.get("name", "")) if p)})
+            return rows + [{"text": "Manage payment methods…", "icon": "card", "pick": ("manage", "payments"), "footer": True}] if rows else []
+        return rows
+
+    def suggest(self, target: AutofillTarget, show: bool = True, typing: bool = False) -> None:
+        popup = self.popup(target.page)
+        if popup is None:
+            return
+        rows = self.suggestions(target)
+        if not rows or not show:  # (the field stays known: typing in it may bring matches)
+            popup.close_popup(forget=False)
+            popup.target, popup.rows = target, rows
+            return
+        if typing and popup.isVisible():
+            popup.open(target, rows, None)
+            return
+        self._place(target, lambda rect: popup.open(target, rows, rect))
+
+    def _place(self, target: AutofillTarget, done) -> None:
+        """Where the field is in the page's top frame (CSS pixels): a subframe's position comes from the frames around it."""
+        x, y, w, h = target.rect
+        if not target.path:
+            done(QRectF(x, y, w, h))
+            return
+        offsets: list = []
+
+        def got(value) -> None:
+            offsets.append(value)
+            if len(offsets) == len(target.path) and not sip.isdeleted(target.page):
+                dx = sum(v[0] for v in offsets if isinstance(v, list) and len(v) == 2)
+                dy = sum(v[1] for v in offsets if isinstance(v, list) and len(v) == 2)
+                done(QRectF(x + dx, y + dy, w, h))
+        for frame in target.path:
+            frame.runJavaScript("typeof __fgAutofill === 'object' ? __fgAutofill.frameRect() : null", AUTOFILL_WORLD, got)
+
+    def choose(self, target: AutofillTarget, pick: tuple) -> None:
+        """Fill what the user picked - into the exact frame it was offered for, still showing the same origin."""
+        what, ident = pick
+        if what == "manage":
+            win = self.window_for(target.page)
+            if win is not None:
+                win.show_autofill_settings(ident)
+            return
+        frame = target.frame
+        if sip.isdeleted(target.page) or not frame.isValid() or origin_of(frame.url()) != target.origin:
+            return
+        if what == "login":
+            entry, password = self.data.login(ident), self.data.password(ident)
+            if entry is None or password is None:
+                self.toast(target.page, "Couldn't read that password from the system keychain.", "error")
+                return
+            payload = {"kind": "login", "username": entry["username"], "password": password}
+            self.data.touch_login(ident)
+        elif what == "address":
+            address = self.data.address(ident)
+            if address is None:
+                return
+            payload = {"kind": "address", "values": address_fill_values(address)}
+        elif what == "card":
+            card, number = self.data.card(ident), self.data.card_number(ident)
+            if card is None or not secure_origin(target.origin):
+                return
+            if number is None:
+                self.toast(target.page, "Couldn't read that card from the system keychain.", "error")
+                return
+            month = card.get("month", "")
+            payload = {"kind": "card", "values": {"number": number, "name": card.get("name", ""), "month": month,
+                                                  "year": card.get("year", ""), "network": card.get("network", ""),
+                                                  "monthName": QLocale.c().monthName(int(month)) if month.isdigit() and 1 <= int(month) <= 12 else ""}}
+        else:
+            return
+        frame.runJavaScript(f"typeof __fgAutofill === 'object' ? __fgAutofill.fill({int(target.field)}, {json.dumps(payload)}, "
+                            f"{json.dumps(target.origin)}) : 0", AUTOFILL_WORLD, lambda _filled: None)
+
+    # ── offering to save ──
+    def _submitted(self, page: QWebEnginePage, frame, origin: str, event: dict) -> None:
+        state = self.state(page)
+        if isinstance(event.get("username"), str) and event["username"]:
+            state.username = (origin, event["username"][:500], time.monotonic())
+        attempt = {"origin": origin, "frame": frame, "url": str(event.get("url") or ""), "time": time.monotonic(),
+                   **{k: event[k] for k in ("login", "card", "address") if isinstance(event.get(k), dict)}}
+        if not any(k in attempt for k in ("login", "card", "address")):
+            return
+        attempt["field"] = int(next((attempt[k].get("field") for k in ("login", "card", "address") if k in attempt), 0) or 0)
+        state.attempt, state.navigated, state.typed = attempt, False, None
+        if state.closing is not None:  # (the news came after the page asked to close: no next page to wait for)
+            self._closing(page)
+            return
+        for delay in self.CHECK_MS:
+            QTimer.singleShot(delay, lambda p=page, a=attempt, last=delay == self.CHECK_MS[-1]: self._check_gone(p, a, last))
+
+    def _load_started(self, page: QWebEnginePage) -> None:
+        self.hide_suggestions(page)
+        state = self.state(page)
+        now = time.monotonic()
+        typed = state.typed
+        if state.attempt is None and typed is not None and now - typed["time"] < 2 and typed["frame"] == page.mainFrame():
+            # a password typed this instant, then the page goes: its submission (the Enter key) just beat the news of it
+            state.attempt = {"origin": typed["origin"], "frame": typed["frame"], "url": typed["url"], "time": now,
+                             "login": typed["login"], "field": int(typed["login"].get("field") or 0)}
+        state.typed = None
+        if state.attempt is not None and now - state.attempt["time"] < self.ATTEMPT_S:
+            state.navigated = True
+        if state.prompts and now - state.offered > 3:  # an offer lasts until you leave the page it was made on
+            state.prompts = []
+            self.prompts_changed.emit(page)
+
+    def _closing(self, page: QWebEnginePage) -> None:
+        """A page closing itself just after a form went (a sign-in pop-up): its offer can't wait for a next page."""
+        state = self.state(page)
+        if state.closing is None:
+            win = self.window_for(page)
+            state.closing = weakref.ref(win) if win is not None else (lambda: None)
+        attempt = state.attempt
+        if attempt is not None and time.monotonic() - attempt["time"] < self.ATTEMPT_S:
+            state.attempt = None
+            self._offer(page, attempt)
+
+    def _load_finished(self, page: QWebEnginePage, ok: bool) -> None:
+        state = self.state(page)
+        attempt = state.attempt
+        if attempt is None or not state.navigated:
+            return
+        state.attempt, state.navigated = None, False
+        if not ok:
+            return
+        if "login" in attempt:  # the login form again on the same page: the login failed
+            def judged(shown) -> None:
+                if sip.isdeleted(page):
+                    return
+                failed = shown is True and QUrl(attempt["url"]).adjusted(QUrl.UrlFormattingOption.RemoveQuery | QUrl.UrlFormattingOption.RemoveFragment) \
+                    == page.url().adjusted(QUrl.UrlFormattingOption.RemoveQuery | QUrl.UrlFormattingOption.RemoveFragment)
+                self._offer(page, attempt, login=not failed)
+            page.mainFrame().runJavaScript("typeof __fgAutofill === 'object' && __fgAutofill.passwordsShown()", AUTOFILL_WORLD, judged)
+        else:
+            self._offer(page, attempt)
+
+    def _check_gone(self, page: QWebEnginePage, attempt: dict, last: bool) -> None:
+        if sip.isdeleted(self) or sip.isdeleted(page):
+            return
+        state = self.state(page)
+        if state.attempt is not attempt or state.navigated:
+            return
+        frame = attempt["frame"]
+
+        def judged(present) -> None:
+            if sip.isdeleted(page) or state.attempt is not attempt or state.navigated:
+                return
+            if present is not True:
+                state.attempt = None
+                self._offer(page, attempt)
+            elif last:
+                state.attempt = None  # still there: not a submission, or it failed
+        if not frame.isValid() or not same_document(frame.url(), QUrl(attempt["url"])):
+            judged(False)
+        else:
+            frame.runJavaScript(f"typeof __fgAutofill === 'object' && __fgAutofill.present({int(attempt['field'])})",
+                                AUTOFILL_WORLD, judged)
+
+    def _offer(self, page: QWebEnginePage, attempt: dict, login: bool = True) -> None:
+        state = self.state(page)
+        prompts = []
+        if login and "login" in attempt:
+            prompts.append(self._login_offer(state, attempt))
+        if "card" in attempt:
+            prompts.append(self._card_offer(attempt))
+        if "address" in attempt:
+            prompts.append(self._address_offer(attempt))
+        prompts = [p for p in prompts if p is not None]
+        if not prompts:
+            return
+        state.prompts = prompts
+        state.offered = time.monotonic()
+        self.prompts_changed.emit(page)
+        win = self.window_for(page) or (state.closing() if state.closing is not None else None)
+        if win is not None and not sip.isdeleted(win):
+            win.autofill_offer(page)
+
+    def _keychain_offer(self) -> dict | None:
+        if self.told_no_keychain:
+            return None
+        self.told_no_keychain = True  # (once a run)
+        return {"kind": "no-keychain", "problem": self.store.problem()}
+
+    def _login_offer(self, state: AutofillPageState, attempt: dict) -> dict | None:
+        login, origin = attempt["login"], attempt["origin"]
+        if not self.offers_passwords() or self.data.never_saved(origin):
+            return None
+        username = str(login.get("username") or "")[:500]
+        password, new = str(login.get("password") or ""), str(login.get("new_password") or "")
+        hint = state.username
+        if not username and hint is not None and hint[0] == origin and time.monotonic() - hint[2] < self.USERNAME_S:
+            username = hint[1]
+        if not (password or new):
+            return None
+        if not self.store.available():
+            return self._keychain_offer()
+        exact = [entry for entry, same in self.data.logins_for(origin) if same]
+        entry = self.data.find_login(origin, username) if username else None
+        if new:  # a new account, or a new password
+            if entry is None and password:
+                entry = next((e for e in exact if self.data.password(e["id"]) == password), None)
+            if entry is not None:
+                return None if self.data.password(entry["id"]) == new else \
+                    {"kind": "update-password", "origin": origin, "entry": entry["id"], "username": entry["username"], "password": new}
+            return {"kind": "save-password", "origin": origin, "username": username, "password": new}
+        if entry is None and not username and len(exact) == 1:
+            entry = exact[0]  # a password-only form
+        if entry is not None:
+            if self.data.password(entry["id"]) == password:
+                self.data.touch_login(entry["id"])
+                return None
+            return {"kind": "update-password", "origin": origin, "entry": entry["id"], "username": entry["username"], "password": password}
+        return {"kind": "save-password", "origin": origin, "username": username, "password": password}
+
+    def _card_offer(self, attempt: dict) -> dict | None:
+        found = attempt["card"]
+        number = re.sub(r"[\s-]", "", str(found.get("cc-number") or ""))
+        if not self.fills_cards() or not secure_origin(attempt["origin"]) or not luhn_ok(number):
+            return None
+        if not self.store.available():
+            return self._keychain_offer()
+        if self.data.find_card(number) is not None:
+            return None
+        month, year = parse_expiry(str(found.get("cc-exp-month") or ""), str(found.get("cc-exp-year") or ""), str(found.get("cc-exp") or ""))
+        name = str(found.get("cc-name") or " ".join(str(found.get(k) or "") for k in ("cc-given", "cc-family")).strip())
+        return {"kind": "save-card", "origin": attempt["origin"],
+                "card": {"number": number, "name": name[:200], "month": month, "year": year, "network": card_network(number)}}
+
+    def _address_offer(self, attempt: dict) -> dict | None:
+        if not self.fills_addresses():
+            return None
+        address = address_from_form({k: v for k, v in attempt["address"].items() if isinstance(v, str)})
+        known = sum(1 for k in ("city", "state", "zip", "country") if address[k])
+        if not address["line1"] or known < 2 or self.data.has_address(address):
+            return None
+        return {"kind": "save-address", "origin": attempt["origin"], "address": address}
+
+    def answer(self, page: QWebEnginePage | None, prompt: dict, choice: str, edits: dict | None = None) -> bool:
+        """The user's answer to an offer: "save" (with *edits* to it), "never" (for the site) or "no" (no thanks)."""
+        edits = edits or {}
+        kind, ok = prompt.get("kind"), True
+        if choice == "save":
+            if kind == "save-password":
+                ok = self.data.add_login(prompt["origin"], edits.get("username", prompt["username"]).strip(),
+                                         edits.get("password", prompt["password"])) is not None
+            elif kind == "update-password":
+                ok = self.data.update_login(prompt["entry"], password=edits.get("password", prompt["password"]))
+            elif kind == "save-card":
+                card = prompt["card"]
+                ok = self.data.add_card(card["number"], edits.get("name", card["name"]), card["month"], card["year"]) is not None
+            elif kind == "save-address":
+                self.data.add_address({**prompt["address"], **edits})
+            if not ok:
+                self.toast(page, "Couldn't save to the system keychain.", "error")
+        elif choice == "never" and kind == "save-password":
+            self.data.never_save(prompt["origin"])
+        if page is not None and not sip.isdeleted(page):
+            state = self.state(page)
+            if prompt in state.prompts:
+                state.prompts.remove(prompt)
+            self.prompts_changed.emit(page)
+        for secret in ("password", "card"):  # (what the offer held goes with it)
+            prompt.pop(secret, None)
+        return ok
+
+    # ── windows ──
+    @staticmethod
+    def window_for(page: QWebEnginePage | None) -> "BrowserWindow | None":
+        view = QWebEngineView.forPage(page) if page is not None and not sip.isdeleted(page) else None
+        host = view.window() if view is not None else None
+        if isinstance(host, PopupWindow):
+            host = host.win
+        return host if isinstance(host, BrowserWindow) and not sip.isdeleted(host) else None
+
+    def toast(self, page: QWebEnginePage | None, text: str, kind: str = "success") -> None:
+        win = self.window_for(page)
+        if win is not None:
+            win.toast(text, kind)
+
+
+class AutofillPopup(QFrame):
+    """The suggestion list under a form field - the browser's own widget, which pages can't see. It never takes the
+    focus from the page: arrow keys move through it, Enter (or Tab) picks, Esc closes."""
+    EARLY_CLICK_MS = 500  # clicks this soon after it appears are ignored (a page could make it pop up under the mouse)
+
+    def __init__(self, host: QWidget, autofill: Autofill):
+        super().__init__(host)
+        self.autofill = autofill
+        self.setObjectName("AutofillPopup")
+        self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground)
+        self.setStyleSheet(
+            f"#AutofillPopup {{ background: {P.PANEL}; border: 1px solid {P.PANEL_BORDER}; border-radius: 8px; }}"
+            "#AutofillRow { background: transparent; border-radius: 6px; }"
+            "#AutofillRow[selected=\"true\"] { background: rgba(251, 251, 254, 0.12); }"
+            "#AutofillRow[footer=\"true\"] { border-top: 1px solid rgba(251, 251, 254, 0.12); border-radius: 0; }")
+        self.column = QVBoxLayout(self)
+        self.column.setContentsMargins(4, 4, 4, 4)
+        self.column.setSpacing(0)
+        self.target: AutofillTarget | None = None
+        self.rows: list[dict] = []
+        self.widgets: list[AutofillRow] = []
+        self.selected = -1
+        self.shown_at = 0.0
+        self._watched: list[QWidget] = []
+        self._proxy: QWidget | None = None
+        self.placing = False  # (finding where the field went after a scroll)
+        self.hide()
+
+    def open(self, target: AutofillTarget, rows: list[dict], rect: QRectF | None) -> None:
+        """Show *rows* for *target* under its field at *rect* (CSS pixels in the top frame; None: where it is now)."""
+        view = QWebEngineView.forPage(target.page)
+        if view is None or not view.isVisible() or view.window() is not self.parentWidget() or (rect is None and not self.isVisible()):
+            return
+        self.target, self.rows, self.placing = target, rows, False
+        self._build()
+        if rect is None:  # (new rows while typing)
+            self.resize(self.width(), self.sizeHint().height())
+        elif not self.place(target, rect):
+            return
+        else:
+            self.shown_at = time.monotonic()
+        self.raise_()
+        self.show()
+        self._watch(view)
+
+    def place(self, target: AutofillTarget, rect: QRectF) -> bool:
+        """Put the list under the field at *rect* (CSS pixels in the top frame) - or above it, if there's no room below.
+        A field out of sight closes it."""
+        view = QWebEngineView.forPage(target.page)
+        if view is None or sip.isdeleted(self) or target is not self.target:
+            return False
+        zoom = target.page.zoomFactor()
+        field = QRect(round(rect.x() * zoom), round(rect.y() * zoom), max(1, round(rect.width() * zoom)),
+                      max(1, round(rect.height() * zoom)))
+        if not field.intersects(view.rect()):
+            self.close_popup(forget=False)
+            return False
+        host = self.parentWidget()
+        corner = view.mapTo(host, field.topLeft())
+        area = QRect(view.mapTo(host, QPoint(0, 0)), view.size())
+        width = clamp(field.width(), 280, 460)
+        height = self.sizeHint().height()
+        x = clamp(corner.x(), area.left() + 2, max(area.left() + 2, area.right() - width - 2))
+        y = corner.y() + field.height() + 2
+        if y + height > area.bottom() and corner.y() - height - 2 >= area.top():
+            y = corner.y() - height - 2
+        self.setGeometry(x, y, width, height)
+        return True
+
+    def _build(self) -> None:
+        for widget in self.widgets:
+            widget.hide()
+            widget.deleteLater()
+        self.widgets = []
+        self.selected = -1
+        for index, row in enumerate(self.rows):
+            widget = AutofillRow(self, row, index)
+            self.column.addWidget(widget)
+            self.widgets.append(widget)
+        self.adjustSize()
+
+    def _watch(self, view: QWidget) -> None:
+        self._unwatch()
+        self._proxy = view.focusProxy()
+        for widget in (self._proxy, view, self.parentWidget()):
+            if widget is not None:
+                widget.installEventFilter(self)
+                self._watched.append(widget)
+
+    def _unwatch(self) -> None:
+        for widget in self._watched:
+            if not sip.isdeleted(widget):
+                widget.removeEventFilter(self)
+        self._watched, self._proxy = [], None
+
+    def close_popup(self, forget: bool = True) -> None:
+        """Hide the list (*forget*: and the field it was for - else typing in it may bring the list back)."""
+        self.hide()
+        self._unwatch()
+        if forget:
+            self.target = None
+
+    # choosing
+    def selectable(self, index: int) -> bool:
+        return 0 <= index < len(self.rows) and "pick" in self.rows[index]
+
+    def select(self, index: int) -> None:
+        self.selected = index if self.selectable(index) else -1
+        for i, widget in enumerate(self.widgets):
+            widget.setProperty("selected", i == self.selected)
+            widget.style().unpolish(widget)
+            widget.style().polish(widget)
+
+    def move_selection(self, step: int) -> None:
+        picks = [i for i in range(len(self.rows)) if self.selectable(i)]
+        if picks:
+            self.select((picks[0] if step > 0 else picks[-1]) if self.selected not in picks
+                        else picks[(picks.index(self.selected) + step) % len(picks)])
+
+    def activate(self, index: int) -> None:
+        target = self.target
+        if target is None or not self.selectable(index) or sip.isdeleted(target.page):
+            return
+        pick = self.rows[index]["pick"]
+        self.close_popup()
+        self.autofill.choose(target, pick)
+
+    def clicked(self, index: int) -> None:
+        if (time.monotonic() - self.shown_at) * 1000 >= self.EARLY_CLICK_MS:
+            self.activate(index)
+
+    def eventFilter(self, watched, event) -> bool:
+        kind = event.type()
+        if watched is self._proxy and self._proxy is not None:
+            if kind == QEvent.Type.KeyPress and self.target is not None and self.isVisible():
+                key = event.key()
+                if key in (Qt.Key.Key_Down, Qt.Key.Key_Up):
+                    self.move_selection(1 if key == Qt.Key.Key_Down else -1)
+                    return True
+                if key in (Qt.Key.Key_Return, Qt.Key.Key_Enter) and self.selected >= 0:
+                    self.activate(self.selected)
+                    return True
+                if key == Qt.Key.Key_Tab and self.selected >= 0:
+                    self.activate(self.selected)
+                    return False  # (and on to the next field)
+                if key == Qt.Key.Key_Escape:
+                    self.target.dismissed = True
+                    self.close_popup(forget=False)
+                    return True
+            # (while hidden, the arrow key goes on to the page: its script asks for the list again, with the field's place)
+        elif kind in (QEvent.Type.Resize, QEvent.Type.Hide, QEvent.Type.WindowDeactivate) and self.isVisible():
+            self.close_popup(forget=kind == QEvent.Type.Hide)
+        return False
+
+
+class AutofillRow(QFrame):
+    """One suggestion: an icon, what it is (a username, a card...) and a detail line."""
+
+    def __init__(self, popup: AutofillPopup, row: dict, index: int):
+        super().__init__(popup)
+        self.popup, self.index = popup, index
+        self.setObjectName("AutofillRow")
+        self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground)
+        self.setProperty("footer", bool(row.get("footer")))
+        self.setCursor(Qt.CursorShape.ArrowCursor if row.get("note") else Qt.CursorShape.PointingHandCursor)
+        line = QHBoxLayout(self)
+        line.setContentsMargins(10, 6, 10, 6)
+        line.setSpacing(10)
+        picture = QLabel()
+        picture.setPixmap(icon(row.get("icon") or "key", P.WARNING if row.get("note") else P.TEXT_2).pixmap(QSize(16, 16)))
+        line.addWidget(picture)
+        texts = QVBoxLayout()
+        texts.setSpacing(1)
+        self.text = tone_label(elide(row["text"], 60), "" if row.get("footer") else "heading")
+        texts.addWidget(self.text)
+        if row.get("sub"):
+            texts.addWidget(tone_label(elide(row["sub"], 70), "dim"))
+        line.addLayout(texts, 1)
+
+    def enterEvent(self, event) -> None:
+        self.popup.select(self.index)
+        super().enterEvent(event)
+
+    def mousePressEvent(self, event) -> None:
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.popup.clicked(self.index)
+
+
+def password_field(text: str = "", placeholder: str = "Password") -> QLineEdit:
+    """A password box with an eye button to show what's in it."""
+    field = QLineEdit(text)
+    field.setPlaceholderText(placeholder)
+    field.setEchoMode(QLineEdit.EchoMode.Password)
+    eye = QAction(icon("eye", P.TEXT_2), "Show password", field)
+
+    def toggle() -> None:
+        hidden = field.echoMode() == QLineEdit.EchoMode.Password
+        field.setEchoMode(QLineEdit.EchoMode.Normal if hidden else QLineEdit.EchoMode.Password)
+        eye.setIcon(icon("eye-off" if hidden else "eye", P.TEXT_2))
+        eye.setText("Hide password" if hidden else "Show password")
+    eye.triggered.connect(lambda *_: toggle())
+    field.addAction(eye, QLineEdit.ActionPosition.TrailingPosition)
+    field.eye = eye
+    return field
+
+
+class AutofillBubble(Panel):
+    """Chrome's "Save password?" - or "Update password?", "Save card?", "Save address?" - under the address bar's key
+    icon. It stays open while you go on using the page; closed unanswered, the offer waits behind the key icon."""
+    TITLES = {"save-password": "Save password?", "update-password": "Update password?", "save-card": "Save card?",
+              "save-address": "Save address?", "no-keychain": "Passwords can't be saved", "manage": "Saved passwords"}
+    DONE = {"save-password": "Password saved.", "update-password": "Password updated.", "save-card": "Card saved.",
+            "save-address": "Address saved."}
+
+    def __init__(self, win: "BrowserWindow", page: QWebEnginePage | None, prompt: dict):
+        super().__init__(win, pinned=True)
+        self.win, self.page, self.prompt = win, page, prompt
+        self.kind = kind = prompt.get("kind", "")
+        self.username: QLineEdit | None = None
+        self.password: QLineEdit | None = None
+        self.name: QLineEdit | None = None
+        self.setMinimumWidth(380)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(16, 12, 10, 14)
+        layout.setSpacing(10)
+        head = QHBoxLayout()
+        picture = QLabel()
+        picture.setPixmap(icon({"save-card": "card", "save-address": "pin", "no-keychain": "warning"}.get(kind, "key"),
+                               P.WARNING if kind == "no-keychain" else P.ACCENT).pixmap(QSize(20, 20)))
+        head.addWidget(picture)
+        head.addWidget(tone_label(self.TITLES.get(kind, ""), "title"), 1)
+        close = tool_button(icon("close", P.TEXT_2), "Close", 26)
+        close.clicked.connect(lambda *_: self.close())
+        head.addWidget(close)
+        layout.addLayout(head)
+        body = QVBoxLayout()
+        body.setContentsMargins(0, 0, 6, 0)
+        body.setSpacing(8)
+        layout.addLayout(body)
+        host = QUrl(prompt.get("origin", "")).host()
+        buttons = QHBoxLayout()
+        buttons.addStretch(1)
+        if kind in ("save-password", "update-password"):
+            form = QFormLayout()
+            form.setHorizontalSpacing(12)
+            if kind == "save-password":
+                self.username = QLineEdit(prompt.get("username", ""))
+                self.username.setPlaceholderText("Username (optional)")
+                form.addRow("Username", self.username)
+            else:
+                form.addRow("Username", tone_label(prompt.get("username") or "(no username)", "secondary"))
+            self.password = password_field(prompt.get("password", ""))
+            form.addRow("Password", self.password)
+            body.addLayout(form)
+            body.addWidget(tone_label(f"For {host}. Passwords are kept in your system keychain.", "dim", wrap=True))
+            if kind == "save-password":
+                never = make_button("Never")
+                never.setToolTip("Never offer to save passwords on this site")
+                never.clicked.connect(lambda *_: self._answer("never"))
+                buttons.addWidget(never)
+            else:
+                later = make_button("No thanks")
+                later.clicked.connect(lambda *_: self._answer("no"))
+                buttons.addWidget(later)
+            save = make_button("Save" if kind == "save-password" else "Update", primary=True)
+            save.clicked.connect(lambda *_: self._answer("save"))
+            buttons.addWidget(save)
+        elif kind == "save-card":
+            card = prompt.get("card", {})
+            body.addWidget(tone_label(card_label({"network": card.get("network"), "last4": card.get("number", "")[-4:]}), "heading"))
+            if card.get("month"):
+                body.addWidget(tone_label(f"Expires {card['month']}/{card.get('year', '')[-2:]}", "secondary"))
+            self.name = QLineEdit(card.get("name", ""))
+            self.name.setPlaceholderText("Name on card")
+            body.addWidget(self.name)
+            body.addWidget(tone_label("The card number is kept in your system keychain. The security code (CVC) is "
+                                      "never saved.", "dim", wrap=True))
+            self._yes_no(buttons)
+        elif kind == "save-address":
+            address = prompt.get("address", {})
+            lines = [address.get("name", ""), address.get("organization", ""), address.get("line1", ""), address.get("line2", ""),
+                     " ".join(p for p in (address.get("city", ""), address.get("state", ""), address.get("zip", "")) if p),
+                     address.get("country", ""), address.get("email", ""), address.get("phone", "")]
+            body.addWidget(tone_label("\n".join(line for line in lines if line), "secondary", wrap=True))
+            self._yes_no(buttons)
+        elif kind == "no-keychain":
+            body.addWidget(tone_label(prompt.get("problem") or "", "secondary", wrap=True))
+            command = tone_label(SecretStore.INSTALL, "heading")
+            command.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+            body.addWidget(command)
+            body.addWidget(tone_label(f"Then restart {APP_NAME}. Addresses are still filled in.", "dim", wrap=True))
+            ok = make_button("OK", primary=True)
+            ok.clicked.connect(lambda *_: self._answer("no"))
+            buttons.addWidget(ok)
+        else:  # the site's saved passwords
+            origin = prompt.get("origin", "")
+            logins = win.autofill.data.logins_for(origin)
+            body.addWidget(tone_label(f"For {host}:", "secondary"))
+            for entry, exact in logins[:6]:
+                body.addWidget(tone_label(f"{entry['username'] or '(no username)'}" + ("" if exact else f"  ·  {QUrl(entry['origin']).host()}"), "heading"))
+            manage = make_button("Manage passwords")
+            manage.clicked.connect(lambda *_: (self.close(), win.show_autofill_settings("passwords")))
+            buttons.addWidget(manage)
+        layout.addLayout(buttons)
+
+    def _yes_no(self, buttons: QHBoxLayout) -> None:
+        later = make_button("No thanks")
+        later.clicked.connect(lambda *_: self._answer("no"))
+        save = make_button("Save", primary=True)
+        save.clicked.connect(lambda *_: self._answer("save"))
+        buttons.addWidget(later)
+        buttons.addWidget(save)
+
+    def _answer(self, choice: str) -> None:
+        edits = {}
+        if self.username is not None:
+            edits["username"] = self.username.text()
+        if self.password is not None:
+            edits["password"] = self.password.text()
+        if self.name is not None:
+            edits["name"] = self.name.text().strip()
+        if self.kind in ("save-password", "update-password") and choice == "save" and not edits.get("password"):
+            self.password.setFocus()
+            return
+        ok = self.win.autofill.answer(self.page, self.prompt, choice, edits)
+        self.close()
+        if choice == "save" and ok and self.kind in self.DONE:
+            self.win.toast(self.DONE[self.kind])
+        if self.page is not None and not sip.isdeleted(self.page) and self.win.autofill.prompts(self.page):
+            QTimer.singleShot(0, lambda: self.win.show_autofill_bubble(self.page, keep_focus=True))  # the next (card, then address)
+
+
+class LoginEditDialog(QDialog):
+    """Add or edit a saved password."""
+
+    def __init__(self, parent: QWidget, title: str, site: str = "", username: str = "", password: str = "", new: bool = False):
+        super().__init__(parent)
+        self.setWindowTitle(title)
+        self.setMinimumWidth(420)
+        layout = QVBoxLayout(self)
+        form = QFormLayout()
+        self.site = QLineEdit(site)
+        self.site.setPlaceholderText("https://example.com")
+        self.site.setReadOnly(not new)
+        self.username = QLineEdit(username)
+        self.password = password_field(password)
+        form.addRow("Site", self.site)
+        form.addRow("Username", self.username)
+        form.addRow("Password", self.password)
+        layout.addLayout(form)
+        self.error = tone_label("", "error", wrap=True)
+        self.error.hide()
+        layout.addWidget(self.error)
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel)
+        buttons.accepted.connect(self._check)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def origin(self) -> str:
+        text = self.site.text().strip()
+        return origin_of(QUrl(text if "://" in text else f"https://{text}"))
+
+    def _check(self) -> None:
+        problem = "Enter the site's address, like https://example.com." if not self.origin() else \
+            "Enter a password." if not self.password.text() else ""
+        if problem:
+            self.error.setText(problem)
+            self.error.show()
+            return
+        self.accept()
+
+
+class CardEditDialog(QDialog):
+    """Add or edit a payment card (the security code is never asked for: it's never saved)."""
+
+    def __init__(self, parent: QWidget, title: str, card: dict | None = None):
+        super().__init__(parent)
+        card = card or {}
+        self.editing = bool(card)
+        self.setWindowTitle(title)
+        self.setMinimumWidth(420)
+        layout = QVBoxLayout(self)
+        form = QFormLayout()
+        self.number = QLineEdit()
+        self.number.setPlaceholderText(f"{card_label(card)} (unchanged)" if card else "Card number")
+        self.name = QLineEdit(card.get("name", ""))
+        self.month, self.year = QComboBox(), QComboBox()
+        self.month.addItems([f"{m:02d}" for m in range(1, 13)])
+        this_year = QDateTime.currentDateTime().date().year()
+        years = [str(y) for y in range(this_year, this_year + 21)]
+        if card.get("year") and card["year"] not in years:
+            years.insert(0, card["year"])
+        self.year.addItems(years)
+        if card.get("month"):
+            self.month.setCurrentText(card["month"])
+        if card.get("year"):
+            self.year.setCurrentText(card["year"])
+        expiry = QHBoxLayout()
+        expiry.addWidget(self.month)
+        expiry.addWidget(QLabel("/"))
+        expiry.addWidget(self.year)
+        expiry.addStretch(1)
+        self.nickname = QLineEdit(card.get("nickname", ""))
+        self.nickname.setPlaceholderText("Optional")
+        form.addRow("Card number", self.number)
+        form.addRow("Name on card", self.name)
+        form.addRow("Expiration date", expiry)
+        form.addRow("Nickname", self.nickname)
+        layout.addLayout(form)
+        layout.addWidget(tone_label("The card number is kept in your system keychain. The security code (CVC) is never "
+                                    "saved.", "dim", wrap=True))
+        self.error = tone_label("", "error", wrap=True)
+        self.error.hide()
+        layout.addWidget(self.error)
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel)
+        buttons.accepted.connect(self._check)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def digits(self) -> str:
+        return re.sub(r"[\s-]", "", self.number.text())
+
+    def values(self) -> dict:
+        return {"name": self.name.text().strip(), "month": self.month.currentText(), "year": self.year.currentText(),
+                "nickname": self.nickname.text().strip()}
+
+    def _check(self) -> None:
+        if (self.digits() or not self.editing) and not luhn_ok(self.digits()):
+            self.error.setText("That isn't a valid card number.")
+            self.error.show()
+            return
+        self.accept()
+
+
+class AddressEditDialog(QDialog):
+    """Add or edit an address."""
+    LABELS = (("name", "Name"), ("organization", "Organization"), ("line1", "Street address"), ("line2", "Address line 2"),
+              ("city", "City"), ("state", "State / province"), ("zip", "ZIP / postal code"), ("country", "Country / region"),
+              ("phone", "Phone"), ("email", "Email"))
+
+    def __init__(self, parent: QWidget, title: str, address: dict | None = None):
+        super().__init__(parent)
+        address = address or {}
+        self.setWindowTitle(title)
+        self.setMinimumWidth(440)
+        layout = QVBoxLayout(self)
+        form = QFormLayout()
+        self.fields: dict[str, QLineEdit] = {}
+        for key, label in self.LABELS:
+            self.fields[key] = QLineEdit(address.get(key, ""))
+            form.addRow(label, self.fields[key])
+        layout.addLayout(form)
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel)
+        buttons.accepted.connect(lambda: self.accept() if any(f.text().strip() for f in self.fields.values()) else None)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def values(self) -> dict:
+        return {key: field.text().strip() for key, field in self.fields.items()}
+
+
+class AutofillDialog(QDialog):
+    """Settings > Autofill and passwords: the Password Manager (saved passwords, sites never saved), payment methods
+    and addresses - each with Chrome's switch for it."""
+    SECTIONS = (("passwords", "Password Manager", "key"), ("payments", "Payment methods", "card"),
+                ("addresses", "Addresses and more", "pin"))
+    MASK = "••••••••"
+
+    def __init__(self, win: "BrowserWindow", section: str = "passwords"):
+        super().__init__(win)
+        self.win, self.autofill = win, win.autofill
+        self.data = self.autofill.data
+        self.revealed: dict[str, str] = {}  # login id -> its password, while shown
+        self.setWindowTitle("Autofill and passwords")
+        self.resize(860, 600)
+        outer = QHBoxLayout(self)
+        nav = QVBoxLayout()
+        nav.setSpacing(4)
+        self.nav = QButtonGroup(self)
+        self.nav.setExclusive(True)
+        for index, (_key, title, icon_name) in enumerate(self.SECTIONS):
+            button = QPushButton(icon(icon_name, P.TEXT_2), "  " + title)
+            button.setCheckable(True)
+            button.setStyleSheet("QPushButton { text-align: left; padding: 8px 14px; background: transparent; }"
+                                 f"QPushButton:checked {{ background: {P.ACCENT_SOFT}; }}"
+                                 "QPushButton:hover:!checked { background: rgba(251, 251, 254, 0.08); }")
+            self.nav.addButton(button, index)
+            nav.addWidget(button)
+        nav.addStretch(1)
+        outer.addLayout(nav)
+        right = QVBoxLayout()
+        self.pages = QStackedWidget()
+        self.pages.addWidget(self._passwords_page())
+        self.pages.addWidget(self._payments_page())
+        self.pages.addWidget(self._addresses_page())
+        right.addWidget(self.pages, 1)
+        close = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
+        close.rejected.connect(self.reject)
+        right.addWidget(close)
+        outer.addLayout(right, 1)
+        self.nav.idClicked.connect(self.pages.setCurrentIndex)
+        self.data.changed.connect(self.refresh)
+        self.refresh()
+        self.show_section(section)
+
+    def show_section(self, section: str) -> None:
+        index = next((i for i, (key, *_rest) in enumerate(self.SECTIONS) if key == section), 0)
+        self.nav.button(index).setChecked(True)
+        self.pages.setCurrentIndex(index)
+
+    # building
+    def _switch(self, text: str, key: str) -> QCheckBox:
+        box = QCheckBox(text)
+        box.setChecked(self.win.settings.get(key))
+        box.toggled.connect(lambda on: self.win.settings.set(key, on))
+        return box
+
+    def _keychain_note(self) -> QWidget | None:
+        store = self.autofill.store
+        if store.available():
+            return None
+        note = tone_label(f"{store.problem()}\nThen restart {APP_NAME}.", "error", wrap=True)
+        note.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        return note
+
+    @staticmethod
+    def _list(headers: list[str]) -> QTreeWidget:
+        tree = QTreeWidget()
+        tree.setHeaderLabels(headers)
+        tree.setRootIsDecorated(False)
+        tree.setUniformRowHeights(True)
+        tree.setAlternatingRowColors(True)
+        tree.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        tree.header().setStretchLastSection(True)
+        return tree
+
+    @staticmethod
+    def _row(*buttons) -> QHBoxLayout:
+        row = QHBoxLayout()
+        for button in buttons:
+            row.addWidget(button)
+        row.addStretch(1)
+        return row
+
+    def _passwords_page(self) -> QWidget:
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.addWidget(tone_label("Password Manager", "title"))
+        note = self._keychain_note()
+        if note is not None:
+            layout.addWidget(note)
+        layout.addWidget(self._switch("Offer to save passwords", "offer_to_save_passwords"))
+        self.search = QLineEdit()
+        self.search.setPlaceholderText("Search passwords")
+        self.search.setClearButtonEnabled(True)
+        self.search.textChanged.connect(lambda *_: self.refresh_passwords())
+        layout.addWidget(self.search)
+        self.password_list = self._list(["Site", "Username", "Password"])
+        self.password_list.setColumnWidth(0, 230)
+        self.password_list.setColumnWidth(1, 200)
+        self.password_list.itemDoubleClicked.connect(lambda *_: self.edit_password())
+        self.password_list.itemSelectionChanged.connect(self._update_password_buttons)
+        layout.addWidget(self.password_list, 1)
+        self.add_password_button = make_button("Add…")
+        self.add_password_button.clicked.connect(lambda *_: self.add_password())
+        self.show_button = make_button("Show")
+        self.show_button.clicked.connect(lambda *_: self.toggle_password())
+        self.copy_button = make_button("Copy password")
+        self.copy_button.clicked.connect(lambda *_: self.copy_password())
+        self.edit_button = make_button("Edit…")
+        self.edit_button.clicked.connect(lambda *_: self.edit_password())
+        self.delete_button = make_button("Delete", danger=True)
+        self.delete_button.clicked.connect(lambda *_: self.delete_password())
+        layout.addLayout(self._row(self.add_password_button, self.show_button, self.copy_button, self.edit_button, self.delete_button))
+        layout.addWidget(tone_label("Never saved", "heading"))
+        self.never_list = self._list(["Sites that never offer to save passwords"])
+        self.never_list.setMaximumHeight(130)
+        layout.addWidget(self.never_list)
+        self.never_remove = make_button("Remove")
+        self.never_remove.clicked.connect(lambda *_: self.remove_never())
+        layout.addLayout(self._row(self.never_remove))
+        return page
+
+    def _payments_page(self) -> QWidget:
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.addWidget(tone_label("Payment methods", "title"))
+        note = self._keychain_note()
+        if note is not None:
+            layout.addWidget(note)
+        layout.addWidget(self._switch("Save and fill payment methods", "autofill_payments"))
+        self.card_list = self._list(["Card", "Name on card", "Expires", "Nickname"])
+        self.card_list.setColumnWidth(0, 210)
+        self.card_list.setColumnWidth(1, 200)
+        self.card_list.itemDoubleClicked.connect(lambda *_: self.edit_card())
+        layout.addWidget(self.card_list, 1)
+        self.add_card_button = make_button("Add…")
+        self.add_card_button.clicked.connect(lambda *_: self.add_card())
+        edit, delete = make_button("Edit…"), make_button("Delete", danger=True)
+        edit.clicked.connect(lambda *_: self.edit_card())
+        delete.clicked.connect(lambda *_: self.delete_card())
+        layout.addLayout(self._row(self.add_card_button, edit, delete))
+        layout.addWidget(tone_label("Cards are filled in only on secure (https) pages, and only when you pick one. The "
+                                    "security code is never saved.", "dim", wrap=True))
+        return page
+
+    def _addresses_page(self) -> QWidget:
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.addWidget(tone_label("Addresses and more", "title"))
+        layout.addWidget(self._switch("Save and fill addresses", "autofill_addresses"))
+        self.address_list = self._list(["Name", "Address", "Email and phone"])
+        self.address_list.setColumnWidth(0, 180)
+        self.address_list.setColumnWidth(1, 320)
+        self.address_list.itemDoubleClicked.connect(lambda *_: self.edit_address())
+        layout.addWidget(self.address_list, 1)
+        add, edit, delete = make_button("Add…"), make_button("Edit…"), make_button("Delete", danger=True)
+        add.clicked.connect(lambda *_: self.add_address())
+        edit.clicked.connect(lambda *_: self.edit_address())
+        delete.clicked.connect(lambda *_: self.delete_address())
+        layout.addLayout(self._row(add, edit, delete))
+        return page
+
+    # showing
+    def refresh(self) -> None:
+        if sip.isdeleted(self):
+            return
+        self.refresh_passwords()
+        self.never_list.clear()
+        for origin in self.data.never:
+            item = QTreeWidgetItem([origin])
+            item.setData(0, Qt.ItemDataRole.UserRole, origin)
+            self.never_list.addTopLevelItem(item)
+        self.never_remove.setEnabled(bool(self.data.never))
+        self._fill(self.card_list, [(c["id"], [card_label(c), c["name"], card_expiry(c), c["nickname"]]) for c in self.data.cards])
+        self._fill(self.address_list, [(a["id"], [a["name"] or a["organization"], address_summary(a),
+                                                  " · ".join(p for p in (a["email"], a["phone"]) if p)]) for a in self.data.addresses])
+        keychain = self.autofill.store.available()
+        self.add_password_button.setEnabled(keychain)
+        self.add_card_button.setEnabled(keychain)
+
+    @staticmethod
+    def _fill(tree: QTreeWidget, rows: list[tuple[str, list[str]]]) -> None:
+        selected = tree.currentItem().data(0, Qt.ItemDataRole.UserRole) if tree.currentItem() is not None else None
+        tree.clear()
+        for ident, texts in rows:
+            item = QTreeWidgetItem(texts)
+            item.setData(0, Qt.ItemDataRole.UserRole, ident)
+            tree.addTopLevelItem(item)
+            if ident == selected:
+                tree.setCurrentItem(item)
+
+    def refresh_passwords(self) -> None:
+        query = self.search.text().strip().lower()
+        rows = []
+        for entry in sorted(self.data.logins, key=lambda r: (QUrl(r["origin"]).host(), r["username"].lower())):
+            host = QUrl(entry["origin"]).host()
+            if query and query not in host.lower() and query not in entry["username"].lower():
+                continue
+            rows.append((entry["id"], [host if entry["origin"].startswith("https://") else entry["origin"],
+                                       entry["username"], self.revealed.get(entry["id"], self.MASK)]))
+        self._fill(self.password_list, rows)
+        for i in range(self.password_list.topLevelItemCount()):
+            item = self.password_list.topLevelItem(i)
+            entry = self.data.login(item.data(0, Qt.ItemDataRole.UserRole))
+            if entry is not None:
+                item.setToolTip(0, entry["origin"])
+        self._update_password_buttons()
+
+    def _update_password_buttons(self) -> None:
+        entry_id = self._current(self.password_list)
+        for button in (self.show_button, self.copy_button, self.edit_button, self.delete_button):
+            button.setEnabled(entry_id is not None)
+        self.show_button.setText("Hide" if entry_id in self.revealed else "Show")
+
+    @staticmethod
+    def _current(tree: QTreeWidget) -> str | None:
+        item = tree.currentItem()
+        return item.data(0, Qt.ItemDataRole.UserRole) if item is not None else None
+
+    # passwords
+    def _password(self, entry_id: str) -> str | None:
+        password = self.data.password(entry_id)
+        if password is None:
+            self.win.toast("Couldn't read that password from the system keychain.", "error")
+        return password
+
+    def toggle_password(self) -> None:
+        entry_id = self._current(self.password_list)
+        if entry_id is None:
+            return
+        if entry_id in self.revealed:
+            del self.revealed[entry_id]
+        elif (password := self._password(entry_id)) is not None:
+            self.revealed[entry_id] = password
+        self.refresh_passwords()
+
+    def copy_password(self) -> None:
+        entry_id = self._current(self.password_list)
+        password = self._password(entry_id) if entry_id is not None else None
+        if password is not None:
+            QGuiApplication.clipboard().setText(password)
+            self.win.toast("Password copied.")
+
+    def add_password(self) -> None:
+        dialog = LoginEditDialog(self, "Add password", new=True)
+        if run_dialog(dialog):
+            origin, username, password = dialog.origin(), dialog.username.text().strip(), dialog.password.text()
+            if self.data.add_login(origin, username, password) is None:
+                self.win.toast("Couldn't save the password to the system keychain.", "error")
+
+    def edit_password(self) -> None:
+        entry_id = self._current(self.password_list)
+        entry = self.data.login(entry_id) if entry_id is not None else None
+        password = self._password(entry_id) if entry is not None else None
+        if entry is None or password is None:
+            return
+        dialog = LoginEditDialog(self, "Edit password", entry["origin"], entry["username"], password)
+        if run_dialog(dialog):
+            username, new = dialog.username.text().strip(), dialog.password.text()
+            if not self.data.update_login(entry_id, username=username, password=new if new != password else None):
+                self.win.toast("Couldn't save: another saved password for this site has that username." if
+                               self.data.find_login(entry["origin"], username) else "Couldn't save to the system keychain.", "error")
+            elif entry_id in self.revealed:
+                self.revealed[entry_id] = new
+                self.refresh_passwords()
+
+    def delete_password(self) -> None:
+        entry_id = self._current(self.password_list)
+        if entry_id is not None:
+            self.revealed.pop(entry_id, None)
+            self.data.delete_login(entry_id)
+            self.win.toast("Password deleted.")
+
+    def remove_never(self) -> None:
+        origin = self._current(self.never_list)
+        if origin is not None:
+            self.data.allow_saving(origin)
+
+    # cards
+    def add_card(self) -> None:
+        dialog = CardEditDialog(self, "Add card")
+        if run_dialog(dialog):
+            values = dialog.values()
+            if self.data.add_card(dialog.digits(), values["name"], values["month"], values["year"], values["nickname"]) is None:
+                self.win.toast("Couldn't save the card to the system keychain.", "error")
+
+    def edit_card(self) -> None:
+        card = self.data.card(self._current(self.card_list) or "")
+        if card is None:
+            return
+        dialog = CardEditDialog(self, "Edit card", card)
+        if run_dialog(dialog) and not self.data.update_card(card["id"], dialog.digits() or None, **dialog.values()):
+            self.win.toast("Couldn't save the card to the system keychain.", "error")
+
+    def delete_card(self) -> None:
+        card_id = self._current(self.card_list)
+        if card_id is not None:
+            self.data.delete_card(card_id)
+
+    # addresses
+    def add_address(self) -> None:
+        dialog = AddressEditDialog(self, "Add address")
+        if run_dialog(dialog):
+            self.data.add_address(dialog.values())
+
+    def edit_address(self) -> None:
+        address = self.data.address(self._current(self.address_list) or "")
+        if address is not None:
+            dialog = AddressEditDialog(self, "Edit address", address)
+            if run_dialog(dialog):
+                self.data.update_address(address["id"], dialog.values())
+
+    def delete_address(self) -> None:
+        address_id = self._current(self.address_list)
+        if address_id is not None:
+            self.data.delete_address(address_id)
+
+    def done(self, result: int) -> None:
+        self.revealed.clear()  # (shown passwords don't outlive the dialog)
+        super().done(result)
+
+
+# ══════════════════════════════════════════════════════════════════════════════════════════
 #  Bookmarks toolbar
 # ══════════════════════════════════════════════════════════════════════════════════════════
 class BookmarkButton(QToolButton):
@@ -9328,6 +11437,7 @@ class BrowserWindow(QMainWindow):
         self.cookie_index = CookieIndex.of(profile)  # (main() made it already, before any page)
         self._cleaners: list[SiteDataCleaner] = []  # clearing site data, still running
         self.settings = settings
+        self.autofill = Autofill.of(profile) or Autofill(profile, settings, session_path.parent)  # (before any page)
         self.bookmarks = bookmarks
         self.history = history
         self.favicons = favicons
@@ -9392,6 +11502,9 @@ class BrowserWindow(QMainWindow):
         extensions.reloaded.connect(self._on_extension_reloaded)
         extensions.replace_requested.connect(self._confirm_replace_extension)
         extensions.bridge.action_changed.connect(lambda ext_id: self._refresh_extension_buttons(ext_id))
+        self.autofill.prompts_changed.connect(lambda *_: self._update_autofill_icon())
+        self.autofill.changed.connect(self._update_autofill_icon)
+        self.url_bar.autofill_action.triggered.connect(lambda *_: self.show_autofill_bubble())
         profile.downloadRequested.connect(self._on_download_requested)
         self._session_timer = QTimer(self)
         self._session_timer.setSingleShot(True)
@@ -9519,6 +11632,9 @@ class BrowserWindow(QMainWindow):
         self.act_downloads = a("Downloads", self.show_downloads, ["Ctrl+Shift+Y"])
         self.act_extensions = a("Extensions and Themes", self.show_extensions, ["Ctrl+Shift+A"])
         self.act_vpn = a("VPN / Proxy…", self.show_vpn_panel)
+        self.act_passwords = a("Password Manager", lambda: self.show_autofill_settings("passwords"))
+        self.act_payments = a("Payment Methods", lambda: self.show_autofill_settings("payments"))
+        self.act_addresses = a("Addresses and More", lambda: self.show_autofill_settings("addresses"))
         self.act_print = a("Print…", self.print_page, ["Ctrl+P"])
         self.act_save = a("Save Page As…", lambda: self._page_action(QWebEnginePage.WebAction.SavePage), ["Ctrl+S"])
         self.act_source = a("View Page Source", self.view_source, ["Ctrl+U"])
@@ -9547,6 +11663,9 @@ class BrowserWindow(QMainWindow):
         menu.addAction(self.act_downloads)
         menu.addAction(self.act_extensions)
         menu.addAction(self.act_vpn)
+        autofill = menu.submenu("Passwords and Autofill", icon("key", P.TEXT_2))
+        for action in (self.act_passwords, self.act_payments, self.act_addresses):
+            autofill.addAction(action)
         menu.addSeparator()
         menu.addAction(self.act_print)
         menu.addAction(self.act_save)
@@ -9611,6 +11730,7 @@ class BrowserWindow(QMainWindow):
         bookmarks_menu.aboutToShow.connect(lambda: self._fill_bookmarks_menu(bookmarks_menu))
         tools_menu = self.mac_menubar.addMenu("Tools")
         for item in (self.act_downloads, self.act_extensions, self.act_vpn, None, self.act_find, self.act_find_next, None,
+                     self.act_passwords, self.act_payments, self.act_addresses, None,
                      self.act_clear_data, self.act_site_settings, self.act_settings):
             tools_menu.addSeparator() if item is None else tools_menu.addAction(item)
         window_menu = self.mac_menubar.addMenu("Window")
@@ -9832,6 +11952,7 @@ class BrowserWindow(QMainWindow):
 
     def _sync_chrome(self, tab: Tab) -> None:
         """Update toolbar, address bar and window title for the current tab."""
+        self._update_autofill_icon()
         if not self.url_bar.isModified() or not self.url_bar.hasFocus():
             self.url_bar.set_url_text(display_url(tab.url()))
         self.url_bar.setPlaceholderText(f"Search with {self.settings.get('search_engine')} or enter address")
@@ -10976,6 +13097,60 @@ class BrowserWindow(QMainWindow):
 
     def show_settings(self) -> None:
         self._single_dialog("settings", lambda: SettingsDialog(self))
+
+    # ── autofill and passwords ──────────────────────────────────────────────────────────
+    def show_autofill_settings(self, section: str = "passwords") -> None:
+        """Settings > Autofill and passwords: "passwords", "payments" or "addresses"."""
+        self._single_dialog("autofill", lambda: AutofillDialog(self, section))
+        self._dialogs["autofill"].show_section(section)
+
+    def autofill_offer(self, page: QWebEnginePage) -> None:
+        """Autofill has offers to save for *page*: ask at once if it's in front (a tab's, or a pop-up's)."""
+        tab = self.current_tab()
+        if (tab is not None and tab.page is page) or all(t.page is not page for t in self.tabs()):
+            self.show_autofill_bubble(page, keep_focus=True)
+        self._update_autofill_icon()
+
+    def show_autofill_bubble(self, page: QWebEnginePage | None = None, keep_focus: bool = False) -> None:
+        """The key icon's bubble: the current tab's first offer to save, else the site's saved passwords."""
+        tab = self.current_tab()
+        page = page if page is not None else tab.page if tab is not None else None
+        for old in self.findChildren(AutofillBubble, options=Qt.FindChildOption.FindDirectChildrenOnly):
+            old.close()
+        prompts = self.autofill.prompts(page)
+        origin = origin_of(tab.url()) if tab is not None and tab.page is page else ""
+        if prompts:
+            prompt = prompts[0]
+        elif origin and self.autofill.data.logins_for(origin):
+            prompt = {"kind": "manage", "origin": origin}
+        else:
+            return
+        focused = QApplication.focusWidget()
+        AutofillBubble(self, page, prompt).popup_at(self.url_bar)
+        if keep_focus and focused is not None and not sip.isdeleted(focused):
+            focused.setFocus()  # (an offer that comes by itself doesn't take the keyboard from the page)
+
+    def _update_autofill_icon(self) -> None:
+        tab = self.current_tab()
+        for bubble in self.findChildren(AutofillBubble, options=Qt.FindChildOption.FindDirectChildrenOnly):
+            alive = bubble.page is not None and not sip.isdeleted(bubble.page)  # (a pop-up's offer outlives the pop-up)
+            dropped = alive and bubble.kind != "manage" and bubble.prompt not in self.autofill.prompts(bubble.page)
+            if dropped or (alive and tab is not None and bubble.page is not tab.page and any(t.page is bubble.page for t in self.tabs())):
+                bubble.close()  # (left for another tab, or the offer is over: it waits behind that tab's key icon)
+        action = self.url_bar.autofill_action
+        prompts = self.autofill.prompts(tab.page if tab is not None else None)
+        origin = origin_of(tab.url()) if tab is not None else ""
+        if prompts:
+            kind = prompts[0].get("kind")
+            action.setIcon(icon({"save-card": "card", "save-address": "pin"}.get(kind, "key"), P.ACCENT))
+            action.setToolTip({"save-card": "Save card", "save-address": "Save address"}.get(kind, "Save password"))
+        elif origin and self.autofill.data.logins_for(origin):
+            action.setIcon(icon("key", P.TEXT_2))
+            action.setToolTip("Saved passwords for this site")
+        else:
+            action.setVisible(False)
+            return
+        action.setVisible(True)
 
     def apply_force_dark(self) -> None:
         # Takes effect as pages load; open tabs aren't reloaded so nothing typed into them is lost.

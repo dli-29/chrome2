@@ -264,7 +264,8 @@ main() {
   # 4. Self-test
   step "Self-test"
   local rc=0
-  "$venv_python" -m chrome2_engine_selftest </dev/null || rc=$?
+  "$venv_python" -m chrome2_engine_selftest </dev/null 2>"$tmp/selftest.log" || rc=$?
+  [ "$rc" = 0 ] || { say "(the test's messages:)"; tail -n 25 "$tmp/selftest.log"; }
   case $rc in
     0) ;;
     2) warn "H.264 and AAC are supported, but the test clip didn't play in the background test - try a video in Chrome 2 itself." ;;

@@ -131,6 +131,53 @@ def mapped_files(pid: int) -> list[str]:
     return [line[1:] for line in out.splitlines() if line.startswith("n")]
 
 
+HTTPS_URLS = ("https://www.google.com/generate_204", "https://example.com/", "https://github.com/")
+
+
+def https_with_qt(urls) -> tuple[bool, str]:
+    """QtNetwork over HTTPS (what Chrome 2 uses for Web Store downloads): Qt's TLS backend with the system's roots."""
+    from PyQt6.QtCore import QEventLoop, QTimer, QUrl
+    from PyQt6.QtNetwork import QNetworkAccessManager, QNetworkReply, QNetworkRequest
+    manager, detail = QNetworkAccessManager(), "no URL tried"
+    for url in urls:
+        reply = manager.get(QNetworkRequest(QUrl(url)))
+        ssl_errors: list[str] = []
+        reply.sslErrors.connect(lambda errors: ssl_errors.extend(e.errorString() for e in errors))
+        loop = QEventLoop()
+        reply.finished.connect(loop.quit)
+        QTimer.singleShot(20000, loop.quit)
+        loop.exec()
+        status = reply.attribute(QNetworkRequest.Attribute.HttpStatusCodeAttribute)
+        if reply.isFinished() and reply.error() == QNetworkReply.NetworkError.NoError and not ssl_errors:
+            return True, f"{url} -> HTTP {status}"
+        detail = f"{url}: {reply.errorString()} {ssl_errors}"
+        reply.abort()
+    return False, detail
+
+
+def https_with_chromium(page, urls) -> tuple[bool, str]:
+    """A page over HTTPS in Qt WebEngine (Chromium's own network stack and certificate checks)."""
+    from PyQt6.QtCore import QEventLoop, QTimer, QUrl
+    detail = "no URL tried"
+    for url in urls:
+        outcome: dict = {}
+        loop = QEventLoop()
+
+        def finished(ok: bool) -> None:
+            outcome["ok"] = ok
+            loop.quit()
+
+        page.loadFinished.connect(finished)
+        page.load(QUrl(url))
+        QTimer.singleShot(30000, loop.quit)
+        loop.exec()
+        page.loadFinished.disconnect(finished)
+        if outcome.get("ok"):
+            return True, f"{url} loaded in Chromium (title {page.title()!r})"
+        detail = f"{url}: load {'failed' if outcome else 'timed out'}"
+    return False, detail
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     parser.add_argument("media_dir")
@@ -196,6 +243,12 @@ def main() -> int:
                   f"events={','.join(play.get('events', []))}")
     if result.get("error"):
         print(f"INFO probe: {result['error']}")
+
+    # HTTPS works without Homebrew's OpenSSL configuration: QtNetwork (OpenSSL backend) and Chromium
+    ok, detail = https_with_qt(HTTPS_URLS)
+    check(ok, f"HTTPS with QtNetwork ({QSslSocket.activeBackend()}): {detail}")
+    ok, detail = https_with_chromium(probe.page, HTTPS_URLS[1:])
+    check(ok, f"HTTPS page in Qt WebEngine: {detail}")
 
     # (d) What is mapped: this process (dyld) and every Chromium helper process (lsof), while they still run
     if sys.platform == "darwin":

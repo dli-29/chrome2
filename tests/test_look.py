@@ -19,7 +19,7 @@ from PyQt6.QtGui import QColor, QImage
 from PyQt6.QtWidgets import QAbstractButton, QLabel, QWidget
 
 import extbuilder as eb
-from helpers import load, poll_js, run_js, run_js_async, spin, stays_absent, wait_attr, wait_until
+from helpers import load, poll_js, run_js, run_js_async, spin, stays_absent, wait_until
 from test_extension_review import ext_page, simple_ext
 
 NTP = "foxglove://newtab"

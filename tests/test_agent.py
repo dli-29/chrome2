@@ -637,7 +637,7 @@ def test_toolbar_button_and_shortcut_toggle_the_panel(window):
 
 # ── the API key ───────────────────────────────────────────────────────────────────────────
 @pytest.fixture
-def memory_keyring():
+def memory_keyring(fg, monkeypatch):
     keyring = pytest.importorskip("keyring")
     from keyring.backend import KeyringBackend
     from keyring.backends import fail
@@ -661,6 +661,7 @@ def memory_keyring():
     previous = keyring.get_keyring()
     backend = MemoryKeyring()
     keyring.set_keyring(backend)
+    monkeypatch.setattr(fg, "_secret_store", None)  # the app's SecretStore finds this keychain
     yield SimpleNamespace(keyring=keyring, backend=backend, fail=fail)
     keyring.set_keyring(previous)
 
@@ -668,9 +669,11 @@ def memory_keyring():
 def test_api_key_in_the_keychain(fg, tmp_path, memory_keyring, monkeypatch):
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
     store = fg.AgentKeyStore(tmp_path)
+    assert store.secrets is fg.secret_store() and store.keychain()  # the same keychain items as saved passwords
     assert store.load() == ("", "")
     assert store.save("  sk-ant-test-1  ") == "keychain"
-    assert memory_keyring.backend.store == {("Chrome 2", "anthropic_api_key"): "sk-ant-test-1"}
+    assert memory_keyring.backend.store == {(fg.KEYCHAIN_SERVICE, "anthropic_api_key"): "sk-ant-test-1"}
+    assert fg.KEYCHAIN_SERVICE == "Chrome 2" and fg.secret_store().get("anthropic_api_key") == "sk-ant-test-1"
     assert not store.file.exists()
     assert store.load() == ("sk-ant-test-1", "keychain")
     monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-from-env")
@@ -684,6 +687,7 @@ def test_api_key_file_without_a_keychain(fg, tmp_path, memory_keyring, monkeypat
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
     memory_keyring.keyring.set_keyring(memory_keyring.fail.Keyring())  # keyring installed, but no backend
     store = fg.AgentKeyStore(tmp_path)
+    assert not store.keychain()
     assert store.save("sk-ant-file") == "file"
     assert store.file.read_text() == "sk-ant-file"
     if os.name == "posix":
@@ -692,7 +696,9 @@ def test_api_key_file_without_a_keychain(fg, tmp_path, memory_keyring, monkeypat
     store.remove()
     assert not store.file.exists() and store.load() == ("", "")
     monkeypatch.setitem(sys.modules, "keyring", None)  # keyring not installed at all
-    assert fg.AgentKeyStore.keyring() is None and not fg.AgentKeyStore.keyring_installed()
+    monkeypatch.setattr(fg, "_secret_store", None)
+    assert not store.keychain() and not fg.AgentKeyStore.keyring_installed()
+    assert "pip install keyring" in fg.secret_store().problem()
     assert store.save("sk-ant-2") == "file" and store.load() == ("sk-ant-2", "file")
 
 

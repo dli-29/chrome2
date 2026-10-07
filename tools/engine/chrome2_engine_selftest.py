@@ -182,8 +182,12 @@ def main(argv=None) -> int:
     parser.add_argument("--json", action="store_true", help="print the raw results as JSON too")
     parser.add_argument("--platform", default=None, help="Qt platform (default: offscreen - no window)")
     parser.add_argument("--no-play", action="store_true", help="only ask which formats are supported")
+    parser.add_argument("--verbose", action="store_true", help="show Chromium's own log messages")
     args = parser.parse_args(argv)
     os.environ["QT_QPA_PLATFORM"] = args.platform or os.environ.get("CHROME2_SELFTEST_PLATFORM", "offscreen")
+    flags = os.environ.get("QTWEBENGINE_CHROMIUM_FLAGS", "").split()
+    if not args.verbose and not any(flag.startswith("--log-level") for flag in flags):
+        os.environ["QTWEBENGINE_CHROMIUM_FLAGS"] = " ".join(flags + ["--log-level=3"])  # (as Chrome 2 does)
     try:
         info = engine_info()
     except ImportError as exc:

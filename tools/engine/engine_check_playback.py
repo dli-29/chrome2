@@ -110,7 +110,7 @@ def dyld_images() -> list[str]:
 
 
 def descendants(pid: int) -> list[tuple[int, str]]:
-    table = subprocess.run(["ps", "-A", "-o", "pid=,ppid=,command="], stdout=subprocess.PIPE, text=True).stdout
+    table = subprocess.run(["ps", "-A", "-ww", "-o", "pid=,ppid=,command="], stdout=subprocess.PIPE, text=True).stdout
     children: dict[int, list[tuple[int, str]]] = {}
     for line in table.splitlines():
         parts = line.split(None, 2)

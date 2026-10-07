@@ -19,8 +19,9 @@
 # Remove everything it installed:  bash install-engine.sh --uninstall
 #
 # Optional settings (environment variables): CHROME2_ENGINE_TAG (another release), CHROME2_ENGINE_BASE_URL
-# (another download folder, e.g. file:///path/to/dir), CHROME2_ENGINE_HOME, CHROME2_VENV, CHROME2_PYTHON,
-# CHROME2_SKIP_PIP=1.
+# (another download location: a URL, or a folder on this Mac holding the release files - e.g. ~/Downloads after
+# downloading them in the browser), CHROME2_GITHUB_TOKEN (a GitHub token, to download from the release while the
+# repository is private), CHROME2_ENGINE_HOME, CHROME2_VENV, CHROME2_PYTHON, CHROME2_SKIP_PIP=1.
 
 DEFAULT_REPO="dli-29/chrome2"  # set by the release workflow
 DEFAULT_ENGINE_TAG="engine-qt6.11.2-arm64"  # set by the release workflow
@@ -67,12 +68,38 @@ sys.exit(0 if ok else 1)
 PY
 }
 
-fetch() {  # fetch URL FILE [quiet]
-  if [ "${3:-}" = quiet ]; then
-    curl -fsSL --retry 3 --retry-delay 2 --connect-timeout 30 -o "$2" "$1"
+curl_to() {  # curl_to FILE quiet|progress URL [curl options...]
+  local target=$1 mode=$2 url=$3
+  shift 3
+  if [ "$mode" = quiet ]; then
+    curl -fsSL --retry 3 --retry-delay 2 --connect-timeout 30 "$@" -o "$target" "$url"
   else
-    curl -fL --retry 3 --retry-delay 2 --connect-timeout 30 --progress-bar -o "$2" "$1"
+    curl -fL --retry 3 --retry-delay 2 --connect-timeout 30 --progress-bar "$@" -o "$target" "$url"
   fi
+}
+
+# get NAME FILE [quiet]: one file of the release - from the release URL (plain curl, no login), from a folder on
+# this Mac, or (CHROME2_GITHUB_TOKEN, for a private repository) through GitHub's API.
+get() {
+  local name=$1 target=$2 mode=${3:-progress}
+  case $BASE_URL in
+    /*) cp "$BASE_URL/$name" "$target"; return ;;
+  esac
+  if [ -z "$TOKEN" ]; then
+    curl_to "$target" "$mode" "$BASE_URL/$name"
+    return
+  fi
+  if [ ! -f "$tmp/release.json" ]; then
+    curl_to "$tmp/release.json" quiet "https://api.github.com/repos/$REPO/releases/tags/$TAG" -H "@$tmp/auth" ||
+      return 1
+  fi
+  local id
+  id=$("$PYTHON" -c 'import json, sys
+print(next((str(a["id"]) for a in json.load(open(sys.argv[1]))["assets"] if a["name"] == sys.argv[2]), ""))' \
+       "$tmp/release.json" "$name")
+  [ -n "$id" ] || { warn "the release has no $name"; return 1; }
+  curl_to "$target" "$mode" "https://api.github.com/repos/$REPO/releases/assets/$id" -H "@$tmp/auth" \
+    -H "Accept: application/octet-stream"
 }
 
 uninstall() {
@@ -96,6 +123,11 @@ main() {
   TAG="${CHROME2_ENGINE_TAG:-$DEFAULT_ENGINE_TAG}"
   BASE_URL="${CHROME2_ENGINE_BASE_URL:-https://github.com/$REPO/releases/download/$TAG}"
   BASE_URL="${BASE_URL%/}"
+  # shellcheck disable=SC2088  # (a literal ~/ that came in quoted)
+  case $BASE_URL in "~/"*) BASE_URL="$HOME/${BASE_URL#"~/"}" ;; esac
+  TOKEN="${CHROME2_GITHUB_TOKEN:-}"
+  unset CHROME2_GITHUB_TOKEN  # (not passed on to pip & co.)
+  [ -z "${CHROME2_ENGINE_BASE_URL:-}" ] || TOKEN=""
   ENGINE_HOME="${CHROME2_ENGINE_HOME:-$HOME/Library/Application Support/Chrome2 Engine}"
   VENV="${CHROME2_VENV:-$HOME/chrome2-env}"
   APP_SCRIPT="$HOME/Desktop/temp/foxglove.py"
@@ -134,13 +166,16 @@ main() {
   tmp=$(mktemp -d "${TMPDIR:-/tmp}/chrome2-engine.XXXXXX")
   # shellcheck disable=SC2064
   trap "rm -rf '$tmp'" EXIT
+  if [ -n "$TOKEN" ]; then
+    (umask 077 && printf 'Authorization: Bearer %s\n' "$TOKEN" > "$tmp/auth")  # (a file: keeps it out of ps)
+  fi
 
   read_manifest() { "$PYTHON" -c 'import json, sys; print(json.load(open(sys.argv[1])).get(sys.argv[2], ""))' "$1" "$2"; }
 
   # 2. The release
   step "Checking the engine release ($TAG)"
-  fetch "$BASE_URL/$MANIFEST" "$tmp/$MANIFEST" quiet ||
-    die "Couldn't download $BASE_URL/$MANIFEST - check your internet connection."
+  get "$MANIFEST" "$tmp/$MANIFEST" quiet ||
+    die "Couldn't download $BASE_URL/$MANIFEST - check your internet connection. (If the repository is private, downloads need a login: download the release files in your browser and run this with CHROME2_ENGINE_BASE_URL=~/Downloads, or set CHROME2_GITHUB_TOKEN.)"
   local version min_macos expected_sha qt chromium size
   version=$(read_manifest "$tmp/$MANIFEST" version)
   min_macos=$(read_manifest "$tmp/$MANIFEST" min_macos)
@@ -159,8 +194,8 @@ main() {
     say "Already installed in $(shell_path "$target")."
   else
     step "Downloading the engine (${size:+$((size / 1000000)) MB})"
-    fetch "$BASE_URL/$TARBALL.sha256" "$tmp/$TARBALL.sha256" quiet || die "Couldn't download $TARBALL.sha256."
-    fetch "$BASE_URL/$TARBALL" "$tmp/$TARBALL" || die "Couldn't download $BASE_URL/$TARBALL."
+    get "$TARBALL.sha256" "$tmp/$TARBALL.sha256" quiet || die "Couldn't download $TARBALL.sha256."
+    get "$TARBALL" "$tmp/$TARBALL" || die "Couldn't download $BASE_URL/$TARBALL."
     local published actual
     published=$(awk '{ print $1; exit }' "$tmp/$TARBALL.sha256")
     actual=$(shasum -a 256 "$tmp/$TARBALL" | awk '{ print $1 }')

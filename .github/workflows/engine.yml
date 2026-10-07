@@ -249,13 +249,14 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ needs.build.outputs.tag }}
+          PRIVATE_REPO: ${{ github.event.repository.private }}
         run: |
           set -euo pipefail
           cd dist
           sha256sum -c chrome2-engine-arm64.tar.gz.sha256
-          python3 - "$TAG" "$GITHUB_REPOSITORY" > notes.md <<'PY'
+          python3 - "$TAG" "$GITHUB_REPOSITORY" "$PRIVATE_REPO" > notes.md <<'PY'
           import json, sys
-          tag, repo = sys.argv[1], sys.argv[2]
+          tag, repo, private = sys.argv[1], sys.argv[2], sys.argv[3] == "true"
           m = json.load(open("chrome2-engine-manifest.json"))
           url = f"https://github.com/{repo}/releases/download/{tag}/install-engine.sh"
           print(f"""Chrome 2's engine with **H.264 / AAC** (proprietary codecs): PyQt6 {m['pyqt_version']} + Qt WebEngine {m['qt_version']} (Chromium {m['chromium_version']}), built from Homebrew's bottles and made self-contained.
@@ -279,6 +280,10 @@ jobs:
           | Built on | macOS {m['build']['runner_macos']}, commit {m['build']['commit'][:12]}, run #{m['build']['build_number']} |
           | Homebrew | qtbase {m['homebrew_versions'].get('qtbase')}, qtwebengine {m['homebrew_versions'].get('qtwebengine')}, pyqt {m['homebrew_versions'].get('pyqt')} |
           """.replace("\n          ", "\n"))
+          if private:
+              print("> **Note:** while this repository is private, these downloads need a GitHub login, so the one-line "
+                    "command above gets *404*. Make the repository public, or download the four files in your browser "
+                    "and run `CHROME2_ENGINE_BASE_URL=~/Downloads bash ~/Downloads/install-engine.sh`.")
           PY
           files="chrome2-engine-arm64.tar.gz chrome2-engine-arm64.tar.gz.sha256 chrome2-engine-manifest.json install-engine.sh"
           title="Chrome 2 engine: Qt WebEngine $(python3 -c 'import json; print(json.load(open("chrome2-engine-manifest.json"))["qt_version"])') with H.264/AAC (Apple Silicon)"
@@ -316,14 +321,31 @@ jobs:
         run: /bin/bash tools/engine/ci_homebrew.sh hide
 
       - name: The published one-line install command
+        env:
+          PRIVATE_REPO: ${{ github.event.repository.private }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           mkdir -p "$FAKE_HOME"
           export HOME="$FAKE_HOME"
           url="https://github.com/$GITHUB_REPOSITORY/releases/download/$TAG/install-engine.sh"
-          echo "+ /bin/bash -c \"\$(curl -fsSL $url)\""
-          /bin/bash -c "$(curl -fsSL "$url")" 2>&1 | tee "$RUNNER_TEMP/install.log"
+          if [ "$PRIVATE_REPO" != "true" ]; then
+            echo "+ /bin/bash -c \"\$(curl -fsSL $url)\""
+            /bin/bash -c "$(curl -fsSL "$url")" 2>&1 | tee "$RUNNER_TEMP/install.log"
+          else
+            # Anonymous downloads of a private repository's release assets get 404: the one-liner only works once
+            # the repository is public. Check the published release anyway, downloading through the API with a token.
+            echo "::warning::$GITHUB_REPOSITORY is private, so 'curl $url' gets 404 without a login. Make the repository public for the one-line installer; until then: CHROME2_GITHUB_TOKEN=<token>, or download the release files in a browser and use CHROME2_ENGINE_BASE_URL=~/Downloads. Verifying the published release through the API instead."
+            api="https://api.github.com/repos/$GITHUB_REPOSITORY/releases"
+            id=$(curl -fsSL -H "Authorization: Bearer $GH_TOKEN" "$api/tags/$TAG" | /Library/Frameworks/Python.framework/Versions/3.14/bin/python3.14 -c '
+          import json, sys
+          print(next(a["id"] for a in json.load(sys.stdin)["assets"] if a["name"] == "install-engine.sh"))')
+            script=$(curl -fsSL -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/octet-stream" "$api/assets/$id")
+            CHROME2_GITHUB_TOKEN="$GH_TOKEN" /bin/bash -c "$script" 2>&1 | tee "$RUNNER_TEMP/install.log"
+          fi
           grep -q "H.264: supported" "$RUNNER_TEMP/install.log"
+          grep -q "AAC: supported" "$RUNNER_TEMP/install.log"
           grep -q "Playback: OK" "$RUNNER_TEMP/install.log" || echo "::warning::self-test playback didn't report OK"
+          "$HOME/chrome2-env/bin/python3" -c 'import anthropic, keyring; print("anthropic", anthropic.__version__, "| keyring", keyring.__version__ if hasattr(keyring, "__version__") else "ok")'
 
       - name: Restore Homebrew
         if: always()

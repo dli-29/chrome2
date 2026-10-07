@@ -5,10 +5,15 @@ Proves, with Homebrew out of the way, that the installed engine
   * is what gets imported (PyQt6 and every Qt framework load from the engine folder),
   * reports H.264 and AAC as supported (MediaSource.isTypeSupported / canPlayType),
   * actually plays an H.264+AAC .mp4 served over HTTP - both as a plain <video src> and through Media Source
-    Extensions with a fragmented .mp4 (how Instagram Reels / TikTok / YouTube stream),
+    Extensions with a fragmented .mp4 (how Instagram Reels / TikTok / YouTube stream) - with sound on, and
+    Chromium's media pipeline really decodes the AAC track (webkitAudioDecodedByteCount > 0),
+  * decodes AAC with Web Audio (decodeAudioData of an .m4a and of the .mp4: duration and a non-silent signal),
+  * keeps Qt's own paths (QLibraryInfo: prefix, plugins, libraries, data, translations) inside the engine, and
+    finds its plugins there even without QT_PLUGIN_PATH,
   * and that neither this process nor Chromium's helper processes map anything from /opt/homebrew or /usr/local.
 
-MEDIA_DIR must hold test-h264-aac.mp4 and test-h264-aac-frag.mp4. Exit status 0 only if everything holds.
+MEDIA_DIR must hold test-h264-aac.mp4 (10 s), test-h264-aac-frag.mp4 and test-aac.m4a (3 s).
+Exit status 0 only if everything holds.
 """
 from __future__ import annotations
 
@@ -25,6 +30,22 @@ FORBIDDEN = ("/opt/homebrew", "/usr/local/")
 NEED_SECONDS = 1.5
 MSE_TYPE = 'video/mp4; codecs="avc1.4D401F, mp4a.40.2"'
 EVIDENCE_TYPES = {"H.264": 'video/mp4; codecs="avc1.42E01E"', "AAC": 'audio/mp4; codecs="mp4a.40.2"'}
+DECODES = {"aac-m4a": ("test-aac.m4a", 3.0), "mp4-audio": ("test-h264-aac.mp4", 10.0)}  # file, seconds of audio
+QT_PATHS = ("PrefixPath", "PluginsPath", "LibrariesPath", "LibraryExecutablesPath", "DataPath", "ArchDataPath",
+            "TranslationsPath", "QmlImportsPath")
+
+# Run in a separate Python (the venv's): Qt with QT_PLUGIN_PATH removed must still find the engine's plugins.
+PLUGINS_WITHOUT_ENV = r"""
+import json, os, sys
+os.environ.pop("QT_PLUGIN_PATH", None)
+os.environ["QT_QPA_PLATFORM"] = "offscreen"
+from PyQt6.QtCore import QCoreApplication, QLibraryInfo
+from PyQt6.QtGui import QGuiApplication, QImageReader
+app = QGuiApplication([sys.argv[0]])
+print(json.dumps({"platform": app.platformName(), "libraryPaths": QCoreApplication.libraryPaths(),
+                  "plugins": QLibraryInfo.path(QLibraryInfo.LibraryPath.PluginsPath),
+                  "imageFormats": sorted(bytes(f).decode() for f in QImageReader.supportedImageFormats())}))
+"""
 
 
 class RangeHandler(SimpleHTTPRequestHandler):
@@ -210,9 +231,35 @@ def main() -> int:
         check(path.startswith(engine_real + "/"), f"{module.__name__} loads from the engine: {path}")
     from PyQt6.QtCore import QLibraryInfo
     from PyQt6.QtNetwork import QSslSocket
-    for name in ("PrefixPath", "PluginsPath", "LibrariesPath", "DataPath", "TranslationsPath"):
-        print(f"INFO QLibraryInfo.{name} = {QLibraryInfo.path(getattr(QLibraryInfo.LibraryPath, name))}")
+
+    def inside(path: str) -> bool:
+        real = os.path.realpath(path)
+        return real == engine_real or real.startswith(engine_real + "/")
+
+    for name in QT_PATHS:
+        member = getattr(QLibraryInfo.LibraryPath, name, None)
+        if member is None:
+            continue
+        path = QLibraryInfo.path(member)
+        check(inside(path), f"QLibraryInfo.{name} is inside the engine: {path}")
+    prefix = QLibraryInfo.path(QLibraryInfo.LibraryPath.PrefixPath)
+    check(os.path.realpath(prefix) == engine_real, f"Qt's prefix is the engine folder itself: {prefix}")
+    plugins_dir = QLibraryInfo.path(QLibraryInfo.LibraryPath.PluginsPath)
+    check(os.path.isfile(os.path.join(plugins_dir, "platforms", "libqcocoa.dylib")),
+          f"QLibraryInfo.PluginsPath holds the engine's plugins: {plugins_dir}")
+    print(f"INFO QLibraryInfo.SettingsPath = {QLibraryInfo.path(QLibraryInfo.LibraryPath.SettingsPath)} (not used on macOS)")
     print(f"INFO QT_PLUGIN_PATH = {os.environ.get('QT_PLUGIN_PATH')}")
+    out = subprocess.run([sys.executable, "-c", PLUGINS_WITHOUT_ENV], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                         text=True, timeout=120)
+    try:
+        bare = json.loads(out.stdout.strip().splitlines()[-1])
+    except (IndexError, ValueError):
+        bare = {}
+        print(f"INFO plugin check output: {out.stdout[-500:]} {out.stderr[-1500:]}")
+    check(bool(bare) and bare.get("platform") == "offscreen" and {"webp", "svg", "jpeg"} <= set(bare.get("imageFormats", []))
+          and all(inside(p) or p.startswith("/Library/Frameworks/Python.framework/") for p in bare.get("libraryPaths", [])),
+          f"without QT_PLUGIN_PATH Qt still finds the engine's plugins: platform {bare.get('platform')}, "
+          f"library paths {bare.get('libraryPaths')}, image formats {bare.get('imageFormats')}")
     print(f"INFO QTWEBENGINEPROCESS_PATH = {os.environ.get('QTWEBENGINEPROCESS_PATH')}")
     backends = QSslSocket.availableBackends()
     check(QSslSocket.supportsSsl(), f"QtNetwork TLS works (backends {backends}, active {QSslSocket.activeBackend()}, "
@@ -221,9 +268,11 @@ def main() -> int:
     # (b) Codecs and playback over HTTP
     server, port = serve(os.path.abspath(args.media_dir))
     base = f"http://127.0.0.1:{port}"
-    plays = [("progressive", "file", f"{base}/test-h264-aac.mp4", "", NEED_SECONDS),
-             ("mse", "mse", f"{base}/test-h264-aac-frag.mp4", args.mse_type, NEED_SECONDS)]
-    probe = selftest.MediaProbe(plays, page_url=f"{base}/index.html", timeout_s=90)
+    # (sound on: no muted shortcut in Chromium's audio path; the runner has no speakers to bother)
+    plays = [("progressive", "file", f"{base}/test-h264-aac.mp4", "", NEED_SECONDS, False, True),
+             ("mse", "mse", f"{base}/test-h264-aac-frag.mp4", args.mse_type, NEED_SECONDS, False, True)]
+    decodes = [(key, f"{base}/{name}") for key, (name, _seconds) in DECODES.items()]
+    probe = selftest.MediaProbe(plays, page_url=f"{base}/index.html", timeout_s=90, decodes=decodes)
     result = probe.run()
     report["result"] = result
     support = result.get("support") or {}
@@ -241,6 +290,19 @@ def main() -> int:
         check(ok, f"playback {key}: currentTime={play.get('currentTime', 0):.2f}s videoWidth={play.get('videoWidth')} "
                   f"videoHeight={play.get('videoHeight')} error={play.get('error') or 'none'} "
                   f"events={','.join(play.get('events', []))}")
+        audio, video = play.get("audioBytes"), play.get("videoBytes")
+        check(isinstance(audio, int) and audio > 0,
+              f"playback {key}: Chromium decoded the AAC track while playing (webkitAudioDecodedByteCount={audio}, "
+              f"webkitVideoDecodedByteCount={video})")
+    for key, (name, seconds) in DECODES.items():
+        dec = (result.get("decode") or {}).get(key) or {}
+        ok = bool(dec.get("ok")) and abs(dec.get("duration", 0) - seconds) < 0.3
+        check(ok, f"Web Audio decodeAudioData({name}): duration={dec.get('duration', 0):.2f}s (expected {seconds}) "
+                  f"sampleRate={dec.get('sampleRate')} channels={dec.get('channels')} rms={dec.get('rms', 0):.3f} "
+                  f"error={dec.get('error') or 'none'}")
+    for name, caps in (result.get("hardware") or {}).items():
+        print(f"INFO MediaCapabilities 1080p {name}: {caps} (powerEfficient = hardware decoding; CI's virtual Macs "
+              f"may have none)")
     if result.get("error"):
         print(f"INFO probe: {result['error']}")
 

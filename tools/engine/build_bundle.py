@@ -8,15 +8,21 @@ Runs on a macOS arm64 machine (GitHub's macos-15 runner) after
 and turns Homebrew's bottles (qtwebengine is built with -DFEATURE_webengine_proprietary_codecs=ON) into one
 self-contained folder that works without Homebrew and without admin rights:
 
-    chrome2-engine/
+    chrome2-engine/                  = Qt's install prefix (see below)
       site/PyQt6/...                 the PyQt6 modules Chrome 2 imports (+ sip), plus the .pth helpers
-      qt/lib/Qt*.framework           only the Qt frameworks those modules need (QtWebEngineCore with its
+      qt/<qt>/macos/lib/Qt*.framework  only the Qt frameworks those modules need (QtWebEngineCore with its
                                      QtWebEngineProcess helper app, resources, locales, ICU data)
-      qt/plugins/<kind>/*.dylib      platforms (cocoa, offscreen, ...), imageformats, iconengines, tls, styles, ...
+      share/qt/plugins/<kind>/*.dylib  platforms (cocoa, offscreen, ...), imageformats, iconengines, tls, styles, ...
       lib/*.dylib                    every other non-system library they load (ICU, OpenSSL, libpng, ...)
       share/selftest-h264-aac.mp4    a tiny H.264+AAC clip for the installer's self-test
-      licenses/<formula>/...         license files of everything bundled
-      manifest.json
+      licenses/                      license texts of everything bundled + SOURCES.txt (where the sources are)
+      manifest.json, files.sha256    what's inside; the SHA-256 of every file (the installer's repair check)
+
+Homebrew's Qt is relocatable: it finds its prefix by going up from the folder that holds QtCore.framework
+(Cellar/qtbase/<version>/lib -> four levels -> /opt/homebrew) and takes its plugin, data and translation folders
+relative to that (share/qt/plugins, ...). The frameworks sit just as deep below the bundle's root, so Qt's
+prefix is the bundle itself and every path QLibraryInfo reports stays inside it - in the browser process and
+in the QtWebEngineProcess helpers alike.
 
 Every Mach-O load command, install id and LC_RPATH is rewritten to @rpath / @loader_path, so nothing refers to
 /opt/homebrew (or any other absolute non-system path); everything is re-signed ad hoc. The build fails if otool
@@ -40,16 +46,18 @@ import struct
 import subprocess
 import sys
 import tarfile
+import time
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 REPO = HERE.parent.parent
 
 BUNDLE_NAME = "chrome2-engine"
-TARBALL = "chrome2-engine-arm64.tar.gz"
+TARBALL = "chrome2-engine-arm64.tar.gz"  # the fixed name; each build's tarball is chrome2-engine-arm64-<version>.tar.gz
 RELEASE_MANIFEST = "chrome2-engine-manifest.json"
-HELPER_CANDIDATES = ("qt/lib/QtWebEngineCore.framework/Versions/A/Helpers/QtWebEngineProcess.app",
-                     "qt/lib/QtWebEngineCore.framework/Helpers/QtWebEngineProcess.app")
+NEWEST_TAG = "engine-arm64"  # the release that always holds the newest engine (the installer's default)
+HELPER_IN_FRAMEWORK = ("QtWebEngineCore.framework/Versions/A/Helpers/QtWebEngineProcess.app",
+                       "QtWebEngineCore.framework/Helpers/QtWebEngineProcess.app")
 
 # The PyQt6 modules foxglove.py imports (directly or through the modules it imports - the closure is taken from
 # sys.modules after importing these with Homebrew's Python).
@@ -61,6 +69,10 @@ OPTIONAL_MODULES = ["QtSvgWidgets", "QtOpenGL", "QtOpenGLWidgets", "QtQml", "QtQ
 # Plugin kinds to ship. A plugin is skipped when it would drag in a Qt framework the modules don't already need.
 PLUGIN_KINDS = ["platforms", "imageformats", "iconengines", "tls", "styles", "networkinformation", "generic",
                 "permissions", "position", "printsupport", "platforminputcontexts", "platformthemes"]
+SKIP_PLUGINS = {  # never shipped
+    "networkinformation/libqglib.dylib": "GLib/GIO backend for Linux desktops (macOS uses the Apple one); it would "
+                                         "bring GIO, which has Homebrew's module folder compiled in",
+}
 
 FORBIDDEN = ("/opt/homebrew", "/usr/local", "Cellar")
 SYSTEM_PREFIXES = ("/usr/lib/", "/System/Library/")
@@ -211,6 +223,7 @@ class Bundle:
     def __init__(self, root: Path, brew_prefix: str):
         self.root = root
         self.brew_prefix = brew_prefix
+        self.qt_lib_rel = "qt/lib"  # set from Homebrew's Qt before copying (see main)
         self.fallback_dirs = [os.path.join(brew_prefix, "lib"), os.path.join(brew_prefix, "Frameworks")]
         self.placed: dict[str, str] = {}       # source realpath (Mach-O) -> destination path in the bundle
         self.identity: dict[str, str] = {}     # source realpath -> name after "@rpath/" (frameworks and lib/)
@@ -314,7 +327,7 @@ class Bundle:
         if fw_src in self.frameworks:
             return
         name = os.path.basename(fw_src)
-        dst = self.root / "qt" / "lib" / name
+        dst = self.root / self.qt_lib_rel / name
 
         def ignore(directory: str, names: list[str]) -> set[str]:
             return {n for n in names if n in FRAMEWORK_IGNORE or n.endswith((".prl", ".dSYM"))}
@@ -359,7 +372,7 @@ class Bundle:
 
     # Rewriting load commands
     def rewrite(self, files: dict[str, MachO]) -> None:
-        qt_lib = self.root / "qt" / "lib"
+        qt_lib = self.root / self.qt_lib_rel
         lib = self.root / "lib"
         for src, dst in sorted(self.placed.items()):
             info = files[src]
@@ -420,11 +433,13 @@ for name in sys.argv[1].split(","):
     importlib.import_module("PyQt6." + name)
 from PyQt6.QtCore import PYQT_VERSION_STR, QT_VERSION_STR, QLibraryInfo
 from PyQt6.QtWebEngineCore import qWebEngineChromiumVersion
+import PyQt6.QtWebEngineCore as webengine
 print(json.dumps({
     "modules": {n: getattr(m, "__file__", None) for n, m in sys.modules.items() if n.startswith("PyQt6")},
     "plugins": QLibraryInfo.path(QLibraryInfo.LibraryPath.PluginsPath),
     "prefix": QLibraryInfo.path(QLibraryInfo.LibraryPath.PrefixPath),
     "qt": QT_VERSION_STR, "pyqt": PYQT_VERSION_STR, "chromium": qWebEngineChromiumVersion(),
+    "pyqt_webengine": getattr(webengine, "PYQT_WEBENGINE_VERSION_STR", ""),
     "python": sys.version.split()[0], "soabi": sysconfig.get_config_var("SOABI"),
 }))
 """
@@ -451,6 +466,33 @@ def copy_pyqt_package(src_dir: str, dst_dir: Path, keep_so: set[str]) -> None:
     shutil.copytree(src_dir, dst_dir, ignore=ignore, symlinks=False)
     for so in keep_so:
         os.chmod(dst_dir / so, 0o755)
+
+
+EXTEND_PATH = re.compile(r"^__path__\s*=\s*__import__\(['\"]pkgutil['\"]\)\.extend_path\(__path__,\s*__name__\)[ \t]*$", re.M)
+
+
+def seal_pyqt_package(package: Path) -> bool:
+    """PyQt6/__init__.py merges every PyQt6 folder on sys.path (pkgutil.extend_path). In the engine that would let
+    a pip-installed PyQt6 in the same environment supply the modules the engine leaves out - with pip's own Qt,
+    a second Qt in the process. Only the engine's own modules may be importable, so that line goes."""
+    init = package / "__init__.py"
+    text = init.read_text(encoding="utf-8")
+    text, count = EXTEND_PATH.subn(
+        "# chrome2-engine: __path__ is not extended to other PyQt6 folders - only the engine's own modules are\n"
+        "# importable, so a pip-installed PyQt6 elsewhere on sys.path can't bring a second Qt into the process.", text)
+    if count == 0 and "extend_path" in text:
+        raise SystemExit(f"error: {init} uses extend_path in an unexpected way - update seal_pyqt_package")
+    init.write_text(text, encoding="utf-8")
+    return count == 1
+
+
+def patch_constants(path: Path, values: dict[str, str]) -> None:
+    text = path.read_text(encoding="utf-8")
+    for name, value in values.items():
+        text, count = re.subn(rf"^{name} = .*$", f"{name} = {json.dumps(value)}", text, flags=re.M)
+        if count != 1:
+            raise SystemExit(f"error: {path} must contain exactly one line '{name} = ...'")
+    path.write_text(text, encoding="utf-8")
 
 
 def strip_binaries(paths: list[str]) -> int:
@@ -577,19 +619,118 @@ def scan_text_references(root: Path, machos: set[str]) -> tuple[list[str], list[
 
 
 def copy_licenses(root: Path, formulae: set[str], cellar: str) -> list[str]:
+    """The license files Homebrew keeps at the top of each keg (and in its share/doc folder)."""
     copied = []
     for formula in sorted(formulae):
         versions = sorted(Path(cellar, formula).glob("*"), key=lambda p: version_key(p.name))
         if not versions:
             continue
         keg = versions[-1]
-        for item in sorted(keg.iterdir()):
-            if re.match(r"(LICEN[CS]E|COPYING|NOTICE|LGPL|GPL|AUTHORS)", item.name, re.I) and item.is_file():
-                dst = root / "licenses" / formula / item.name
+        for folder in (keg, keg / "share" / "doc" / formula):
+            if not folder.is_dir():
+                continue
+            for item in sorted(folder.iterdir()):
+                if re.match(r"(LICEN[CS]E|COPYING|NOTICE|LGPL|GPL|AUTHORS)", item.name, re.I) and item.is_file():
+                    dst = root / "licenses" / formula / item.name
+                    if dst.exists():
+                        continue
+                    dst.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copyfile(item, dst)
+                    copied.append(f"{formula}/{item.name}")
+    return copied
+
+
+def fetch_qt_licenses(root: Path, formulae: set[str], versions: dict[str, str], work: Path) -> list[str]:
+    """Qt's kegs carry no license texts, so take each Qt module's LICENSES/ folder (LGPL-3.0, GPL-2.0/3.0, ...)
+    from its upstream source at the same version (github.com/qt/<module>, tag v<version>)."""
+    copied = []
+    for formula in sorted(f for f in formulae if f.startswith("qt")):
+        version = re.sub(r"_\d+$", "", versions[formula].split()[-1])
+        checkout = work / "qt-licenses" / formula
+        for attempt in range(3):
+            shutil.rmtree(checkout, ignore_errors=True)
+            steps = [["git", "clone", "--quiet", "--depth", "1", "--branch", f"v{version}", "--filter=blob:none",
+                      "--no-checkout", f"https://github.com/qt/{formula}.git", str(checkout)],
+                     ["git", "-C", str(checkout), "sparse-checkout", "set", "--no-cone", "/LICENSES/"],
+                     ["git", "-C", str(checkout), "checkout", "--quiet"]]
+            if all(run(cmd, check=False, quiet=True).returncode == 0 for cmd in steps) and \
+                    any((checkout / "LICENSES").glob("*.txt")):
+                break
+            log(f"    (fetching {formula}'s LICENSES failed, attempt {attempt + 1})")
+            time.sleep(10)
+        else:
+            raise SystemExit(f"error: couldn't get the license texts of {formula} {version} from github.com/qt")
+        for item in sorted((checkout / "LICENSES").iterdir()):
+            if item.is_file():
+                dst = root / "licenses" / formula / "LICENSES" / item.name
                 dst.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copyfile(item, dst)
-                copied.append(f"{formula}/{item.name}")
+                copied.append(f"{formula}/LICENSES/{item.name}")
     return copied
+
+
+def write_sources(root: Path, formulae: set[str], query: dict) -> list[dict]:
+    """licenses/SOURCES.txt: for every bundled Homebrew formula its version, license, upstream source and
+    Homebrew's build recipe (with any patches) - where to get the source of everything in the bundle."""
+    info = json.loads(brew("info", "--json=v2", *sorted(formulae)))["formulae"]
+    entries = []
+    for f in info:
+        stable = (f.get("urls") or {}).get("stable") or {}
+        installed = (f.get("installed") or [{}])[0]
+        recipe_path = f.get("ruby_source_path") or f"Formula/{f['name'][0]}/{f['name']}.rb"
+        recipe = f"https://github.com/Homebrew/homebrew-core/blob/{f.get('tap_git_head') or 'HEAD'}/{recipe_path}"
+        entries.append({"formula": f["name"], "version": installed.get("version") or f["versions"]["stable"],
+                        "license": f.get("license"), "homepage": f.get("homepage"), "source": stable.get("url"),
+                        "source_sha256": stable.get("checksum"), "homebrew_recipe": recipe})
+    lines = [
+        "Chrome 2 engine - sources of the bundled software",
+        "",
+        "Everything in this bundle comes unmodified from Homebrew's bottles (prebuilt packages) for macOS on Apple",
+        "Silicon; the only changes are relinking (install_name_tool), stripping local symbols, ad-hoc re-signing and",
+        "one line of PyQt6/__init__.py (it no longer merges other PyQt6 folders into the package).",
+        "Each part below is built by Homebrew's recipe (linked; it lists any patches) from the upstream source.",
+        "The Qt libraries are dynamically linked frameworks (LGPL-3.0): you may replace them with your own build.",
+        f"PyQt6 {query['pyqt']} and PyQt6-WebEngine {query.get('pyqt_webengine') or query['pyqt']} are GPL-3.0: "
+        "https://pypi.org/project/PyQt6/ and https://pypi.org/project/PyQt6-WebEngine/ (sources: the .tar.gz files)",
+        "",
+    ]
+    for e in entries:
+        lines += [f"{e['formula']} {e['version']}  (license: {e['license']})",
+                  f"  source:          {e['source']}" + (f"  (sha256 {e['source_sha256']})" if e["source_sha256"] else ""),
+                  f"  homepage:        {e['homepage']}",
+                  f"  Homebrew recipe: {e['homebrew_recipe']}", ""]
+    (root / "licenses").mkdir(exist_ok=True)
+    (root / "licenses" / "SOURCES.txt").write_text("\n".join(lines), encoding="utf-8")
+    (root / "licenses" / "README.txt").write_text(
+        "Licenses of the software in the Chrome 2 engine\n\n"
+        "  qt*/LICENSES/       Qt's license texts (Qt is used under the LGPL-3.0; some parts are GPL/BSD/MIT)\n"
+        "  qtwebengine/        also LICENSE.Chromium: Chromium and its third-party code\n"
+        "  pyqt/LICENSE        PyQt6 (GPL-3.0)\n"
+        "  <formula>/          the other libraries' own license files\n"
+        "  SOURCES.txt         where the source code of every part is, with versions and licenses\n\n"
+        "Codecs: this Qt WebEngine is built with Chromium's proprietary codecs (H.264, HEVC, AAC). Those formats\n"
+        "are covered by patents licensed by patent pools (e.g. Via LA / Access Advance). No patent license comes\n"
+        "with this bundle; it is made for personal use - check what applies to you before redistributing it.\n",
+        encoding="utf-8")
+    return entries
+
+
+def write_file_list(root: Path) -> int:
+    """files.sha256 (shasum -c format): every regular file of the bundle, so the installer can tell when files were
+    deleted or changed after installation and repair them."""
+    lines = []
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames.sort()
+        for filename in sorted(filenames):
+            full = os.path.join(dirpath, filename)
+            rel = os.path.relpath(full, root)
+            if os.path.islink(full) or rel == "files.sha256":
+                continue
+            if "\n" in rel or "\\" in rel:
+                raise SystemExit(f"error: unexpected file name in the bundle: {rel!r}")
+            lines.append(f"{sha256_of(Path(full))}  {rel}")
+    (root / "files.sha256").write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return len(lines)
 
 
 def dir_size(root: Path) -> tuple[int, int]:
@@ -622,6 +763,7 @@ def make_tarball(root: Path, target: Path) -> None:
 
 
 def patch_installer(source: Path, target: Path, tag: str, min_macos: str, repo: str) -> None:
+    """The released installer, with this build's defaults: the newest-engine release, its minimum macOS, the repo."""
     text = source.read_text(encoding="utf-8")
     replacements = {
         r'^DEFAULT_ENGINE_TAG=.*$': f'DEFAULT_ENGINE_TAG="{tag}"  # set by the release workflow',
@@ -643,6 +785,8 @@ def main() -> int:
     parser.add_argument("--python", default=None, help="Homebrew's python3.14 (default: brew --prefix python@3.14)")
     parser.add_argument("--selftest-media", default=None, help="small H.264+AAC .mp4 for the installer's self-test")
     parser.add_argument("--build-number", default=os.environ.get("GITHUB_RUN_NUMBER", "0"))
+    parser.add_argument("--build-attempt", default=os.environ.get("GITHUB_RUN_ATTEMPT", "1"),
+                        help="a re-run of the same build number gets its own version (6.11.2-b7.2)")
     parser.add_argument("--repo", default=os.environ.get("GITHUB_REPOSITORY", "dli-29/chrome2"))
     parser.add_argument("--commit", default=os.environ.get("GITHUB_SHA", ""))
     parser.add_argument("--no-strip", action="store_true", help="keep local symbols")
@@ -680,6 +824,23 @@ def main() -> int:
     if "QtWebEngineCore.framework" not in allowed:
         raise SystemExit("error: QtWebEngineCore.framework isn't among the dependencies")
 
+    # Where the frameworks go: as many levels below the bundle root as Homebrew's QtCore.framework folder is below
+    # Qt's prefix, so that Qt's relocatable prefix (and every QLibraryInfo path) is the bundle itself.
+    qtcore = next(p for p in required if os.path.basename(framework_root(p) or "") == "QtCore.framework")
+    homebrew_lib = os.path.dirname(framework_root(qtcore))
+    to_prefix = os.path.relpath(os.path.realpath(query["prefix"]), homebrew_lib)
+    levels = to_prefix.split("/")
+    if set(levels) != {".."} or not 1 <= len(levels) <= 4:
+        raise SystemExit(f"error: Qt's prefix {query['prefix']} isn't 1-4 levels above {homebrew_lib} ({to_prefix}); "
+                         "update the bundle layout")
+    qt_lib_rel = "/".join((["qt", query["qt"], "macos"][: len(levels) - 1]) + ["lib"])
+    plugins_rel = os.path.relpath(query["plugins"], query["prefix"])
+    if plugins_rel.startswith("..") or os.path.isabs(plugins_rel):
+        raise SystemExit(f"error: Qt's plugins ({query['plugins']}) aren't inside its prefix ({query['prefix']})")
+    bundle.qt_lib_rel = qt_lib_rel
+    log(f"    layout: Qt's prefix is {to_prefix} from {homebrew_lib} -> frameworks in {qt_lib_rel}, "
+        f"plugins in {plugins_rel} (Qt computes both from the bundle's location)")
+
     # 2. Optional modules and plugins that don't need more Qt
     for name in OPTIONAL_MODULES:
         if name in modules:
@@ -705,6 +866,9 @@ def main() -> int:
         for item in sorted(folder.iterdir()):
             if not item.name.endswith(".dylib") or not is_macho(str(item)):
                 continue
+            if f"{kind}/{item.name}" in SKIP_PLUGINS:
+                log(f"    skipping plugin {kind}/{item.name}: {SKIP_PLUGINS[f'{kind}/{item.name}']}")
+                continue
             try:
                 extra = bundle.qt_frameworks(bundle.closure([str(item)])) - allowed
             except SystemExit as exc:
@@ -723,28 +887,35 @@ def main() -> int:
     log("==> Copying into the bundle")
     keep_so = {os.path.basename(path) for path in modules.values()}
     copy_pyqt_package(pyqt_dir, root / "site" / "PyQt6", keep_so)
+    sealed = seal_pyqt_package(root / "site" / "PyQt6")
+    log(f"    PyQt6/__init__.py: {'extend_path removed (only the engine' + chr(39) + 's modules)' if sealed else 'no extend_path'}")
     roles: dict[str, tuple[str, Path]] = {}
     for path in modules.values():
         roles[path] = ("module", root / "site" / "PyQt6" / os.path.basename(path))
     for rel, path in plugins.items():
-        roles[path] = ("plugin", root / "qt" / "plugins" / rel)
+        roles[path] = ("plugin", root / plugins_rel / rel)
     files = bundle.closure(list(modules.values()) + list(plugins.values()))
     bundle.place_all(files, roles)
     for helper in ("chrome2_engine_env.py", "chrome2_engine_selftest.py"):
         shutil.copyfile(HERE / helper, root / "site" / helper)
+    patch_constants(root / "site" / "chrome2_engine_env.py", {"QT_LIB_REL": qt_lib_rel, "PLUGINS_REL": plugins_rel})
     if args.selftest_media:
         (root / "share").mkdir(exist_ok=True)
         shutil.copyfile(args.selftest_media, root / "share" / "selftest-h264-aac.mp4")
+    helper_candidates = [f"{qt_lib_rel}/{rel}" for rel in HELPER_IN_FRAMEWORK]
     helpers = [os.path.relpath(os.path.join(d, "QtWebEngineProcess.app"), root)
-               for d, dirs, _files in os.walk(root / "qt" / "lib" / "QtWebEngineCore.framework")
+               for d, dirs, _files in os.walk(root / qt_lib_rel / "QtWebEngineCore.framework")
                if "QtWebEngineProcess.app" in dirs and not os.path.islink(os.path.join(d, "QtWebEngineProcess.app"))]
-    if len(helpers) != 1 or helpers[0] not in HELPER_CANDIDATES or \
+    if len(helpers) != 1 or helpers[0] not in helper_candidates or \
             not (root / helpers[0] / "Contents" / "MacOS" / "QtWebEngineProcess").is_file():
-        raise SystemExit(f"error: expected one helper app at {' or '.join(HELPER_CANDIDATES)} (where "
+        raise SystemExit(f"error: expected one helper app at {' or '.join(helper_candidates)} (where "
                          f"chrome2_engine_env.py looks), found {helpers}")
     helper_rel = helpers[0]
     log(f"    helper: {helper_rel}")
-    resources = root / "qt/lib/QtWebEngineCore.framework/Versions/A/Resources"
+    resources = root / qt_lib_rel / "QtWebEngineCore.framework/Versions/A/Resources"
+    expected_prefix = os.path.normpath(os.path.join(root, qt_lib_rel, to_prefix))
+    if expected_prefix != os.path.normpath(root):
+        raise SystemExit(f"error: Qt's prefix would be {expected_prefix}, not the bundle")
     log(f"    QtWebEngineCore resources: {', '.join(sorted(p.name for p in resources.iterdir()))}")
 
     # 4. Relocate, strip, sign
@@ -800,38 +971,61 @@ def main() -> int:
     counts: dict[str, int] = {}
     for value in minos_by_file.values():
         counts[value] = counts.get(value, 0) + 1
-    licenses = copy_licenses(root, bundle.formulae, brew("--cellar"))
-    size, count = dir_size(root)
     versions = dict(line.split(" ", 1) for line in brew("list", "--versions").splitlines() if " " in line)
+    licenses = copy_licenses(root, bundle.formulae, brew("--cellar"))
+    licenses += fetch_qt_licenses(root, bundle.formulae, versions, work)
+    sources = write_sources(root, bundle.formulae, query)
+    missing = sorted(f for f in bundle.formulae if not any(item.startswith(f + "/") for item in licenses))
+    if missing:
+        log(f"    note: no license file in the kegs of {', '.join(missing)} (their licenses: licenses/SOURCES.txt)")
+    size, count = dir_size(root)
     qtwebengine = versions.get("qtwebengine", query["qt"]).split()[-1]
     qt_plain = re.sub(r"_\d+$", "", qtwebengine)
     tag = f"engine-qt{qt_plain}-arm64"
     version = f"{qt_plain}-b{args.build_number}"
+    if str(args.build_attempt) not in ("", "1"):
+        version += f".{args.build_attempt}"
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", version):
+        raise SystemExit(f"error: bad version {version!r}")
+    lib_users: dict[str, list[str]] = {}
+    for src, deps in bundle.edges.items():
+        if src not in bundle.placed:
+            continue
+        for target in deps.values():
+            if bundle.kind.get(target) == "lib":
+                lib_users.setdefault(bundle.identity[target], []).append(os.path.relpath(bundle.placed[src], root))
     sw_vers = run(["sw_vers", "-productVersion"]).stdout.strip()
     manifest = {
         "name": BUNDLE_NAME,
         "version": version,
         "release_tag": tag,
+        "newest_tag": NEWEST_TAG,
         "arch": "arm64",
         "min_macos": min_macos,
         "python": "3.14",
         "qt_version": query["qt"],
         "pyqt_version": query["pyqt"],
+        "pyqt_webengine_version": query.get("pyqt_webengine", ""),
         "chromium_version": query["chromium"],
         "proprietary_codecs": True,
         "built_at": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "build": {"runner_macos": sw_vers, "repo": args.repo, "commit": args.commit,
-                  "build_number": args.build_number, "homebrew": brew("--version").splitlines()[0],
+                  "build_number": args.build_number, "build_attempt": args.build_attempt,
+                  "homebrew": brew("--version").splitlines()[0],
                   "homebrew_python": query["python"], "homebrew_python_soabi": query["soabi"]},
         "homebrew_versions": {k: versions[k] for k in sorted(versions)},
         "bundled_formulae": sorted(bundle.formulae),
-        "layout": {"site": "site", "qt_lib": "qt/lib", "plugins": "qt/plugins", "lib": "lib",
+        "sources": sources,
+        "layout": {"qt_prefix": ".", "site": "site", "qt_lib": qt_lib_rel, "plugins": plugins_rel, "lib": "lib",
                    "webengine_helper": helper_rel, "env_module": "site/chrome2_engine_env.py",
-                   "selftest": "site/chrome2_engine_selftest.py"},
+                   "selftest": "site/chrome2_engine_selftest.py", "file_list": "files.sha256"},
         "pyqt_modules": sorted(modules),
+        "pyqt_package_sealed": sealed,
         "qt_frameworks": sorted(os.path.basename(p) for p in bundle.frameworks),
         "plugins": sorted(plugins),
+        "plugins_left_out": SKIP_PLUGINS,
         "libs": sorted(bundle.lib_names),
+        "lib_users": {k: sorted(set(v)) for k, v in sorted(lib_users.items())},
         "minos_counts": dict(sorted(counts.items(), key=lambda kv: version_key(kv[0]))),
         "minos_max_files": sorted(p for p, v in minos_by_file.items() if v == min_macos),
         "python_framework_refs": bundle.python_refs,
@@ -849,27 +1043,33 @@ def main() -> int:
         f"Chrome 2 engine {version}: PyQt6 {query['pyqt']} + Qt WebEngine {query['qt']} (Chromium "
         f"{query['chromium']}) with H.264/AAC, built from Homebrew bottles on macOS {sw_vers} (arm64).\n"
         f"Needs macOS {min_macos} or newer on Apple Silicon and python.org Python 3.14.\n"
-        "Install it with install-engine.sh (no admin rights needed); see manifest.json for what's inside.\n",
+        "Install it with install-engine.sh (no admin rights needed); see manifest.json for what's inside and\n"
+        "licenses/ for the licenses and where the sources are.\n",
         encoding="utf-8")
+    listed = write_file_list(root)
+    log(f"    files.sha256: {listed} files")
 
     # 7. Package
     log("==> Packaging")
-    tarball = out / TARBALL
+    tarball_name = f"chrome2-engine-arm64-{version}.tar.gz"
+    tarball = out / tarball_name
     make_tarball(root, tarball)
     digest = sha256_of(tarball)
-    (out / f"{TARBALL}.sha256").write_text(f"{digest}  {TARBALL}\n", encoding="utf-8")
-    release_manifest = dict(manifest, tarball=TARBALL, tarball_sha256=digest, tarball_bytes=tarball.stat().st_size)
+    (out / f"{tarball_name}.sha256").write_text(f"{digest}  {tarball_name}\n", encoding="utf-8")
+    release_manifest = dict(manifest, tarball=tarball_name, tarball_alias=TARBALL, tarball_sha256=digest,
+                            tarball_bytes=tarball.stat().st_size)
     (out / RELEASE_MANIFEST).write_text(json.dumps(release_manifest, indent=2) + "\n", encoding="utf-8")
-    patch_installer(REPO / "tools" / "install-engine.sh", out / "install-engine.sh", tag, min_macos, args.repo)
+    patch_installer(REPO / "tools" / "install-engine.sh", out / "install-engine.sh", NEWEST_TAG, min_macos, args.repo)
 
-    log(f"    version {version}, tag {tag}")
+    log(f"    version {version}, tags {tag} and {NEWEST_TAG}")
     log(f"    min macOS (largest LC_BUILD_VERSION minos): {min_macos}   counts: {manifest['minos_counts']}")
     log(f"    bundle: {size / 1e6:.1f} MB in {count} files ({len(machos)} Mach-O; {size_before / 1e6:.1f} MB before strip)")
-    log(f"    tarball: {tarball.stat().st_size / 1e6:.1f} MB  sha256 {digest}")
+    log(f"    tarball: {tarball_name} {tarball.stat().st_size / 1e6:.1f} MB  sha256 {digest}")
     github_output = os.environ.get("GITHUB_OUTPUT")
     if github_output:
         with open(github_output, "a", encoding="utf-8") as fh:
-            fh.write(f"tag={tag}\nversion={version}\nmin_macos={min_macos}\n")
+            fh.write(f"tag={tag}\nnewest_tag={NEWEST_TAG}\nversion={version}\nmin_macos={min_macos}\n"
+                     f"tarball={tarball_name}\n")
     return 0
 
 

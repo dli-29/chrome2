@@ -1,11 +1,14 @@
 """Chrome 2 engine self-test:  ~/chrome2-env/bin/python3 -m chrome2_engine_selftest [--json] [--platform NAME]
 
 Asks the bundled Qt WebEngine (Chromium) which media formats it supports - H.264 and AAC are the ones the plain
-pip PyQt6-WebEngine lacks - and plays the bundled H.264+AAC test clip for a moment.
+pip PyQt6-WebEngine lacks - plays the bundled H.264+AAC test clip for a moment (muted) and checks that its AAC
+audio is really decoded: the audio bytes Chromium's media pipeline decoded while playing, and the clip decoded
+with Web Audio (decodeAudioData). Also reports whether Chromium will decode H.264 / HEVC in hardware
+(MediaCapabilities' powerEfficient; VideoToolbox on a real Mac).
 
-Exit status: 0 = H.264 and AAC supported and the clip played, 1 = H.264 or AAC missing (or the engine didn't
-start), 2 = supported but the clip didn't play here (with the off-screen platform that can be the test, not
-the engine).
+Exit status: 0 = H.264 and AAC supported, the clip played and its audio was decoded, 1 = H.264 or AAC missing
+(or the engine didn't start), 2 = supported, but playback or audio decoding couldn't be confirmed here (with the
+off-screen platform that can be the test, not the engine).
 
 Also used by the CI checks (tools/engine/engine_check_playback.py), through MediaProbe.
 """
@@ -28,20 +31,36 @@ CODECS = {  # name -> MIME type for MediaSource.isTypeSupported / canPlayType
     "Opus": 'audio/webm; codecs="opus"',
 }
 REQUIRED = ("H.264", "AAC")
+HARDWARE = {  # name -> 1080p stream for MediaCapabilities.decodingInfo
+    "H.264": 'video/mp4; codecs="avc1.640028"',
+    "HEVC": 'video/mp4; codecs="hvc1.1.6.L120.90"',
+}
 
 PAGE_JS = r"""
 (() => {
-  const codecs = %s;
-  const r = window.__c2 = {support: {}, canPlay: {}, play: {}, userAgent: navigator.userAgent};
+  const codecs = %s, hardware = %s;
+  const r = window.__c2 = {support: {}, canPlay: {}, play: {}, decode: {}, hardware: {}, hardwareDone: false,
+                           userAgent: navigator.userAgent};
   for (const [name, type] of Object.entries(codecs)) {
     r.support[name] = !!(window.MediaSource && MediaSource.isTypeSupported(type));
     r.canPlay[name] = document.createElement('video').canPlayType(type);
   }
-  window.__c2play = (key, mode, url, mime, need) => {
-    const p = r.play[key] = {mode, url, done: false, played: false, currentTime: 0, videoWidth: 0, videoHeight: 0,
-                             error: null, events: []};
+  const caps = navigator.mediaCapabilities;
+  Promise.all(Object.entries(hardware).map(([name, type]) => !caps ? null : caps.decodingInfo({
+      type: 'media-source', video: {contentType: type, width: 1920, height: 1080, bitrate: 6000000, framerate: 30}})
+    .then(i => { r.hardware[name] = {supported: i.supported, smooth: i.smooth, powerEfficient: i.powerEfficient}; })
+    .catch(e => { r.hardware[name] = {error: String(e)}; })))
+    .finally(() => { r.hardwareDone = true; });
+  const counts = (v) => ({
+    audioBytes: typeof v.webkitAudioDecodedByteCount === 'number' ? v.webkitAudioDecodedByteCount : null,
+    videoBytes: typeof v.webkitVideoDecodedByteCount === 'number' ? v.webkitVideoDecodedByteCount : null});
+  // Play url (mode 'file': <video src>, 'mse': Media Source Extensions); done when `need` seconds played with a
+  // picture and - with needAudio - decoded audio (or after 30 s: error).
+  window.__c2play = (key, mode, url, mime, need, muted, needAudio) => {
+    const p = r.play[key] = {mode, url, muted, done: false, played: false, currentTime: 0, videoWidth: 0,
+                             videoHeight: 0, audioBytes: null, videoBytes: null, error: null, events: []};
     const v = document.createElement('video');
-    v.muted = true; v.playsInline = true; v.autoplay = true; v.width = 320; v.height = 180;
+    v.muted = muted; v.playsInline = true; v.autoplay = true; v.width = 320; v.height = 180;
     document.body.appendChild(v);
     const fail = (msg) => { if (!p.done) { p.error = msg; p.done = true; } };
     v.addEventListener('error', () => fail(v.error ? `MediaError ${v.error.code}: ${v.error.message}` : 'error event'));
@@ -50,10 +69,16 @@ PAGE_JS = r"""
     const started = performance.now();
     const tick = () => {
       if (p.done) return;
+      Object.assign(p, counts(v));
       p.currentTime = v.currentTime; p.videoWidth = v.videoWidth; p.videoHeight = v.videoHeight;
       p.readyState = v.readyState; p.paused = v.paused; p.duration = v.duration;
-      if (v.currentTime > need && v.videoWidth > 0) { p.played = true; p.done = true; return; }
-      if (performance.now() - started > 30000) { fail('timed out (currentTime ' + v.currentTime + ')'); return; }
+      const audioOk = !needAudio || p.audioBytes === null || p.audioBytes > 0;
+      if (v.currentTime > need && v.videoWidth > 0 && audioOk) { p.played = true; p.done = true; return; }
+      if (performance.now() - started > 30000) {
+        fail(v.currentTime > need && v.videoWidth > 0 ? 'played, but no audio was decoded'
+                                                      : 'timed out (currentTime ' + v.currentTime + ')');
+        return;
+      }
       setTimeout(tick, 100);
     };
     if (mode === 'mse') {
@@ -75,9 +100,32 @@ PAGE_JS = r"""
     v.play().catch(e => p.events.push('play() rejected: ' + e));
     tick();
   };
+  // Decode url's audio with Web Audio (no audio device needed): ok when it gives > 0.5 s of non-silent sound.
+  window.__c2decode = (key, url) => {
+    const d = r.decode[key] = {url, done: false, ok: false, error: null};
+    const load = () => url.startsWith('file:') ? new Promise((resolve, reject) => {
+      const x = new XMLHttpRequest();
+      x.open('GET', url); x.responseType = 'arraybuffer';
+      x.onload = () => x.response && x.response.byteLength ? resolve(x.response)
+                                                         : reject(new Error('empty response, status ' + x.status));
+      x.onerror = () => reject(new Error('XMLHttpRequest failed'));
+      x.send();
+    }) : fetch(url).then(resp => { if (!resp.ok) throw new Error('HTTP ' + resp.status); return resp.arrayBuffer(); });
+    load().then(data => new OfflineAudioContext(1, 44100, 44100).decodeAudioData(data)).then(audio => {
+      let sum = 0, n = 0;
+      for (let c = 0; c < audio.numberOfChannels; c++) {
+        const samples = audio.getChannelData(c);
+        for (let i = 0; i < samples.length; i += 7) { sum += samples[i] * samples[i]; n++; }
+      }
+      const rms = n ? Math.sqrt(sum / n) : 0;
+      Object.assign(d, {duration: audio.duration, sampleRate: audio.sampleRate, channels: audio.numberOfChannels,
+                        rms, ok: audio.duration > 0.5 && rms > 0.01});
+      if (!d.ok) d.error = 'decoded, but silent or too short';
+    }).catch(e => { d.error = String(e && e.message || e); }).finally(() => { d.done = true; });
+  };
   return true;
 })();
-""" % json.dumps(CODECS)
+""" % (json.dumps(CODECS), json.dumps(HARDWARE))
 
 
 def engine_info() -> dict:
@@ -95,16 +143,17 @@ def engine_info() -> dict:
 
 class MediaProbe:
     """Loads *page_url* (or a blank page with *base_url*) in a visible QWebEngineView, collects codec support and
-    runs the given plays: [(key, mode 'file'|'mse', media url, MIME type for MSE, seconds that must play)]."""
+    hardware decoding info, and runs the given plays: [(key, mode 'file'|'mse', media url, MIME type for MSE,
+    seconds that must play, muted, audio must be decoded)] and Web Audio decodes: [(key, media url)]."""
 
-    def __init__(self, plays, page_url=None, base_url=None, timeout_s=60.0):
+    def __init__(self, plays, page_url=None, base_url=None, timeout_s=60.0, decodes=()):
         from PyQt6.QtCore import QTimer, QUrl
         from PyQt6.QtWebEngineCore import QWebEnginePage, QWebEngineProfile, QWebEngineSettings
         from PyQt6.QtWebEngineWidgets import QWebEngineView
         from PyQt6.QtWidgets import QApplication
 
         self.app = QApplication.instance() or QApplication([sys.argv[0] or "chrome2-selftest"])
-        self.plays, self.result, self.finished = plays, {"load_ok": None}, False
+        self.plays, self.decodes, self.result, self.finished = plays, list(decodes), {"load_ok": None}, False
         self.profile = QWebEngineProfile()  # off the record: nothing is written to disk
         self.page = QWebEnginePage(self.profile)
         settings = self.page.settings()
@@ -138,9 +187,12 @@ class MediaProbe:
             self._finish("page failed to load")
             return
         self.page.runJavaScript(PAGE_JS)
-        for key, mode, url, mime, need in self.plays:
+        for key, mode, url, mime, need, muted, need_audio in self.plays:
             self.page.runJavaScript(f"__c2play({json.dumps(key)}, {json.dumps(mode)}, {json.dumps(url)}, "
-                                    f"{json.dumps(mime)}, {float(need)})")
+                                    f"{json.dumps(mime)}, {float(need)}, {json.dumps(bool(muted))}, "
+                                    f"{json.dumps(bool(need_audio))})")
+        for key, url in self.decodes:
+            self.page.runJavaScript(f"__c2decode({json.dumps(key)}, {json.dumps(url)})")
         self.poll.start()
 
     def _poll(self) -> None:
@@ -151,8 +203,9 @@ class MediaProbe:
             return
         data = json.loads(value)
         self.result.update(data)
-        plays = data.get("play", {})
-        if all(plays.get(key, {}).get("done") for key, *_rest in self.plays):
+        plays, decodes = data.get("play", {}), data.get("decode", {})
+        if all(plays.get(key, {}).get("done") for key, *_rest in self.plays) and \
+                all(decodes.get(key, {}).get("done") for key, _url in self.decodes) and data.get("hardwareDone"):
             self._finish(None)
 
     def _timeout(self) -> None:
@@ -197,10 +250,14 @@ def main(argv=None) -> int:
     print(f"  Engine: Qt {info['qt']}, Chromium {info['chromium']}, PyQt6 {info['pyqt']}, Python {info['python']}")
     print(f"  PyQt6 loaded from: {info['pyqt_path']}")
     from PyQt6.QtCore import QUrl
-    plays = []
+    plays, decodes = [], []
     if not args.no_play and os.path.isfile(CLIP):
-        plays.append(("clip", "file", QUrl.fromLocalFile(CLIP).toString(), "", 1.0))
-    probe = MediaProbe(plays, base_url=QUrl.fromLocalFile(os.path.dirname(CLIP) + "/").toString(), timeout_s=45)
+        clip_url = QUrl.fromLocalFile(CLIP).toString()
+        # muted (no beep during the install); the audio proof is the bytes decoded meanwhile, or Web Audio's decode
+        plays.append(("clip", "file", clip_url, "", 1.0, True, False))
+        decodes.append(("clip", clip_url))
+    probe = MediaProbe(plays, base_url=QUrl.fromLocalFile(os.path.dirname(CLIP) + "/").toString(), timeout_s=45,
+                       decodes=decodes)
     result = probe.run()
     support = result.get("support") or {}
     for name in CODECS:
@@ -210,6 +267,7 @@ def main(argv=None) -> int:
     if not support:
         print(f"  (the test page didn't run: {result.get('error', 'unknown error')})")
     clip = (result.get("play") or {}).get("clip")
+    decoded = (result.get("decode") or {}).get("clip") or {}
     if plays:
         if clip and clip.get("played"):
             print(f"  Playback: OK - the H.264+AAC test clip played {clip['currentTime']:.1f} s "
@@ -218,6 +276,23 @@ def main(argv=None) -> int:
             detail = (clip or {}).get("error") or result.get("error") or "no progress"
             print(f"  Playback: the test clip didn't play here ({detail})")
             status = status or 2
+        audio_bytes = (clip or {}).get("audioBytes")
+        proofs = []
+        if audio_bytes:
+            proofs.append(f"{audio_bytes} bytes while playing")
+        if decoded.get("ok"):
+            proofs.append(f"Web Audio decoded {decoded['duration']:.1f} s at {decoded['sampleRate']:.0f} Hz")
+        if proofs:
+            print(f"  AAC audio: decoded ({'; '.join(proofs)})")
+        else:
+            print(f"  AAC audio: not confirmed (while playing: {audio_bytes} bytes; Web Audio: "
+                  f"{decoded.get('error') or 'no result'})")
+            status = status or 2
+    hardware = result.get("hardware") or {}
+    if hardware:
+        print("  Hardware video decoding: " + ", ".join(
+            f"{name} {'yes' if caps.get('powerEfficient') else 'no'}" if "error" not in caps else f"{name} ?"
+            for name, caps in hardware.items()) + "  (MediaCapabilities powerEfficient)")
     if args.json:
         print(json.dumps({"info": info, "result": result}, indent=2))
     probe.close()

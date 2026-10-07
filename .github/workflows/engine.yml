@@ -1,13 +1,16 @@
 # Chrome 2 engine: a relocatable PyQt6 + Qt WebEngine bundle WITH proprietary codecs (H.264 / AAC / HEVC) for
 # Apple Silicon Macs, made from Homebrew's bottles (its qtwebengine is built with
-# -DFEATURE_webengine_proprietary_codecs=ON; pip's PyQt6-WebEngine is not), tested on a clean runner with
-# Homebrew hidden and python.org's Python 3.14, then published as a GitHub release with a no-admin installer.
+# -DFEATURE_webengine_proprietary_codecs=ON; pip's PyQt6-WebEngine is not), tested on clean runners with
+# Homebrew hidden and python.org's Python 3.14, then published as GitHub releases with a no-admin installer.
 #
 #   build           macos-15: brew install pyqt -> tools/engine/build_bundle.py (copy, relocate, strip, sign, verify)
-#   test            fresh macos-15, Homebrew moved away: python.org Python 3.14 + tools/install-engine.sh into a
-#                   fake home, then codec support, H.264+AAC playback over HTTP (plain + MSE), Chrome 2 itself,
-#                   and DYLD_PRINT_LIBRARIES / lsof: nothing may come from /opt/homebrew
-#   publish         only after test passed (contents: write only here): release engine-qt<version>-arm64
+#   test            fresh runners (macOS 15 + python.org's newest 3.14 and 3.14.0, macOS 26 + newest 3.14), Homebrew
+#                   moved away: tools/install-engine.sh into a fake home, then codec support, H.264+AAC playback
+#                   over HTTP (plain + MSE) with the AAC audio really decoded, Qt's paths, Chrome 2 itself, and
+#                   DYLD_PRINT_LIBRARIES / lsof: nothing may come from /opt/homebrew; on the first runner also the
+#                   installer's repair, in-use and "only delete what it made" paths
+#   publish         only after every test passed (contents: write only here): releases engine-arm64 (the newest
+#                   engine, the installer's default) and engine-qt<version>-arm64 (history)
 #   verify-release  fresh macos-15: the published one-line install command, end to end
 name: Engine bundle
 
@@ -21,15 +24,17 @@ on:
 permissions:
   contents: read
 
-concurrency:
-  group: engine-${{ github.ref }}
-  cancel-in-progress: true
+# No workflow-wide cancel-in-progress: a newer push cancels an older run's build and tests (job-level groups
+# below), but never a publish that has started - that would leave the releases half-updated.
 
 jobs:
   build:
     name: Build (macos-15, Homebrew bottles)
     runs-on: macos-15
     timeout-minutes: 90
+    concurrency:
+      group: engine-build-${{ github.ref }}
+      cancel-in-progress: true
     env:
       HOMEBREW_NO_AUTO_UPDATE: "1"
       HOMEBREW_NO_INSTALL_CLEANUP: "1"
@@ -37,6 +42,7 @@ jobs:
       HOMEBREW_NO_ENV_HINTS: "1"
     outputs:
       tag: ${{ steps.bundle.outputs.tag }}
+      newest_tag: ${{ steps.bundle.outputs.newest_tag }}
       version: ${{ steps.bundle.outputs.version }}
       min_macos: ${{ steps.bundle.outputs.min_macos }}
     steps:
@@ -54,17 +60,36 @@ jobs:
       - name: brew install pyqt qtimageformats ffmpeg (bottles)
         run: |
           brew update --quiet || brew update
-          for attempt in 1 2; do
-            if brew install --quiet pyqt qtimageformats ffmpeg; then break; fi
-            echo "::warning::brew install attempt $attempt failed (exit $?); retrying / checking what is installed"
+          # The runner image's openssl@1.1 owns bin/openssl & co., so linking openssl@3 (a qtbase dependency)
+          # would fail: unlink it first.
+          if brew list --versions openssl@1.1 >/dev/null 2>&1; then brew unlink openssl@1.1; fi
+          rc=0
+          for attempt in 1 2 3; do
+            rc=0
+            brew install --quiet pyqt qtimageformats ffmpeg || rc=$?
+            if [ "$rc" = 0 ]; then break; fi
+            echo "::warning::brew install attempt $attempt failed (exit status $rc)"
+            sleep 15
           done
+          if [ "$rc" != 0 ]; then
+            echo "::error::brew install failed $attempt times (last exit status $rc)"
+            exit 1
+          fi
           brew list --versions pyqt qtbase qtwebengine qtdeclarative qtsvg qtimageformats python@3.14 ffmpeg
           brew info --json=v2 --installed | /usr/bin/python3 -c '
           import json, sys
+          unlinked = []
           for f in json.load(sys.stdin)["formulae"]:
+              i = f["installed"][0]
               if f["name"] in ("pyqt", "qtbase", "qtwebengine", "qtdeclarative", "qtimageformats"):
-                  i = f["installed"][0]
                   print(f["name"], i["version"], "poured_from_bottle =", i["poured_from_bottle"])
+                  if not i["poured_from_bottle"]:
+                      sys.exit("::error::" + f["name"] + " was built from source, not poured from a bottle")
+              if not f.get("keg_only") and not f.get("linked_keg"):
+                  unlinked.append(f["name"])
+          if unlinked:
+              # The bundle is assembled from the kegs (Cellar / opt), so unlinked kegs do no harm - but say so.
+              print("::warning::installed but not linked into /opt/homebrew: " + ", ".join(sorted(unlinked)))
           '
           grep -rl "webengine_proprietary_codecs" "$(brew --prefix qtwebengine)/lib/cmake" 2>/dev/null | head -3 || true
 
@@ -76,11 +101,12 @@ jobs:
              -c:v libx264 -profile:v main -level 3.1 -pix_fmt yuv420p -g 30 -c:a aac -b:a 96k -ac 2 -shortest \
              -movflags +faststart media/test-h264-aac.mp4
           ff -i media/test-h264-aac.mp4 -c copy -movflags +frag_keyframe+empty_moov+default_base_moof media/test-h264-aac-frag.mp4
+          ff -f lavfi -i "sine=frequency=550:sample_rate=44100:duration=3" -c:a aac -b:a 64k -ac 1 media/test-aac.m4a
           ff -f lavfi -i "testsrc2=size=160x120:rate=25:duration=3" -f lavfi -i "sine=frequency=660:sample_rate=44100:duration=3" \
              -c:v libx264 -profile:v baseline -pix_fmt yuv420p -g 25 -c:a aac -b:a 48k -ac 1 -shortest \
              -movflags +faststart media/selftest-h264-aac.mp4
-          for f in media/*.mp4; do
-            echo "$f ($(stat -f %z "$f") bytes): $(ffprobe -v error -show_entries stream=codec_name,profile,width,height,sample_rate -of compact=p=0 "$f" | tr '\n' ' ')"
+          for f in media/*.mp4 media/*.m4a; do
+            echo "$f ($(stat -f %z "$f") bytes): $(ffprobe -v error -show_entries stream=codec_name,profile,width,height,sample_rate,duration -of compact=p=0 "$f" | tr '\n' ' ')"
           done
 
       - name: Assemble, relocate, sign and verify the bundle
@@ -88,8 +114,10 @@ jobs:
         run: |
           PY="$(brew --prefix python@3.14)/bin/python3.14"
           "$PY" tools/engine/build_bundle.py --work build --out dist --selftest-media media/selftest-h264-aac.mp4 \
-            --build-number "$GITHUB_RUN_NUMBER" --repo "$GITHUB_REPOSITORY" --commit "$GITHUB_SHA"
-          ls -la dist
+            --build-number "$GITHUB_RUN_NUMBER" --build-attempt "$GITHUB_RUN_ATTEMPT" --repo "$GITHUB_REPOSITORY" \
+            --commit "$GITHUB_SHA"
+          ls -la dist build/chrome2-engine build/chrome2-engine/licenses
+          head -n 12 build/chrome2-engine/licenses/SOURCES.txt
 
       - name: Manifest
         run: cat dist/chrome2-engine-manifest.json
@@ -110,10 +138,20 @@ jobs:
           if-no-files-found: error
 
   test:
-    name: Test (clean macos-15, Homebrew hidden, python.org Python 3.14)
+    name: Test (${{ matrix.runner }}, python.org ${{ matrix.python }}, Homebrew hidden)
     needs: build
-    runs-on: macos-15
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {id: macos15-newest, runner: macos-15, python: latest, full: true}
+          - {id: macos15-3.14.0, runner: macos-15, python: "3.14.0", full: false}
+          - {id: macos26-newest, runner: macos-26, python: latest, full: false}
+    concurrency:
+      group: engine-test-${{ github.ref }}-${{ matrix.id }}
+      cancel-in-progress: true
     defaults:
       run:
         shell: /bin/bash --noprofile --norc -euo pipefail {0}
@@ -135,14 +173,19 @@ jobs:
           name: test-media
           path: media
 
+      - name: Runner
+        run: |
+          sw_vers
+          [ "$(uname -m)" = arm64 ] || { echo "::error::not an Apple Silicon runner: $(uname -m)"; exit 1; }
+
       - name: Install python.org Python 3.14 (official installer, like the user's)
-        run: /bin/bash tools/engine/ci_python_org.sh
+        run: /bin/bash tools/engine/ci_python_org.sh "${{ matrix.python }}"
 
       - name: Fake home with foxglove.py where the user keeps it
         run: |
           mkdir -p "$FAKE_HOME/Desktop/temp" "$RUNNER_TEMP/logs"
           cp foxglove.py "$FAKE_HOME/Desktop/temp/foxglove.py"
-          (cd dist && shasum -a 256 -c chrome2-engine-arm64.tar.gz.sha256)
+          (cd dist && shasum -a 256 -c chrome2-engine-arm64-*.tar.gz.sha256)
 
       - name: Hide Homebrew
         run: /bin/bash tools/engine/ci_homebrew.sh hide
@@ -154,11 +197,14 @@ jobs:
           /bin/bash -c "$(cat dist/install-engine.sh)" 2>&1 | tee "$RUNNER_TEMP/logs/install-1.log"
           grep -q "H.264: supported" "$RUNNER_TEMP/logs/install-1.log"
           grep -q "AAC: supported" "$RUNNER_TEMP/logs/install-1.log"
+          grep -q "Playback: OK" "$RUNNER_TEMP/logs/install-1.log"
+          grep -q "AAC audio: decoded" "$RUNNER_TEMP/logs/install-1.log"
           echo "==== running it again (upgrade / repair path)"
           /bin/bash dist/install-engine.sh 2>&1 | tee "$RUNNER_TEMP/logs/install-2.log"
           grep -q "Already installed" "$RUNNER_TEMP/logs/install-2.log"
           grep -q "H.264: supported" "$RUNNER_TEMP/logs/install-2.log"
           du -sh "$HOME/Library/Application Support/Chrome2 Engine"/* "$HOME/chrome2-env"
+          cat "$HOME/chrome2-env/pip.conf"
 
       - name: (a) PyQt6 and Qt load from the engine
         run: |
@@ -176,13 +222,15 @@ jobs:
               ok = path.startswith(engine + "/")
               bad += not ok
               print("OK  " if ok else "BAD ", module.__name__, path)
+          print("PyQt6.__path__", PyQt6.__path__)
+          bad += len(PyQt6.__path__) != 1
           print("Qt", QtCore.QT_VERSION_STR, "PyQt6", QtCore.PYQT_VERSION_STR, "Chromium", QtWebEngineCore.qWebEngineChromiumVersion())
           print("QT_PLUGIN_PATH", os.environ.get("QT_PLUGIN_PATH"))
           print("QTWEBENGINEPROCESS_PATH", os.environ.get("QTWEBENGINEPROCESS_PATH"))
           sys.exit(1 if bad else 0)
           PY
 
-      - name: (b)+(d) H.264/AAC support, playback over HTTP, DYLD_PRINT_LIBRARIES
+      - name: (b)+(d) H.264/AAC support, playback with decoded audio over HTTP, Qt paths, DYLD_PRINT_LIBRARIES
         run: |
           export HOME="$FAKE_HOME" CFFIXED_USER_HOME="$FAKE_HOME"
           VPY="$HOME/chrome2-env/bin/python3"
@@ -218,6 +266,12 @@ jobs:
             check offscreen
           fi
 
+      - name: (e) The installer's repair, in-use and "only remove what it made" paths
+        if: matrix.full
+        run: |
+          export HOME="$FAKE_HOME" CFFIXED_USER_HOME="$FAKE_HOME"
+          /bin/bash tools/engine/ci_installer_checks.sh dist
+
       - name: Restore Homebrew
         if: always()
         run: /bin/bash tools/engine/ci_homebrew.sh restore
@@ -225,92 +279,54 @@ jobs:
       - uses: actions/upload-artifact@v7.0.2
         if: always()
         with:
-          name: test-logs
+          name: test-logs-${{ matrix.id }}
           path: ${{ runner.temp }}/logs/
           retention-days: 14
 
   publish:
-    name: Publish the release
+    name: Publish the releases
     needs: [build, test]
     if: github.ref_name == github.event.repository.default_branch
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 30
     permissions:
       contents: write
+    concurrency:
+      group: engine-publish
+      cancel-in-progress: false
     outputs:
-      tag: ${{ needs.build.outputs.tag }}
+      newest_tag: ${{ needs.build.outputs.newest_tag }}
     steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+
       - uses: actions/download-artifact@v8.0.2
         with:
           name: engine
           path: dist
 
-      - name: Create or update the release (assets overwritten on re-runs)
+      - name: Publish (the newest engine + this Qt version's release; each switched over in one step)
         env:
           GH_TOKEN: ${{ github.token }}
-          TAG: ${{ needs.build.outputs.tag }}
           PRIVATE_REPO: ${{ github.event.repository.private }}
-        run: |
-          set -euo pipefail
-          cd dist
-          sha256sum -c chrome2-engine-arm64.tar.gz.sha256
-          python3 - "$TAG" "$GITHUB_REPOSITORY" "$PRIVATE_REPO" > notes.md <<'PY'
-          import json, sys
-          tag, repo, private = sys.argv[1], sys.argv[2], sys.argv[3] == "true"
-          m = json.load(open("chrome2-engine-manifest.json"))
-          url = f"https://github.com/{repo}/releases/download/{tag}/install-engine.sh"
-          print(f"""Chrome 2's engine with **H.264 / AAC** (proprietary codecs): PyQt6 {m['pyqt_version']} + Qt WebEngine {m['qt_version']} (Chromium {m['chromium_version']}), built from Homebrew's bottles and made self-contained.
-
-          **Needs:** an Apple Silicon Mac, macOS {m['min_macos']} or newer, and python.org's Python 3.14. No admin password.
-
-          **Install** (Terminal):
-
-          ```
-          /bin/bash -c "$(curl -fsSL {url})"
-          ```
-
-          Then start Chrome 2 with `~/chrome2-env/bin/python3 ~/Desktop/temp/foxglove.py`. Your data in `~/Library/Application Support/Foxglove` and your old `~/foxglove-env` are untouched.
-
-          | | |
-          |---|---|
-          | Engine version | {m['version']} |
-          | Tarball | {m['tarball_bytes'] / 1e6:.0f} MB, SHA-256 `{m['tarball_sha256']}` |
-          | Unpacked | {m['size_bytes'] / 1e6:.0f} MB, {m['file_count']} files ({m['macho_count']} Mach-O) |
-          | Minimum macOS (largest LC_BUILD_VERSION minos) | {m['min_macos']} |
-          | Built on | macOS {m['build']['runner_macos']}, commit {m['build']['commit'][:12]}, run #{m['build']['build_number']} |
-          | Homebrew | qtbase {m['homebrew_versions'].get('qtbase')}, qtwebengine {m['homebrew_versions'].get('qtwebengine')}, pyqt {m['homebrew_versions'].get('pyqt')} |
-          """.replace("\n          ", "\n"))
-          if private:
-              print("> **Note:** while this repository is private, these downloads need a GitHub login, so the one-line "
-                    "command above gets *404*. Make the repository public, or download the four files in your browser "
-                    "and run `CHROME2_ENGINE_BASE_URL=~/Downloads bash ~/Downloads/install-engine.sh`.")
-          PY
-          files="chrome2-engine-arm64.tar.gz chrome2-engine-arm64.tar.gz.sha256 chrome2-engine-manifest.json install-engine.sh"
-          title="Chrome 2 engine: Qt WebEngine $(python3 -c 'import json; print(json.load(open("chrome2-engine-manifest.json"))["qt_version"])') with H.264/AAC (Apple Silicon)"
-          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            # shellcheck disable=SC2086
-            gh release upload "$TAG" $files --clobber --repo "$GITHUB_REPOSITORY"
-            gh release edit "$TAG" --title "$title" --notes-file notes.md --repo "$GITHUB_REPOSITORY"
-            # the tag follows the commit these assets were built from
-            gh api -X PATCH "repos/$GITHUB_REPOSITORY/git/refs/tags/$TAG" -f sha="$GITHUB_SHA" -F force=true >/dev/null
-          else
-            # shellcheck disable=SC2086
-            gh release create "$TAG" $files --title "$title" --notes-file notes.md --target "$GITHUB_SHA" --repo "$GITHUB_REPOSITORY"
-          fi
-          gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json url,assets \
-            --jq '.url, (.assets[] | "\(.name)  \(.size)  \(.url)")'
+        run: /bin/bash tools/engine/ci_publish.sh dist "${{ needs.build.outputs.tag }}" "${{ needs.build.outputs.newest_tag }}"
 
   verify-release:
     name: Install from the published release (fresh macos-15)
     needs: [build, publish]
     runs-on: macos-15
     timeout-minutes: 40
+    concurrency:
+      group: engine-verify-${{ github.ref }}
+      cancel-in-progress: true
     defaults:
       run:
         shell: /bin/bash --noprofile --norc -euo pipefail {0}
     env:
       FAKE_HOME: /Users/runner/Another Home
-      TAG: ${{ needs.publish.outputs.tag }}
+      TAG: ${{ needs.publish.outputs.newest_tag }}
+      VERSION: ${{ needs.build.outputs.version }}
     steps:
       - uses: actions/checkout@v7.0.1
         with:
@@ -344,10 +360,17 @@ jobs:
             script=$(curl -fsSL -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/octet-stream" "$api/assets/$id")
             CHROME2_GITHUB_TOKEN="$GH_TOKEN" /bin/bash -c "$script" 2>&1 | tee "$RUNNER_TEMP/install.log"
           fi
+          grep -q "Engine $VERSION:" "$RUNNER_TEMP/install.log"
           grep -q "H.264: supported" "$RUNNER_TEMP/install.log"
           grep -q "AAC: supported" "$RUNNER_TEMP/install.log"
+          grep -q "AAC audio: decoded" "$RUNNER_TEMP/install.log" || echo "::warning::self-test didn't confirm decoded AAC audio"
           grep -q "Playback: OK" "$RUNNER_TEMP/install.log" || echo "::warning::self-test playback didn't report OK"
           "$HOME/chrome2-env/bin/python3" -c 'import anthropic, keyring; print("anthropic", anthropic.__version__, "| keyring", keyring.__version__ if hasattr(keyring, "__version__") else "ok")'
+
+      - name: The installer from the Qt-version release installs the newest engine too
+        run: |
+          url="https://github.com/$GITHUB_REPOSITORY/releases/download/${{ needs.build.outputs.tag }}/install-engine.sh"
+          curl -fsSL "$url" | grep -E '^DEFAULT_ENGINE_TAG="'"$TAG"'"'
 
       - name: Restore Homebrew
         if: always()

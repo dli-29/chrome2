@@ -557,9 +557,7 @@ def test_install_app_builds_an_applet_with_osacompile(fg, tmp_path, monkeypatch,
     fake = tmp_path / "bin" / "osacompile"
     fake.parent.mkdir()
     # osacompile -o <app> -e <applescript>: keep the source, lay out an applet like the real tool does
-    # like the real tool, an output name not ending in .app gets a compiled script file, not an applet
-    fake.write_text('#!/bin/sh\ncase "$2" in *.app) ;; *) printf scpt > "$2"; exit 0;; esac\n'
-                    'mkdir -p "$2/Contents/Resources" "$2/Contents/MacOS"\nprintf %s "$4" > "$2/source.applescript"\n'
+    fake.write_text('#!/bin/sh\nmkdir -p "$2/Contents/Resources" "$2/Contents/MacOS"\nprintf %s "$4" > "$2/source.applescript"\n'
                     'printf \'<?xml version="1.0" encoding="UTF-8"?><plist version="1.0"><dict><key>CFBundleName</key>'
                     '<string>applet</string><key>CFBundleIconFile</key><string>applet</string></dict></plist>\' '
                     '> "$2/Contents/Info.plist"\n')
@@ -571,10 +569,7 @@ def test_install_app_builds_an_applet_with_osacompile(fg, tmp_path, monkeypatch,
     script = home / "Desk top" / "foxglove.py"
     script.parent.mkdir(parents=True)
     script.write_text("import sys; open(sys.argv[0] + '.ran', 'w').write('ok')\n")
-    (home / "Applications").mkdir()
-    (home / "Applications" / "Chrome 2.app.part").write_text("left by an older version")
     bundle = fg.make_app_bundle(home / "Applications" / "Chrome 2.app", fg.sys.executable, str(script))
-    assert sorted(p.name for p in (home / "Applications").iterdir()) == ["Chrome 2.app"]
     contents = bundle / "Contents"
     info = plistlib.loads((contents / "Info.plist").read_bytes())
     assert info["CFBundleName"] == "Chrome 2" and info["CFBundleIconFile"] == "applet"

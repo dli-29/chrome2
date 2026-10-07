@@ -18016,12 +18016,8 @@ def make_app_bundle(bundle: Path, python: str, script: str) -> Path:
     import plistlib
     import shlex
     bundle.parent.mkdir(parents=True, exist_ok=True)
-    staging = bundle.with_name(bundle.stem + ".part.app")  # osacompile makes an applet only for a name ending in .app
-    for leftover in (staging, bundle.with_name(bundle.name + ".part")):  # (an older version's staging name)
-        if leftover.is_dir() and not leftover.is_symlink():
-            shutil.rmtree(leftover, ignore_errors=True)
-        elif leftover.exists() or leftover.is_symlink():
-            leftover.unlink()
+    staging = bundle.with_name(bundle.name + ".part")
+    shutil.rmtree(staging, ignore_errors=True)
     contents = staging / "Contents"
     (contents / "MacOS").mkdir(parents=True)
     (contents / "Resources").mkdir()

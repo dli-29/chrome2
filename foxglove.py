@@ -18030,6 +18030,24 @@ def make_app_bundle(bundle: Path, python: str, script: str) -> Path:
     }
     (contents / "Info.plist").write_bytes(plistlib.dumps(info))
     (contents / "PkgInfo").write_text("APPL????", encoding="ascii")
+    osacompile = shutil.which("osacompile")
+    if osacompile:  # recent macOS refuses bundles whose executable is a script: build a real AppleScript applet
+        shutil.rmtree(staging)
+        log = f"$HOME/Library/Logs/{APP_NAME}.log"
+        command = (f'mkdir -p "$HOME/Library/Logs"; {shlex.quote(python)} {shlex.quote(script)} '
+                   f'>>"{log}" 2>&1 &')
+        applescript = 'do shell script "' + command.replace("\\", "\\\\").replace('"', '\\"') + '"'
+        subprocess.run([osacompile, "-o", str(staging), "-e", applescript], check=True, capture_output=True, timeout=60)
+        resources = staging / "Contents" / "Resources"
+        write_icns(resources / "applet.icns")
+        plist = staging / "Contents" / "Info.plist"
+        applet = plistlib.loads(plist.read_bytes())
+        applet.update({k: info[k] for k in ("CFBundleName", "CFBundleDisplayName", "CFBundleIdentifier",
+                                            "CFBundleVersion", "CFBundleShortVersionString", "NSHighResolutionCapable")})
+        plist.write_bytes(plistlib.dumps(applet))
+        shutil.rmtree(bundle, ignore_errors=True)
+        staging.rename(bundle)
+        return bundle
     launcher = contents / "MacOS" / APP_EXECUTABLE
     launcher.write_text(
         "#!/bin/sh\n"

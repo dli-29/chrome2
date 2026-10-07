@@ -141,7 +141,7 @@ def test_failed_restore_keeps_the_previous_version_for_the_next_start(harness, t
         real_move(source, target)
     monkeypatch.setattr(fg, "_move", move)
     kind, text = harness.install(src)
-    assert kind == "error" and "couldn't be put back yet - it will be when Foxglove restarts" in text, text
+    assert kind == "error" and f"couldn't be put back yet - it will be when {fg.APP_NAME} restarts" in text, text
     backups = list(harness.staging.glob("previous-*"))
     assert len([b for b in backups if b.is_dir()]) == 1 and len([b for b in backups if b.suffix == ".restore"]) == 1
     harness.controller._clean_staging()  # what the next start does first: the backup must survive it

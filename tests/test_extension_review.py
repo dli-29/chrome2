@@ -332,7 +332,7 @@ def test_extensions_for_a_newer_chrome_install_with_a_warning(harness, tmp_path)
     kind, text = harness.install(simple_ext(tmp_path / "n", "Newer", minimum_chrome_version="999.0"))
     assert kind == "success" and "made for Chrome 999.0 or newer" in text
     kind, text = harness.install(simple_ext(tmp_path / "o", "Older", minimum_chrome_version="100"))
-    assert kind == "success" and "Chrome" not in text
+    assert kind == "success" and "made for Chrome" not in text  # (the browser itself is "Chrome 2")
 
 
 # ══════════════════════════════════════════════════════════════════════════════════════════

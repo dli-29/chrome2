@@ -143,7 +143,7 @@ def test_install_from_each_package_kind(harness, server, tmp_path, kind):
     path, key = _package(kind, tmp_path, name, tag)
     kind_, text = harness.install(path)
     assert kind_ == "success", text
-    assert text == f"“{name}” was added to Foxglove."
+    assert text == f"“{name}” was added to Chrome 2."
     entry = harness.wait_enabled_by_name(name)
     assert entry.version == "1.0" and entry.description == f"Test extension {tag}"
     if key is not None:  # signed packages keep the developer key, so the ID is the key's ID
@@ -190,7 +190,7 @@ def test_manifest_with_trailing_commas_is_refused_the_same_way(harness, tmp_path
 
 def test_localized_name_is_shown(harness, tmp_path):
     kind, text = harness.install(eb.localized_extension(tmp_path / "l10n"))
-    assert kind == "success" and text == "“Localized Probe” was added to Foxglove."
+    assert kind == "success" and text == "“Localized Probe” was added to Chrome 2."
     entry = harness.wait_enabled_by_name("Localized Probe")
     assert entry.description == "Localized Probe description"
 
@@ -520,7 +520,7 @@ def test_webstore_install_through_local_update_service(harness, local_store, tmp
     start = len(harness.messages)
     harness.controller.install_from_webstore(key.ext_id, "Store Probe")
     kind, text = harness.wait_message(start)
-    assert kind == "success" and text == "“Store Probe” was added to Foxglove.", text
+    assert kind == "success" and text == "“Store Probe” was added to Chrome 2.", text
     assert ("info", "Downloading Store Probe from the Chrome Web Store…") in harness.messages[start:]
     asked = next(r for r in server.requests if r.startswith("/service/update2/crx"))
     assert f"x=id%3D{key.ext_id}%26uc" in asked and f"prodversion={fg.qWebEngineChromiumVersion()}" in asked
@@ -585,8 +585,8 @@ def test_webstore_info_bar_offers_install_and_installs(window, harness, local_st
     window._update_webstore_bar(tab, store_url)  # what urlChanged does for a Web Store page
     bar = tab.webstore_bar
     assert bar is not None and bar.property("ext_id") == key.ext_id
-    assert "Install this extension in Foxglove?" in bar.text.text()
-    add = next(b for b in bar.findChildren(QPushButton) if b.text() == "Add to Foxglove")
+    assert "Install this extension in Chrome 2?" in bar.text.text()
+    add = next(b for b in bar.findChildren(QPushButton) if b.text() == "Add to Chrome 2")
     start = len(harness.messages)
     add.click()
     kind, text = harness.wait_message(start)
@@ -595,7 +595,7 @@ def test_webstore_info_bar_offers_install_and_installs(window, harness, local_st
     window._update_webstore_bar(tab, store_url)
     bar = wait_until(lambda: tab.webstore_bar is not None and tab.webstore_bar.isVisible() and tab.webstore_bar,
                      message="info bar for the installed extension")
-    assert bar.text.text() == "This extension is installed in Foxglove."
+    assert bar.text.text() == "This extension is installed in Chrome 2."
     assert [b.text() for b in bar.findChildren(QPushButton)] == ["Reinstall / Update"]
     window._update_webstore_bar(tab, QUrl("https://example.com/"))  # leaving the store page removes the bar
     assert tab.webstore_bar is None
@@ -678,7 +678,7 @@ def test_uninstall_removes_files_and_registry_entry(window, harness, server, tmp
     monkeypatch.setattr(fg, "ask_question", lambda *a, **_k: asked.append(a[1:3]) or True)
     start = len(harness.messages)
     window.confirm_remove_extension(entry.id, entry.name)
-    assert asked == [("Remove Extension", "Remove “Remover” from Foxglove?")]
+    assert asked == [("Remove Extension", "Remove “Remover” from Chrome 2?")]
     kind, text = harness.wait_message(start)
     assert kind == "success" and text == "“Remover” was removed.", text
     assert harness.entry(entry.id) is None and harness.entries() == []
@@ -699,7 +699,7 @@ def test_concurrent_installs_of_one_folder_are_deduplicated(harness, tmp_path):
     messages = harness.messages[start:]
     assert len(harness.by_name("Twice")) == 1, harness.entries()
     assert ("info", "“Twice” is already being installed.") in messages, messages
-    assert [m for m in messages if m[0] != "info"] == [("success", "“Twice” was added to Foxglove.")], messages
+    assert [m for m in messages if m[0] != "info"] == [("success", "“Twice” was added to Chrome 2.")], messages
     assert harness.leftover_staging() == []
 
 
@@ -717,7 +717,7 @@ def test_concurrent_installs_of_one_crx_are_deduplicated(harness, tmp_path):
     messages = harness.messages[start:]
     assert [e.id for e in harness.entries()] == [key.ext_id]
     assert ("info", "“Twice Signed” is already being installed.") in messages, messages
-    assert [m for m in messages if m[0] != "info"] == [("success", "“Twice Signed” was added to Foxglove.")], messages
+    assert [m for m in messages if m[0] != "info"] == [("success", "“Twice Signed” was added to Chrome 2.")], messages
 
 
 # ══════════════════════════════════════════════════════════════════════════════════════════

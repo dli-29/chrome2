@@ -482,7 +482,10 @@ def seal_pyqt_package(package: Path) -> bool:
         "# importable, so a pip-installed PyQt6 elsewhere on sys.path can't bring a second Qt into the process.", text)
     if count == 0 and "extend_path" in text:
         raise SystemExit(f"error: {init} uses extend_path in an unexpected way - update seal_pyqt_package")
+    mode = stat.S_IMODE(init.stat().st_mode)
+    init.chmod(mode | stat.S_IWUSR)  # (Homebrew's files are read-only)
     init.write_text(text, encoding="utf-8")
+    init.chmod(mode)
     return count == 1
 
 

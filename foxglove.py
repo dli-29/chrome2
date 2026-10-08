@@ -18109,9 +18109,44 @@ def write_icns(target: Path) -> str:
     return "direct"
 
 
+def bytecode_cache() -> str:
+    """Where boot_command() keeps the script's compiled bytecode: not a __pycache__ next to the script (the user's
+    Desktop, or somewhere read-only) but ~/Library/Caches/Chrome 2/pycache on macOS and $XDG_CACHE_HOME/Foxglove/pycache
+    elsewhere - unless Python was already given a cache prefix (-X pycache_prefix / PYTHONPYCACHEPREFIX)."""
+    if sys.pycache_prefix:
+        return sys.pycache_prefix
+    if IS_MAC:
+        return str(Path.home() / "Library" / "Caches" / APP_NAME / "pycache")
+    return str(Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache") / DATA_NAME / "pycache")
+
+
+def boot_command(script: str) -> str:
+    """Code for `python -c` that starts *script* as __main__ through importlib, which caches its bytecode:
+    `python script.py` compiles all 18k lines on every start (about 0.2 s here; reading the cache takes 5 ms).
+    Everything then looks as it does for `python script.py`: sys.path[0] is the script's folder (not the current
+    directory, which -c puts there), sys.argv[0] is the script, __name__ is "__main__" and __file__ is absolute. Any
+    file name works. Only this file's bytecode goes under bytecode_cache(): the prefix is global, so it is set just
+    while the code is read and put back before the script's own imports run. A cache that can't be written (or a
+    stale one) just means a compile, as today."""
+    path = os.path.abspath(script)
+    return "\n".join((
+        "import importlib.util, os, sys",
+        f"p, c = {path!r}, {bytecode_cache()!r}",
+        'sys.path[0:1] = [os.path.dirname(p)] if sys.path[:1] == [""] else [os.path.dirname(p), *sys.path[:1]]',
+        "sys.argv[0] = p",
+        "k, sys.pycache_prefix = sys.pycache_prefix, c",
+        'spec = importlib.util.spec_from_file_location("__main__", p)',
+        "main = importlib.util.module_from_spec(spec)",
+        'sys.modules["__main__"] = main',
+        'code = spec.loader.get_code("__main__")',
+        "sys.pycache_prefix = k",
+        "exec(code, main.__dict__)"))
+
+
 def make_app_bundle(bundle: Path, python: str, script: str) -> Path:
-    """A macOS app bundle that starts *script* with *python* (the Python - venv - it was made with), logging to
-    ~/Library/Logs/Chrome 2.log. Made in a temporary folder first, then put in place of any older one."""
+    """A macOS app bundle that starts *script* with *python* (the Python - venv - it was made with) from cached
+    bytecode (boot_command), logging to ~/Library/Logs/Chrome 2.log. Made in a temporary folder first, then put in
+    place of any older one."""
     import plistlib
     import shlex
     bundle.parent.mkdir(parents=True, exist_ok=True)
@@ -18133,10 +18168,11 @@ def make_app_bundle(bundle: Path, python: str, script: str) -> Path:
     launcher.write_text(
         "#!/bin/sh\n"
         f"# Starts {APP_NAME}; made by: python3 foxglove.py --install-app (run that again if Python or the script moves)\n"
+        f"# The script is started through importlib so its compiled form is cached (under ~/Library/Caches/{APP_NAME})\n"
         f'LOG="$HOME/Library/Logs/{APP_NAME}.log"\n'
         'mkdir -p "$HOME/Library/Logs"\n'
         f'echo "--- $(date): starting {APP_NAME}" >>"$LOG"\n'
-        f'exec {shlex.quote(python)} {shlex.quote(script)} "$@" >>"$LOG" 2>&1\n', encoding="utf-8")
+        f'exec {shlex.quote(python)} -c {shlex.quote(boot_command(script))} "$@" >>"$LOG" 2>&1\n', encoding="utf-8")
     launcher.chmod(0o755)
     write_icns(contents / "Resources" / "icon.icns")
     shutil.rmtree(bundle, ignore_errors=True)
@@ -18342,7 +18378,8 @@ def main(argv: list[str] | None = None) -> int:
 
 
 def restart_process(profile_name: str, original_flags: str | None) -> None:
-    """Start Chrome 2 again in this same process (same terminal, same Ctrl+C), e.g. to apply a VPN change."""
+    """Start Chrome 2 again in this same process (same terminal, same Ctrl+C), e.g. to apply a VPN change - from
+    cached bytecode (boot_command), so the restart doesn't compile this file again."""
     if original_flags is None:
         os.environ.pop("QTWEBENGINE_CHROMIUM_FLAGS", None)
     else:
@@ -18351,7 +18388,7 @@ def restart_process(profile_name: str, original_flags: str | None) -> None:
         shutil.rmtree(_icon_factory.dir, ignore_errors=True)
     sys.stdout.flush()
     sys.stderr.flush()
-    os.execv(sys.executable, [sys.executable, os.path.abspath(__file__), "--profile", profile_name])
+    os.execv(sys.executable, [sys.executable, "-c", boot_command(__file__), "--profile", profile_name])
 
 
 if __name__ == "__main__":

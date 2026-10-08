@@ -3194,7 +3194,7 @@ class ExtensionsController(QObject):
             return None
         script = QWebEngineScript()
         script.setName(self.TAB_SCRIPT)
-        script.setWorldId(APP_WORLD)
+        script.setWorldId(PAGE_WORLD)  # (the world autofill already has in every frame: no extra V8 context per frame)
         script.setInjectionPoint(QWebEngineScript.InjectionPoint.DocumentCreation)
         script.setRunsOnSubFrames(True)
         script.setSourceCode(f"for (const [q, a] of Object.entries({json.dumps(pairs)})) document.addEventListener(q, () => "
@@ -4161,7 +4161,8 @@ class ExtensionsController(QObject):
         self.changed.emit()
 
 
-APP_WORLD = QWebEngineScript.ScriptWorldId.ApplicationWorld.value  # Foxglove's own isolated world in web pages
+PAGE_WORLD = 3                       # Foxglove's one isolated world in web pages (autofill, Claude's helpers, extension
+                                     # tab ids): every extra world costs a V8 context in every frame of every page
 FIRST_EXTENSION_WORLD = 16           # chrome.scripting: a world per extension from here on (never Foxglove's)
 HOST_SCHEMES = ("http", "https", "ws", "wss", "ftp")  # what host permissions reach (file: only if the user allows it)
 MAIN_WINDOW_ID = 1
@@ -4626,9 +4627,10 @@ class ExtensionBridge(QWebEngineUrlSchemeHandler):
         name = self.c.shim_config(ext_id).get("relay")
         if not name or sip.isdeleted(page):
             return False
+        # (the payload stays a JSON string literal: PAGE_WORLD also holds autofill's API)
         page.runJavaScript(f"!document.dispatchEvent(new CustomEvent({json.dumps(name)}, "
                            f"{{detail: {json.dumps(json.dumps(payload, default=str))}, cancelable: true}}))",
-                           APP_WORLD, done or (lambda _result: None))
+                           PAGE_WORLD, done or (lambda _result: None))
         return True
 
     # ── extension life cycle (called by ExtensionsController) ───────────────────────────
@@ -10459,13 +10461,17 @@ class VpnPanel(Panel):
 # ══════════════════════════════════════════════════════════════════════════════════════════
 # Chrome's password manager and form autofill. Passwords and card numbers live only in the system keychain
 # (SecretStore); sites, usernames, addresses and the last digits of cards in autofill.json (your user only). In web
-# pages a script in an isolated world of its own (AUTOFILL_WORLD) finds login, address and payment forms: page scripts
-# can't see it, call it or read what it holds. When it has news it logs a console message that carries no data (a
+# pages a script in an isolated world (AUTOFILL_WORLD) finds login, address and payment forms: page scripts can't see
+# it, call it or read what it holds. When it has news it logs a console message that carries no data (a
 # "poke", which pages can't read); the browser then collects the news from that frame's isolated world. Saved data goes
 # into a page only when you pick it from the browser's own suggestion list - and only into the frame it was offered for.
-AUTOFILL_WORLD = 3                     # (APP_WORLD 1: other internal scripts; 4: the AI agent; 16+: extensions)
+AUTOFILL_WORLD = PAGE_WORLD            # (shared with Claude's helpers and the extension tab-id script; 16+: extensions)
 KEYCHAIN_SERVICE = "Chrome 2"          # the keychain items' service: fixed, so renaming the app never orphans them
 AUTOFILL_SCRIPT = "chrome2-autofill"
+# Only web and file pages get the script (Qt honours these Greasemonkey headers): an about:blank, srcdoc, data: or
+# internal frame it would return from at once still costs a V8 context of its own. @run-at keeps DocumentCreation.
+AUTOFILL_MATCH = ("// ==UserScript==\n// @match http://*/*\n// @match https://*/*\n// @match file:///*\n"
+                  "// @run-at document-start\n// ==/UserScript==\n")
 AUTOFILL_POKE = "⁣chrome2-autofill:"  # + a per-run token + the frame's address
 
 ICONS.update({
@@ -10905,9 +10911,9 @@ class AutofillData(QObject):
         self.store.delete(f"card:{entry_id}")
 
 
-# The page side. It runs in every frame of every web page, in AUTOFILL_WORLD; nothing it holds is reachable from the
-# page's own scripts. Forms are grouped like Chrome does (a <form>, else every form-less field of the document); fields
-# are typed by their autocomplete attribute first, then by name/id/placeholder/label.
+# The page side. It runs in every http(s) frame of every web page, in AUTOFILL_WORLD; nothing it holds is reachable
+# from the page's own scripts. Forms are grouped like Chrome does (a <form>, else every form-less field of the
+# document); fields are typed by their autocomplete attribute first, then by name/id/placeholder/label.
 AUTOFILL_JS = r"""(() => {
   if (!/^https?:$/.test(location.protocol) || typeof __fgAutofill !== "undefined") return;
   const POKE = __POKE__;
@@ -11321,7 +11327,9 @@ class Autofill(QObject):
         script.setWorldId(AUTOFILL_WORLD)
         script.setInjectionPoint(QWebEngineScript.InjectionPoint.DocumentCreation)
         script.setRunsOnSubFrames(True)
-        script.setSourceCode(AUTOFILL_JS.replace("__POKE__", json.dumps(self.poke)))
+        # one script, one world: Claude's password watch rides along (a throw in it must never stop autofill)
+        script.setSourceCode(AUTOFILL_MATCH + "try {" + AGENT_WATCH_JS + "} catch (e) {}\n"
+                             + AUTOFILL_JS.replace("__POKE__", json.dumps(self.poke)))
         scripts.insert(script)
 
     @classmethod
@@ -12768,7 +12776,8 @@ class BookmarksBar(QWidget):
 from PyQt6.QtGui import QImage, QInputMethodEvent, QKeyEvent  # (only the agent needs these)
 from PyQt6.QtWidgets import QPlainTextEdit, QSpinBox
 
-AGENT_WORLD = 4                     # Claude's isolated world in web pages: its element labels are out of the page's reach
+AGENT_WORLD = PAGE_WORLD            # Claude's helpers, in autofill's isolated world: still out of the page's reach. Never
+                                    # run model-written or page-derived JS here: __fgAutofill.fill/drain live in it
 AGENT_SECRET_KEY = "anthropic_api_key"  # its item in the app's SecretStore (the keychain, KEYCHAIN_SERVICE)
 AGENT_KEY_FILE = "anthropic-api-key"  # (in the profile folder, 0600) when there is no system keychain
 AGENT_MAX_TOKENS = 64000
@@ -13636,7 +13645,8 @@ window.__claudeAgent = {collect, point, clickFallback, focus, fieldState, stillF
                         aimAt, armAt, landed, masks};
 })();"""
 
-AGENT_WATCH_SCRIPT = "chrome2-agent-watch"
+# Part of the autofill script (AUTOFILL_SCRIPT, from the start of every web page and frame): a password the user typed
+# and then had shown (a "show password" button makes the field type=text) still reads as [redacted] to Claude.
 AGENT_WATCH_JS = r"""(() => {  // (Claude's world, from the start of every document) password fields, before any "show"
   if (window.__claudeEverPassword) return;
   const seen = new WeakSet();
@@ -13651,21 +13661,6 @@ AGENT_WATCH_JS = r"""(() => {  // (Claude's world, from the start of every docum
       if (r.target.tagName === "INPUT" && String(r.oldValue || "").toLowerCase() === "password") seen.add(r.target);
   }).observe(document, {subtree: true, attributes: true, attributeFilter: ["type"], attributeOldValue: true});
 })();"""
-
-
-def install_agent_watch(profile: QWebEngineProfile) -> None:
-    """AGENT_WATCH_JS on every page of *profile*: a password the user typed and then had shown (a "show password"
-    button makes the field type=text) still reads as [redacted] to Claude."""
-    scripts = profile.scripts()
-    if scripts.find(AGENT_WATCH_SCRIPT):
-        return
-    script = QWebEngineScript()
-    script.setName(AGENT_WATCH_SCRIPT)
-    script.setWorldId(AGENT_WORLD)
-    script.setInjectionPoint(QWebEngineScript.InjectionPoint.DocumentCreation)
-    script.setRunsOnSubFrames(True)
-    script.setSourceCode(AGENT_WATCH_JS)
-    scripts.insert(script)
 
 
 AGENT_KEY_ALIASES = {
@@ -15435,7 +15430,6 @@ class BrowserWindow(QMainWindow):
         self._cleaners: list[SiteDataCleaner] = []  # clearing site data, still running
         self.settings = settings
         self.autofill = Autofill.of(profile) or Autofill(profile, settings, session_path.parent)  # (before any page)
-        install_agent_watch(profile)
         self.bookmarks = bookmarks
         self.history = history
         self.favicons = favicons

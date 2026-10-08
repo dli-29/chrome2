@@ -500,10 +500,12 @@ def test_install_app_makes_a_macos_app_bundle(fg, tmp_path, monkeypatch, qapp):
     assert "Library/Logs/Chrome 2.log" in launcher.read_text()
     assert (contents / "PkgInfo").read_text() == "APPL????"
     assert not list(bundle.parent.glob("*.part"))
-    # the launcher starts this script with that Python (quoting and all), passing arguments on, output to the log
+    # the launcher starts this script with that Python (quoting and all) from cached bytecode (python -c boot_command),
+    # passing arguments on, output to the log
     log_home.mkdir()
     subprocess.run([str(launcher), "https://example.com/"], env={**os.environ, "HOME": str(log_home)}, check=True, timeout=30)
-    assert (log_home / "started-with").read_text().splitlines() == [str(script), "https://example.com/"]
+    started_with = (log_home / "started-with").read_text().splitlines()
+    assert started_with == ["-c", *fg.boot_command(str(script)).splitlines(), "https://example.com/"]
     assert "started" in (log_home / "Library" / "Logs" / "Chrome 2.log").read_text()
     # no iconutil (not macOS): the icon is written directly, every size a PNG of the logo
     chunks = _icns_chunks((contents / "Resources" / "icon.icns").read_bytes())

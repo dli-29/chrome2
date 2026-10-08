@@ -42,6 +42,7 @@ import errno
 import hashlib
 import hmac
 import html
+import importlib.util
 import io
 import itertools
 import json
@@ -13005,6 +13006,16 @@ def agent_sdk():
     return anthropic
 
 
+def agent_sdk_installed() -> bool:
+    """Whether the anthropic package is there - without importing it, which takes about a second (see AgentPanel)."""
+    if "anthropic" in sys.modules:
+        return sys.modules["anthropic"] is not None  # (None: an import that failed, or a test standing in for one)
+    try:
+        return importlib.util.find_spec("anthropic") is not None
+    except (ImportError, ValueError):
+        return False
+
+
 def agent_echo_content(content: list) -> list:
     """The assistant turn as it goes back into the history: the response unchanged - except that after a fallback in
     mid-answer, the declined model's thinking and tool calls before the switch are left out, as the API asks."""
@@ -15201,6 +15212,10 @@ class AgentPanel(QFrame):
         self.session.controlling.connect(self.indicator.show_on)
         win.tab_bar.currentChanged.connect(lambda _index: self._on_tab_changed())
         self._update_usage()
+        if agent_sdk_installed() and "anthropic" not in sys.modules:
+            # Importing the SDK takes about a second: do it off the UI thread while the panel opens. It only fills
+            # sys.modules (no Qt objects); agent_sdk() on the UI thread then finds the module, or waits for the import.
+            threading.Thread(target=agent_sdk, name="anthropic-import", daemon=True).start()
         self._show_hint()
 
     # ── settings ─────────────────────────────────────────────────────────────────────────
@@ -15328,7 +15343,7 @@ class AgentPanel(QFrame):
 
     def _show_hint(self) -> None:
         """What Claude can do, how to install the SDK or add a key - while the transcript is empty."""
-        sdk = agent_sdk() is not None
+        sdk = agent_sdk_installed()
         self.input.setEnabled(sdk)
         self.send_button.setEnabled(sdk)
         if self.column.count() > (2 if self.hint is not None else 1):
@@ -15402,7 +15417,7 @@ class AgentPanel(QFrame):
         text = self.input.toPlainText().strip()
         if not text:
             return
-        if self._key_where is None and agent_sdk() is not None:
+        if self._key_where is None and agent_sdk_installed():
             self._refresh_key_status()
         if self.session.send(text):
             self.input.clear()

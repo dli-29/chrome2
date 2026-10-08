@@ -280,6 +280,8 @@ class Harness:
         for name_, value in (("FullScreenSupportEnabled", True), ("JavascriptCanOpenWindows", True),
                              ("LocalStorageEnabled", True), ("PdfViewerEnabled", True)):
             self.profile.settings().setAttribute(getattr(attribute, name_), value)
+        if hasattr(attribute, "BackForwardCacheEnabled"):  # as main() (LocalServer's pages are no-store: never cached)
+            self.profile.settings().setAttribute(attribute.BackForwardCacheEnabled, True)
         self.pages_handler = fg.InternalPages(lambda: "<!doctype html><title>New Tab</title>")
         self.profile.installUrlSchemeHandler(b"foxglove", self.pages_handler)
         self.registry_path = self.dir / "extensions.json"

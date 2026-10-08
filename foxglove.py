@@ -16321,22 +16321,32 @@ class BrowserWindow(QMainWindow):
         self._refresh_tab(tab)
         self._tab_updated(tab, {"status": "complete"})
         if ok:
-            self._navigation_event(tab, "onDOMContentLoaded", tab.page.url())
-            self._navigation_event(tab, "onCompleted", tab.page.url())
-        url = tab.page.url()
-        if ok and HistoryStore.recordable(url):
-            tab.last_recorded = url.toString()
-            self.history.add_visit(url.toString(), tab.page.title())
+            self._load_succeeded(tab)
         self._apply_site_zoom(tab)
         if tab is self.current_tab():
             self._sync_chrome(tab)
         self.schedule_session_save()
 
+    def _load_succeeded(self, tab: Tab) -> None:
+        """A page loaded (or came back from the back/forward cache): webNavigation's last events, a history visit."""
+        url = tab.page.url()
+        self._navigation_event(tab, "onDOMContentLoaded", url)
+        self._navigation_event(tab, "onCompleted", url)
+        if HistoryStore.recordable(url):
+            tab.last_recorded = url.toString()
+            self.history.add_visit(url.toString(), tab.page.title())
+
     def _on_loading_changed(self, tab: Tab, info: QWebEngineLoadingInfo) -> None:
         status = info.status()
+        # Qt reports a page restored from the back/forward cache as a failed load (loadFinished(False), just before
+        # this) with no error at all; a real failure has an error code (Stop and 204 report LoadStoppedStatus)
+        restored = (status == QWebEngineLoadingInfo.LoadStatus.LoadFailedStatus and info.errorCode() == 0
+                    and info.errorDomain() == QWebEngineLoadingInfo.ErrorDomain.NoErrorDomain and not info.isErrorPage())
+        if restored:
+            self._load_succeeded(tab)
         if status == QWebEngineLoadingInfo.LoadStatus.LoadFailedStatus and info.errorCode() in PROXY_ERROR_CODES:
             self._warn_vpn_unreachable(tab)
-        if tab.back_after_error and status != QWebEngineLoadingInfo.LoadStatus.LoadStartedStatus:
+        if tab.back_after_error and status != QWebEngineLoadingInfo.LoadStatus.LoadStartedStatus and not restored:
             target, tab.back_after_error = tab.back_after_error, ""
             if status == QWebEngineLoadingInfo.LoadStatus.LoadFailedStatus and info.url().toString() == target:
                 QTimer.singleShot(0, lambda: tab.page.history().canGoBack()
@@ -18187,6 +18197,10 @@ def main(argv: list[str] | None = None) -> int:
                         ("JavascriptCanOpenWindows", True), ("LocalStorageEnabled", True)):
         web_settings.setAttribute(getattr(attribute, name), value)
     web_settings.setAttribute(attribute.ForceDarkMode, settings.get("force_dark_pages"))
+    if hasattr(attribute, "BackForwardCacheEnabled"):  # (not in older PyQt6)
+        # Back/Forward show the page as you left it, at once, as Chrome does (no-store pages aren't kept). It keeps its
+        # JS state: content, autofill, agent and tab-id scripts aren't injected again (a new extension: after a reload)
+        web_settings.setAttribute(attribute.BackForwardCacheEnabled, True)
 
     pages = InternalPages(NewTabPage(settings, history, favicons, app), app)
     profile.installUrlSchemeHandler(b"foxglove", pages)

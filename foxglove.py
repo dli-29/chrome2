@@ -6120,6 +6120,26 @@ DNR_REGEX_URL_LIMIT = 2048  # ... for regexFilter rules when only Python's (back
 DNR_REGEX_MAX = 2000    # a longer regexFilter wouldn't fit Chrome's 2 KB RE2 program either
 _URL_SEPARATOR = r"(?:[^A-Za-z0-9_\-.%]|\Z)"  # urlFilter's "^": a separator character, or the end of the URL
 _URL_AUTHORITY = re.compile(r"[a-z][a-z0-9+.-]*://(?:[^/?#@]*@)?", re.I)  # where "||" looks for the host
+_LITERAL = re.compile(r"[^*^|]+")  # a urlFilter's runs of plain characters
+_FILTER_DOMAIN = re.compile(r"\|\|([a-z0-9-]+(?:\.[a-z0-9-]+)+)(?:[\^/:]|\|$)")  # "||domain^"
+_WORD = re.compile(r"[a-z0-9]+")
+_NO_NAMES: frozenset = frozenset()  # shared by every rule without an excluded* list
+_TYPE_SETS: dict = {}  # resource-type sets: a few dozen distinct ones, shared by all rules
+_ALL_BUT_MAIN = DNR_TYPES - {"main_frame"}
+_FRAMES = frozenset(("main_frame", "sub_frame"))
+
+
+def _names(value) -> frozenset | None:
+    """A rule's list of domains, types or methods, lower-cased (None: not a list)."""
+    return frozenset([v.lower() for v in value if isinstance(v, str)]) if isinstance(value, list) else None
+
+
+def _literal(text: str, case: bool) -> str:
+    """The longest run of plain characters a urlFilter needs in the URL ("" if none): a URL without it can't match."""
+    body = text[2:] if text.startswith("||") else text.lstrip("|")
+    best = max((part for part in _LITERAL.findall(body.rstrip("|")) if part.isascii()), key=len, default="")
+    return best if case else best.lower()  # (non-ASCII skipped: re.I folds more than str.lower - URLs are ASCII anyway)
+
 
 try:  # linear-time regular expressions, as Chrome's (pip install google-re2)
     import re2 as _re2
@@ -6133,9 +6153,10 @@ class UrlFilter:
     The pattern's pieces between "*"s are looked for one after another, each as far to the left as it goes: with "*" as
     the only wildcard that finds a match whenever there is one - and unlike a regular expression with a ".*" per "*",
     no URL a web page makes up can keep the browser busy for long."""
-    __slots__ = ("domain", "start", "end", "pieces", "last")
+    __slots__ = ("domain", "start", "end", "pieces", "last", "need")
 
     def __init__(self, text: str, case: bool = False):
+        self.need = _literal(text, case)  # a quick "not in the URL" before any regular expression runs
         self.domain = text.startswith("||")
         self.start = not self.domain and text.startswith("|")
         text = text[2:] if self.domain else text[1:] if self.start else text
@@ -6195,13 +6216,13 @@ def _filter_keys(text: str) -> list[str]:
     """Where a urlFilter rule is filed: the domain of "||domain^", else its longest whole word (one a URL splits out
     as it is - not cut by a "*" or an open end)."""
     low = text.lower()
-    m = re.match(r"\|\|([a-z0-9-]+(?:\.[a-z0-9-]+)+)(?:[\^/:]|\|$)", low)
+    m = _FILTER_DOMAIN.match(low)
     if m:
         return ["d:" + m.group(1)]
     start, end = low.startswith("|"), low.endswith("|")
     pieces, best = low.lstrip("|")[:-1 if end else None].split("*"), ""
     for i, piece in enumerate(pieces):
-        for w in re.finditer(r"[a-z0-9]+", piece):
+        for w in _WORD.finditer(piece):
             whole = (w.start() > 0 or (i == 0 and start)) and (w.end() < len(piece) or (i == len(pieces) - 1 and end))
             if whole and len(w.group()) > len(best) and w.group() not in _COMMON_WORDS:
                 best = w.group()
@@ -6225,27 +6246,29 @@ class NetRule:
             raise ValueError("unknown action")
         if self.kind == "modifyHeaders" and not action.get("requestHeaders"):
             raise ValueError("response headers only")  # Qt can't change those
-        self.id, self.ruleset, self.action = raw["id"], ruleset, action
+        get, kind = cond.get, self.kind
+        self.id, self.ruleset = raw["id"], ruleset
+        self.action = action if kind in ("redirect", "modifyHeaders") else None  # (what the others do is their type)
         self.priority = raw.get("priority") if isinstance(raw.get("priority"), int) else 1
-        self.rank = DNR_ACTIONS.index(self.kind) if self.kind in DNR_ACTIONS else len(DNR_ACTIONS)
-        value = lambda key, alias=None: cond.get(key, cond.get(alias) if alias else None)  # "domains": the old name
-        words = lambda key, alias=None: frozenset(s.lower() for s in _strings(value(key, alias)))
-        listed = lambda key, alias=None: words(key, alias) if isinstance(value(key, alias), list) else None
-        self.text = cond.get("regexFilter") if isinstance(cond.get("regexFilter"), str) else cond.get("urlFilter")
-        self.text = self.text if isinstance(self.text, str) and self.text else ""
-        self.is_regex, self.regex = isinstance(cond.get("regexFilter"), str), None
-        self.case = cond.get("isUrlFilterCaseSensitive") is True
-        types, excluded = listed("resourceTypes"), listed("excludedResourceTypes")
-        self.types = types if types else DNR_TYPES - (excluded if excluded is not None else {"main_frame"})
-        if self.kind == "allowAllRequests":
-            self.types &= {"main_frame", "sub_frame"}
-        self.domains, self.not_domains = listed("requestDomains"), words("excludedRequestDomains")
-        self.initiators = listed("initiatorDomains", "domains")
-        self.not_initiators = words("excludedInitiatorDomains", "excludedDomains")
-        self.methods, self.not_methods = listed("requestMethods"), words("excludedRequestMethods")
-        self.party = cond.get("domainType") if cond.get("domainType") in ("firstParty", "thirdParty") else None
-        ids = lambda key: frozenset(v for v in cond.get(key) if isinstance(v, int)) if isinstance(cond.get(key), list) else None
-        self.tabs, self.not_tabs = ids("tabIds"), ids("excludedTabIds") or frozenset()
+        self.rank = DNR_ACTIONS.index(kind) if kind in DNR_ACTIONS else len(DNR_ACTIONS)
+        regex = get("regexFilter")
+        self.is_regex, self.regex = isinstance(regex, str), None
+        text = regex if self.is_regex else get("urlFilter")
+        self.text = text if isinstance(text, str) and text else ""
+        self.case = get("isUrlFilterCaseSensitive") is True
+        types = _names(get("resourceTypes"))
+        if not types:
+            excluded = _names(get("excludedResourceTypes"))
+            types = DNR_TYPES - excluded if excluded is not None else _ALL_BUT_MAIN
+        types &= _FRAMES if kind == "allowAllRequests" else DNR_TYPES  # (real types only: the shared sets stay few)
+        self.types = _TYPE_SETS.setdefault(types, types)
+        self.domains, self.not_domains = _names(get("requestDomains")), _names(get("excludedRequestDomains")) or _NO_NAMES
+        self.initiators = _names(get("initiatorDomains", get("domains")))  # "domains": the old name
+        self.not_initiators = _names(get("excludedInitiatorDomains", get("excludedDomains"))) or _NO_NAMES
+        self.methods, self.not_methods = _names(get("requestMethods")), _names(get("excludedRequestMethods")) or _NO_NAMES
+        self.party = get("domainType") if get("domainType") in ("firstParty", "thirdParty") else None
+        ids = lambda key: frozenset(v for v in get(key) if isinstance(v, int)) if isinstance(get(key), list) else None
+        self.tabs, self.not_tabs = ids("tabIds"), ids("excludedTabIds") or _NO_NAMES
         self.keys = (["d:" + d for d in self.domains] if self.domains else
                      (_filter_keys(self.text) if self.text and not self.is_regex else []) or
                      (["i:" + d for d in self.initiators] if self.initiators else []))
@@ -6269,7 +6292,11 @@ class NetRule:
                 except re.error:
                     self.text, self.types = "", frozenset()  # Chrome refuses such a rule when it loads
                     return False
-            if not (self.regex.search(req.regex_head) if self.is_regex else self.regex.search(req.head, req.cut)):
+            if self.is_regex:
+                if not self.regex.search(req.regex_head):
+                    return False
+            elif ((self.regex.need and self.regex.need not in (req.head if self.case else req.low))
+                  or not self.regex.search(req.head, req.cut)):
                 return False
         if self.tabs is None and not self.not_tabs:
             return True
@@ -6283,7 +6310,8 @@ class RuleIndex:
 
     def __init__(self, raw_rules, ruleset: str):
         self.keyed: dict[str, list[NetRule]] = {}
-        self.generic: list[NetRule] = []
+        self.by_initiator: dict[str, dict[str, list[NetRule]]] = {}  # key -> initiator -> its rules for that site only
+        self.generic: list[tuple[str, NetRule]] = []  # (what the URL must contain, rule)
         self.tabbed = self.allow_all = False
         for raw in raw_rules if isinstance(raw_rules, list) else []:
             try:
@@ -6293,14 +6321,27 @@ class RuleIndex:
             self.tabbed = self.tabbed or rule.tabs is not None or bool(rule.not_tabs)
             self.allow_all = self.allow_all or rule.kind == "allowAllRequests"
             for key in rule.keys:
-                self.keyed.setdefault(key, []).append(rule)
+                if rule.initiators is not None and not key.startswith("i:"):
+                    sub = self.by_initiator.setdefault(key, {})
+                    for site in rule.initiators:
+                        sub.setdefault(site, []).append(rule)
+                else:
+                    self.keyed.setdefault(key, []).append(rule)
             if not rule.keys:
-                self.generic.append(rule)
+                self.generic.append(("" if rule.is_regex else _literal(rule.text, rule.case), rule))
 
-    def candidates(self, keys: list[str]):
-        yield from self.generic
+    def candidates(self, req: "NetRequest", keys: list[str]):
+        """The rules that might match *req* (*keys*: those of its keys some rule is filed under)."""
+        for need, rule in self.generic:
+            if not need or need in (req.head if rule.case else req.low):
+                yield rule
+        keyed, by_initiator = self.keyed.get, self.by_initiator.get
         for key in keys:
-            yield from self.keyed.get(key, ())
+            yield from keyed(key, ())
+            sub = by_initiator(key)
+            if sub:
+                for site in req.initiators:
+                    yield from sub.get(site, ())
 
 
 @dataclass
@@ -6316,9 +6357,11 @@ class NetRequest:
     head: str = dc_field(init=False, default="")         # what urlFilters look at (DNR_URL_LIMIT)...
     cut: bool = dc_field(init=False, default=False)      # ... and whether that's only the start of the URL
     regex_head: str = dc_field(init=False, default="")   # what regexFilters look at
+    low: str = dc_field(init=False, default="")          # head, lower-cased
 
     def __post_init__(self) -> None:
         self.head, self.cut = self.url[:DNR_URL_LIMIT], len(self.url) > DNR_URL_LIMIT
+        self.low = self.head.lower()
         self.regex_head = self.url if _re2 is not None else self.url[:DNR_REGEX_URL_LIMIT]
 
 
@@ -6328,6 +6371,12 @@ class NetExtension:
     indexes: list
     hosts: list[str]         # host permissions: redirects and header changes need them
     needs_hosts: bool        # declarativeNetRequestWithHostAccess only: every action needs them
+    present: frozenset = dc_field(init=False, default=frozenset())  # every key its indexes file rules under
+    allow_all: bool = dc_field(init=False, default=False)
+
+    def __post_init__(self) -> None:
+        self.present = frozenset().union(*(i.keyed.keys() | i.by_initiator.keys() for i in self.indexes))
+        self.allow_all = any(i.allow_all for i in self.indexes)
 
     def may(self, url: str) -> bool:
         return any(match_pattern(h, url) for h in self.hosts)
@@ -6424,7 +6473,7 @@ class NetRules:
             for ruleset in self.enabled_rulesets(ext_id, manifest):
                 if isinstance(paths.get(ruleset), str):
                     indexes.append(self._ruleset(root, paths[ruleset], str(ruleset)))
-            indexes = [i for i in indexes if i is not None and (i.keyed or i.generic)]
+            indexes = [i for i in indexes if i is not None and (i.keyed or i.by_initiator or i.generic)]
             if indexes:
                 exts.append(NetExtension(ext_id, indexes, bridge._hosts(ext_id), not dnr))
         self._exts = exts
@@ -6437,7 +6486,7 @@ class NetRules:
         party = source or first_party.host().lower()
         third = kind != "main_frame" and bool(party) and _site(host) != _site(party)
         req = NetRequest(text, kind, method, _suffixes(host), _suffixes(source), third, tab)
-        req.keys = (["d:" + h for h in req.hosts] + ["t:" + w for w in set(re.findall(r"[a-z0-9]+", req.head.lower()))]
+        req.keys = (["d:" + h for h in req.hosts] + ["t:" + w for w in set(_WORD.findall(req.low))]
                     + ["i:" + h for h in req.initiators])
         return req
 
@@ -6448,24 +6497,26 @@ class NetRules:
             if len(self._documents) > 500:
                 self._documents.clear()
             req = self._request(page, "main_frame", "get", QUrl(), page, -1)
-            hits = [r.priority for i in ext.indexes if i.allow_all for r in i.candidates(req.keys)
+            hits = [r.priority for i in ext.indexes if i.allow_all for r in i.candidates(req, req.keys)
                     if r.kind == "allowAllRequests" and r.matches(req)]
             self._documents[key] = max(hits) if hits else None
         return self._documents[key]
 
     def decide(self, ext: NetExtension, req: NetRequest, page: QUrl):
         """(winning rule or None, header rules to apply) - or None if it depends on the tab."""
-        best, headers = None, []
+        best, found = None, {}
+        keys = [k for k in req.keys if k in ext.present]  # (in order: the tie-breaks stay the same)
         for index in ext.indexes:
-            for rule in index.candidates(req.keys):
+            for rule in index.candidates(req, keys):
                 hit = rule.matches(req)
                 if hit is None:
                     return None
                 if hit and rule.kind == "modifyHeaders":
-                    headers.append(rule)
+                    found[id(rule)] = rule  # (a rule filed under two of the request's keys counts once)
                 elif hit and (best is None or (rule.priority, -rule.rank) > (best.priority, -best.rank)):
                     best = rule
-        if req.type not in ("main_frame", "sub_frame") and page.isValid() and any(i.allow_all for i in ext.indexes):
+        headers = list(found.values())
+        if req.type not in ("main_frame", "sub_frame") and page.isValid() and ext.allow_all:
             allowed = self._frame_allowed(ext, page)
             if allowed is not None and (best is None or best.priority <= allowed):  # the page is allowed: so is this
                 return None, [h for h in headers if h.priority > allowed]

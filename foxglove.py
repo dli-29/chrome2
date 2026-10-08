@@ -561,10 +561,11 @@ def read_json(path: Path, default):
 def write_json(path: Path, data, keep_backup: bool = False) -> bool:
     """Atomically replace *path* (write to a temp file, then rename) so a crash never leaves half a file."""
     try:
+        text = json.dumps(data, ensure_ascii=False, indent=1)  # (dumps takes the C encoder; dump never does)
         path.parent.mkdir(parents=True, exist_ok=True)
         tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
         with open(tmp, "w", encoding="utf-8") as fh:
-            json.dump(data, fh, ensure_ascii=False, indent=1)
+            fh.write(text)
             fh.flush()
             os.fsync(fh.fileno())
         if keep_backup and path.exists():
@@ -2489,6 +2490,7 @@ class HistoryStore:
         try:
             self.db = sqlite3.connect(str(path))
             self.db.execute("PRAGMA journal_mode=WAL")
+            self.db.execute("PRAGMA synchronous=NORMAL")  # WAL: crash-safe without an fsync per visit
             self.db.execute(
                 "CREATE TABLE IF NOT EXISTS places (url TEXT PRIMARY KEY, title TEXT NOT NULL DEFAULT '', "
                 "visit_count INTEGER NOT NULL DEFAULT 0, last_visit REAL NOT NULL DEFAULT 0)")
@@ -2571,8 +2573,13 @@ class HistoryStore:
         return found
 
     def delete(self, urls: list[str]) -> None:
-        for url in urls:
-            self._run("DELETE FROM places WHERE url = ?", (url,))
+        if self.db is None or not urls:
+            return
+        try:
+            with self.db:  # one transaction (and one fsync), not one per address
+                self.db.executemany("DELETE FROM places WHERE url = ?", [(u,) for u in urls])
+        except sqlite3.Error as exc:
+            log(f"History error: {exc}")
 
     def clear(self) -> None:
         self._run("DELETE FROM places")
@@ -7501,6 +7508,7 @@ class Tab(QWidget):
         self.typed_text = ""                  # what was typed, in case the guessed address doesn't exist
         self.back_after_error = ""            # URL whose certificate error page we should step back from
         self.last_recorded = ""
+        self.title_writes = 0                 # history title updates for this document (capped, as Chrome)
         self.webstore_bar: InfoBar | None = None
         self.crash_bar: InfoBar | None = None
         self.permission_bars: list[InfoBar] = []
@@ -9586,7 +9594,11 @@ class HistoryDialog(QDialog):
         top = QHBoxLayout()
         self.search = QLineEdit()
         self.search.setPlaceholderText("Search history")
-        self.search.textChanged.connect(lambda *_: self.reload())
+        self._search_timer = QTimer(self)  # one query per pause in typing, not one per keystroke
+        self._search_timer.setSingleShot(True)
+        self._search_timer.setInterval(200)
+        self._search_timer.timeout.connect(self.reload)
+        self.search.textChanged.connect(lambda *_: self._search_timer.start())
         top.addWidget(self.search, 1)
         delete = make_button("Delete")
         delete.clicked.connect(lambda *_: self._delete())
@@ -9607,6 +9619,7 @@ class HistoryDialog(QDialog):
         self.reload()
 
     def reload(self) -> None:
+        self._search_timer.stop()  # (a pending search would only fill the same list again)
         self.tree.clear()
         for url, title, last, _count in self.win.history.recent(self.search.text().strip(), 3000):
             stamp = time.strftime("%Y-%m-%d %H:%M", time.localtime(last))
@@ -10569,12 +10582,13 @@ def secret_store() -> SecretStore:
 def write_private_json(path: Path, data) -> bool:
     """write_json for a file only your user may read (0600 from the moment it exists)."""
     try:
+        text = json.dumps(data, ensure_ascii=False, indent=1)  # (as write_json)
         path.parent.mkdir(parents=True, exist_ok=True)
         tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
         with os.fdopen(os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "w", encoding="utf-8") as fh:
             if os.name == "posix":
                 os.fchmod(fh.fileno(), 0o600)  # (a temp file left from before kept its mode)
-            json.dump(data, fh, ensure_ascii=False, indent=1)
+            fh.write(text)
             fh.flush()
             os.fsync(fh.fileno())
         os.replace(tmp, path)
@@ -16347,9 +16361,11 @@ class BrowserWindow(QMainWindow):
         if tab is self.current_tab():
             self.setWindowTitle(APP_NAME if is_newtab(tab.url()) else f"{tab.title()} — {APP_NAME}")
         url = tab.page.url()
-        if title and HistoryStore.recordable(url):
+        if title and HistoryStore.recordable(url) and tab.title_writes < 5:  # (as Chrome: a page's first few titles;
+            tab.title_writes += 1                                            # a flashing "(3) Inbox" would commit forever)
             self.history.set_title(url.toString(), title)
-        self.schedule_session_save()
+        # No session save for a title: it is inside the saved history blob anyway, and the 15 s autosave, the URL/load
+        # saves and closeEvent still write it. A ticking title would rewrite session.json (with fsync) every second.
 
     def _on_icon_changed(self, tab: Tab, icon_: QIcon) -> None:
         if not icon_.isNull() and tab.page.url().scheme() in ("http", "https"):
@@ -16357,6 +16373,7 @@ class BrowserWindow(QMainWindow):
         self._refresh_tab(tab)
 
     def _on_url_changed(self, tab: Tab, url: QUrl) -> None:
+        tab.title_writes = 0
         self.extensions.bridge.tab_navigated(tab, url)
         self._tab_updated(tab, {"url": url.toString()})
         self._navigation_event(tab, "onCommitted" if tab.loading else "onHistoryStateUpdated", url)
@@ -16380,7 +16397,7 @@ class BrowserWindow(QMainWindow):
         self.schedule_session_save()
 
     def _on_load_started(self, tab: Tab) -> None:
-        tab.loading, tab.progress, tab.crashed = True, 0, False
+        tab.loading, tab.progress, tab.crashed, tab.title_writes = True, 0, False, 0
         self._tab_updated(tab, {"status": "loading"})
         self._navigation_event(tab, "onBeforeNavigate", tab.page.requestedUrl())
         if tab.crash_bar is not None and not sip.isdeleted(tab.crash_bar):

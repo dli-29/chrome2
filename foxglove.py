@@ -117,6 +117,8 @@ TAB_MIN_WIDTH, TAB_MAX_WIDTH, TAB_HEIGHT = 80, 240, 40
 TAB_CLOSE_AREA = 32           # room for the close button on the right of each tab
 PINNED_TAB_WIDTH = 44         # a pinned tab: just its icon, like Chrome
 MAX_CLOSED_TABS = 25
+TAB_DISCARD_AFTER = 60 * 60   # Memory Saver: a background tab unused this long gives back its memory (s)...
+TAB_LIVE_LIMIT = 8            # ...once more background tabs than this are loaded (the least recently used first)
 ZOOM_LEVELS = (0.3, 0.5, 0.67, 0.8, 0.9, 1.0, 1.1, 1.2, 1.33, 1.5, 1.7, 2.0, 2.4, 3.0, 4.0, 5.0)
 
 SEARCH_ENGINES = {
@@ -164,6 +166,7 @@ SITE_PERMISSIONS = ((_PT.Geolocation, "Location"), (_PT.MediaVideoCapture, "Came
 PERMISSION_PARTS = {_PT.MediaAudioVideoCapture: (_PT.MediaAudioCapture, _PT.MediaVideoCapture),
                     _PT.DesktopAudioVideoCapture: (_PT.DesktopVideoCapture,)}  # requests for two at once
 ASK_ALWAYS = {_PT.DesktopVideoCapture, _PT.DesktopAudioVideoCapture}
+_CAPTURE = {_PT.MediaAudioCapture, _PT.MediaVideoCapture, _PT.MediaAudioVideoCapture, *ASK_ALWAYS}  # a call: never discarded
 
 
 # ══════════════════════════════════════════════════════════════════════════════════════════
@@ -2103,6 +2106,7 @@ class Settings(QObject):
         "ntp_hidden": [],                  # most visited pages removed from the page
         "ntp_theme": "",                   # "" (default) or a NTP_COLORS key
         "privacy_screen": True,            # grey out the windows while Chrome 2 isn't the active app
+        "memory_saver": True,              # discard background tabs left unused (BrowserWindow._sleep_tabs)
     }
 
     def __init__(self, path: Path):
@@ -4605,7 +4609,7 @@ class ExtensionBridge(QWebEngineUrlSchemeHandler):
             return []
         out = []
         for tab in self.tabs():
-            if tab.pending is not None or sip.isdeleted(tab.page):
+            if sip.isdeleted(tab.page) or unloaded(tab):
                 continue
             urls, frames = {tab.url().toString()}, [tab.page.mainFrame()]
             while frames and len(urls) < 200:
@@ -4770,14 +4774,14 @@ class ExtensionBridge(QWebEngineUrlSchemeHandler):
     def tab_info(self, ext_id: str, tab) -> dict:
         win = self.c.window
         popup = isinstance(tab, PopupWindow)
-        page, url = tab.page, tab.url().toString()
+        page, url, asleep = tab.page, tab.url().toString(), unloaded(tab)
         active = popup or (win is not None and tab is win.current_tab())
         info = {"id": tab.tab_id, "index": 0 if popup or win is None else win.index_of(tab), "windowId": tab.window_id,
                 "active": active, "highlighted": active, "selected": active, "pinned": bool(getattr(tab, "pinned", False)),
                 "incognito": False,
                 "audible": page.recentlyAudible(), "mutedInfo": {"muted": page.isAudioMuted()},
-                "discarded": tab.pending is not None, "autoDiscardable": True, "frozen": False, "groupId": -1,
-                "status": "unloaded" if tab.pending is not None else "loading" if tab.loading else "complete",
+                "discarded": asleep, "autoDiscardable": True, "frozen": False, "groupId": -1,
+                "status": "unloaded" if asleep else "loading" if tab.loading else "complete",
                 "width": tab.width(), "height": tab.height()}
         opener = getattr(tab, "opener", None)
         if opener is not None:
@@ -4813,7 +4817,7 @@ class ExtensionBridge(QWebEngineUrlSchemeHandler):
 
     def _script_tab(self, ext_id: str, target) -> "Tab":
         tab = self._tab((target or {}).get("tabId") if isinstance(target, dict) else None)
-        if tab.pending is not None:
+        if unloaded(tab):
             raise ApiError("Cannot access contents of a tab that hasn't been loaded yet.")
         if not self.can_access(ext_id, tab.url().toString(), tab.tab_id):
             raise ApiError(self.NO_HOST)
@@ -5348,7 +5352,7 @@ class ExtensionBridge(QWebEngineUrlSchemeHandler):
             tab = self._tab(a.get("tabId"))
         except ApiError:
             raise ApiError(self.NO_RECEIVER) from None
-        if tab.pending is not None:
+        if unloaded(tab):  # (no content scripts in it, as in Chrome)
             raise ApiError(self.NO_RECEIVER)
         call_id = secrets.token_hex(8)
         payload = {"msg": a.get("msg"), "callId": call_id, "frameId": a.get("frameId"),
@@ -7503,6 +7507,11 @@ class Tab(QWidget):
         self.pinned = False                   # pinned tabs sit left of the others, icon only
         self.split: SplitView | None = None   # shown side by side with another tab (split view)
         self.uid = uuid.uuid4().hex           # survives restarts (session), unlike tab_id
+        # Memory Saver (BrowserWindow._sleep_tabs): a tab opened in the background never says it's hidden, so it is now
+        self.hidden_since: float | None = time.monotonic()  # out of sight since (None: shown)
+        self.keep_awake = ""                  # origin given camera/mic/screen here: a call, never discarded
+        self.typed = False                    # typed into since its page loaded: drafts may live only in its scripts
+        self.page.visibleChanged.connect(self._visible_changed)
 
     # State
     @property
@@ -7539,6 +7548,14 @@ class Tab(QWidget):
         if self.page.isAudioMuted():
             return "muted"
         return "playing" if self.page.recentlyAudible() else ""
+
+    def _visible_changed(self, visible: bool) -> None:
+        self.hidden_since = None if visible else time.monotonic()
+
+    def eventFilter(self, watched, event) -> bool:  # (on the page's focus proxy: BrowserWindow._on_load_finished)
+        if event.type() == QEvent.Type.InputMethod or (event.type() == QEvent.Type.KeyPress and event.text()):
+            self.typed = True
+        return False
 
     # Loading
     def load(self, url: QUrl) -> None:
@@ -7625,6 +7642,12 @@ class Tab(QWidget):
         if self.devtools is not None:
             self.devtools.page().blockSignals(True)
             self.page.setDevToolsPage(None)
+
+
+def unloaded(tab) -> bool:
+    """No document runs in the tab (or pop-up): restored and not opened yet, or Memory Saver discarded it. Showing,
+    loading or reloading it brings it back (with its back/forward list)."""
+    return tab.pending is not None or tab.page.lifecycleState() == QWebEnginePage.LifecycleState.Discarded
 
 
 # ══════════════════════════════════════════════════════════════════════════════════════════
@@ -10060,6 +10083,15 @@ class SettingsDialog(QDialog):
         bookmarks_bar.setChecked(settings.get("show_bookmarks_bar"))
         bookmarks_bar.toggled.connect(lambda on: win.set_bookmarks_bar_visible(on))
         layout.addWidget(bookmarks_bar)
+
+        section("Performance")
+        self.memory_saver = QCheckBox("Memory Saver: tabs you haven't used for an hour give back their memory")
+        self.memory_saver.setToolTip(f"Only when more than {TAB_LIVE_LIMIT} background tabs are open. A tab reloads when "
+                                     "you go back to it. Pinned tabs, tabs playing sound, calls, tabs you typed in and "
+                                     "sites allowed to send notifications always stay active")
+        self.memory_saver.setChecked(settings.get("memory_saver"))
+        self.memory_saver.toggled.connect(lambda on: settings.set("memory_saver", on))
+        layout.addWidget(self.memory_saver)
 
         section("Downloads")
         folder_row = QHBoxLayout()
@@ -15491,6 +15523,10 @@ class BrowserWindow(QMainWindow):
         self._autosave.setInterval(15_000)
         self._autosave.timeout.connect(self.save_session)
         self._autosave.start()
+        self._sleeper = QTimer(self)  # Memory Saver
+        self._sleeper.setInterval(60_000)
+        self._sleeper.timeout.connect(self._sleep_tabs)
+        self._sleeper.start()
         self._rebuild_extension_buttons()
         self._restore(startup_urls)
         self.privacy_screen = PrivacyScreen(self, settings)
@@ -15850,7 +15886,7 @@ class BrowserWindow(QMainWindow):
     def close_tab(self, tab: Tab | None) -> None:
         if tab is None:
             return
-        if tab.pending is not None or tab.crashed or tab.close_requested or self._closing:
+        if unloaded(tab) or tab.crashed or tab.close_requested or self._closing:
             self._remove_tab(tab)
             return
         # Let the page run its "leave page?" check (onbeforeunload); it answers via windowCloseRequested.
@@ -16134,6 +16170,8 @@ class BrowserWindow(QMainWindow):
         page.findTextFinished.connect(lambda result, t=tab: self._on_find_result(t, result))
         page.certificateAccepted.connect(self._on_certificate_accepted)
         page.certificateProblem.connect(lambda error, t=tab: self._on_certificate_problem(t, error))
+        page.lifecycleStateChanged.connect(  # (Memory Saver discarded it, or it's back)
+            lambda state, t=tab: self._tab_updated(t, {"discarded": state == QWebEnginePage.LifecycleState.Discarded}))
         tab.view.printFinished.connect(lambda ok: self._on_print_finished(ok))
 
     def _on_current_changed(self, index: int) -> None:
@@ -16165,8 +16203,12 @@ class BrowserWindow(QMainWindow):
             self.find_bar.find()
         if tab.split is not None:
             tab.split.set_focused(tab)
-        for visible in self.visible_tabs():
+        on_screen = self.visible_tabs()
+        if previous is not None and not sip.isdeleted(previous) and previous not in on_screen:
+            previous.hidden_since = time.monotonic()  # (Memory Saver: least recently used first)
+        for visible in on_screen:
             visible.ensure_loaded()
+            visible.hidden_since = None
         self.content.bubble.hide()
         self._sync_chrome(tab)
         if self._keep_focus:  # you clicked into this side of the split view: the focus is where you put it
@@ -16177,6 +16219,42 @@ class BrowserWindow(QMainWindow):
             tab.view.setFocus()
         self.tab_bar.update()  # (a split view's outline follows the current tab)
         self.schedule_session_save()
+
+    # Memory Saver (like Chrome's): beyond the TAB_LIVE_LIMIT most recently used background tabs, one left unused for
+    # TAB_DISCARD_AFTER gives back its memory (its renderer ends). It keeps its title, address and back/forward list, and
+    # reloads when shown. Never a tab in use: pinned, shown, playing sound, in a call, typed into, with notifications...
+    def _can_sleep(self, tab: Tab) -> bool:
+        url, page = tab.url(), tab.page
+        if (tab.pending is not None or tab.pinned or tab.devtools is not None or tab.loading or tab.crashed
+                or tab.close_requested or tab.keep_awake or tab.typed or tab.permission_bars or page.js_dialog is not None
+                or page.isVisible() or tab is self._fullscreen_tab or tab in self.visible_tabs() or page.recentlyAudible()):
+            return False
+        if is_newtab(url):
+            return True
+        return url.scheme() in ("http", "https") and self.profile.queryPermission(
+            QUrl(origin_of(url)), _PT.Notifications).state() != QWebEnginePermission.State.Granted
+
+    def _sleep_tabs(self) -> None:
+        if self._closing or not self.settings.get("memory_saver") or self.agent_running():
+            return
+        S, now, shown, tabs = QWebEnginePage.LifecycleState, time.monotonic(), self.visible_tabs(), self.tabs()
+        excess = sum(t.pending is None and t not in shown and t.page.lifecycleState() != S.Discarded for t in tabs) - TAB_LIVE_LIMIT
+        for tab in sorted((t for t in tabs if t.hidden_since is not None), key=lambda t: t.hidden_since):
+            if excess <= 0 or now - tab.hidden_since < TAB_DISCARD_AFTER:
+                break
+            page = tab.page
+            if page.lifecycleState() != S.Active or page.recommendedState() == S.Active or not self._can_sleep(tab):
+                continue  # (Qt keeps a page Active while it's shown or plays sound)
+            page.blockSignals(True)  # (a probe nobody hears of: extensions see only the discarding)
+            page.setLifecycleState(S.Frozen)  # Qt's last checks (a pop-up it opened, a PDF...) need a frozen page,
+            discard = page.recommendedState() == S.Discarded  # and answer at once: no lasting freeze (it would
+            if not discard:                                   # block the site's other tabs on IndexedDB, locks...)
+                page.setLifecycleState(S.Active)
+                tab.hidden_since = now  # (asked again in TAB_DISCARD_AFTER)
+            page.blockSignals(False)
+            if discard:
+                page.setLifecycleState(S.Discarded)
+                excess -= 1
 
     def _sync_chrome(self, tab: Tab) -> None:
         """Update toolbar, address bar and window title for the current tab."""
@@ -16291,6 +16369,8 @@ class BrowserWindow(QMainWindow):
                 tab.permission_bars.remove(bar)
                 if not sip.isdeleted(bar):
                     bar.dismiss()
+        if tab.keep_awake and origin_of(url) != tab.keep_awake:
+            tab.keep_awake = ""  # (the call's site is gone)
         if tab.loading:
             self.site_visited(url)
         if not tab.loading and HistoryStore.recordable(url) and url.toString() != tab.last_recorded:
@@ -16317,7 +16397,9 @@ class BrowserWindow(QMainWindow):
             self.content.loading_bar.set_progress(value, tab.loading)
 
     def _on_load_finished(self, tab: Tab, ok: bool) -> None:
-        tab.loading, tab.progress = False, 100
+        tab.loading, tab.progress, tab.typed = False, 100, False
+        if (proxy := tab.view.focusProxy()) is not None:  # (Memory Saver: notes typing; a new renderer may bring a new
+            proxy.installEventFilter(tab)                  # proxy, and Qt keeps one filter per object)
         self._refresh_tab(tab)
         self._tab_updated(tab, {"status": "complete"})
         if ok:
@@ -16464,9 +16546,15 @@ class BrowserWindow(QMainWindow):
         if text is None:
             permission.deny()
             return
+
+        def grant() -> None:
+            permission.grant()
+            if permission.permissionType() in _CAPTURE:
+                tab.keep_awake = origin_of(permission.origin())  # (a call: Memory Saver leaves the tab alone)
+
         remembered = self.remembered_decision(permission)  # set in site settings, or answered before
         if remembered is not None:
-            permission.grant() if remembered else permission.deny()
+            grant() if remembered else permission.deny()
             return
         origin = permission.origin()
         bar = InfoBar(icon("info", P.ACCENT), f"Allow <b>{html.escape(origin.host() or origin.toString())}</b> to {text}?")
@@ -16476,7 +16564,7 @@ class BrowserWindow(QMainWindow):
         def decide(allow: bool, remember: bool = False) -> None:
             if not decided["done"]:
                 decided["done"] = True
-                permission.grant() if allow else permission.deny()
+                grant() if allow else permission.deny()
                 if remember:
                     self.remember_decision(permission, allow)
 
@@ -17608,8 +17696,8 @@ class BrowserWindow(QMainWindow):
                 self._cleaners.remove(cleaner)
             for tab in self.tabs():
                 origin = origin_of(tab.url())
-                if tab.pending is None and origin in cleaner.done and not (everything and origin in cleaner.visited):
-                    tab.page.triggerAction(QWebEnginePage.WebAction.Reload)
+                if not unloaded(tab) and origin in cleaner.done and not (everything and origin in cleaner.visited):
+                    tab.page.triggerAction(QWebEnginePage.WebAction.Reload)  # (a discarded one: when shown)
             cleaner.deleteLater()
             if done is not None:
                 done()
@@ -17785,6 +17873,7 @@ class BrowserWindow(QMainWindow):
         self._closing = True
         self._session_timer.stop()
         self._autosave.stop()
+        self._sleeper.stop()
         self.bookmarks.flush()
         self.settings.save()
         self.extensions.save()

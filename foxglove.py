@@ -16557,7 +16557,9 @@ class BrowserWindow(QMainWindow):
             self.content.loading_bar.set_progress(value, tab.loading)
 
     def _on_load_finished(self, tab: Tab, ok: bool) -> None:
-        tab.loading, tab.progress, tab.typed = False, 100, False
+        tab.loading, tab.progress = False, 100
+        if ok:  # (a new document; a cache restore keeps the one typed into)
+            tab.typed = False
         if (proxy := tab.view.focusProxy()) is not None:  # (Memory Saver: notes typing; a new renderer may bring a new
             proxy.installEventFilter(tab)                  # proxy, and Qt keeps one filter per object)
         self._refresh_tab(tab)

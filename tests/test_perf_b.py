@@ -148,6 +148,11 @@ def test_back_forward_cache_restore_counts_as_loaded(fg, window, cacheable, even
     assert tab.page.url().toString() == b and run_js(tab.page, "window.persisted") is True
     assert events["nav"].count(("onCompleted", b)) == 1 and visits(window, b) == 2
     assert window.url_bar.text() == fg.display_url(QUrl(b)) and not tab.loading
+    # Memory Saver's "typed into" guard: a new document resets it, a restore keeps the document (and the draft)
+    tab.typed = True
+    assert finished(tab, window.act_back.trigger) == ("LoadFailedStatus", 0) and tab.typed is True
+    load_tab(tab, cacheable.url("/c"))
+    assert tab.typed is False
 
 
 def test_204_stop_and_failed_loads_are_not_counted_as_loaded(fg, window, cacheable, events):

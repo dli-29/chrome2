@@ -42,6 +42,7 @@ import errno
 import hashlib
 import hmac
 import html
+import importlib.util
 import io
 import itertools
 import json
@@ -117,6 +118,8 @@ TAB_MIN_WIDTH, TAB_MAX_WIDTH, TAB_HEIGHT = 80, 240, 40
 TAB_CLOSE_AREA = 32           # room for the close button on the right of each tab
 PINNED_TAB_WIDTH = 44         # a pinned tab: just its icon, like Chrome
 MAX_CLOSED_TABS = 25
+TAB_DISCARD_AFTER = 60 * 60   # Memory Saver: a background tab unused this long gives back its memory (s)...
+TAB_LIVE_LIMIT = 8            # ...once more background tabs than this are loaded (the least recently used first)
 ZOOM_LEVELS = (0.3, 0.5, 0.67, 0.8, 0.9, 1.0, 1.1, 1.2, 1.33, 1.5, 1.7, 2.0, 2.4, 3.0, 4.0, 5.0)
 
 SEARCH_ENGINES = {
@@ -164,6 +167,7 @@ SITE_PERMISSIONS = ((_PT.Geolocation, "Location"), (_PT.MediaVideoCapture, "Came
 PERMISSION_PARTS = {_PT.MediaAudioVideoCapture: (_PT.MediaAudioCapture, _PT.MediaVideoCapture),
                     _PT.DesktopAudioVideoCapture: (_PT.DesktopVideoCapture,)}  # requests for two at once
 ASK_ALWAYS = {_PT.DesktopVideoCapture, _PT.DesktopAudioVideoCapture}
+_CAPTURE = {_PT.MediaAudioCapture, _PT.MediaVideoCapture, _PT.MediaAudioVideoCapture, *ASK_ALWAYS}  # a call: never discarded
 
 
 # ══════════════════════════════════════════════════════════════════════════════════════════
@@ -558,10 +562,11 @@ def read_json(path: Path, default):
 def write_json(path: Path, data, keep_backup: bool = False) -> bool:
     """Atomically replace *path* (write to a temp file, then rename) so a crash never leaves half a file."""
     try:
+        text = json.dumps(data, ensure_ascii=False, indent=1)  # (dumps takes the C encoder; dump never does)
         path.parent.mkdir(parents=True, exist_ok=True)
         tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
         with open(tmp, "w", encoding="utf-8") as fh:
-            json.dump(data, fh, ensure_ascii=False, indent=1)
+            fh.write(text)
             fh.flush()
             os.fsync(fh.fileno())
         if keep_backup and path.exists():
@@ -2103,6 +2108,7 @@ class Settings(QObject):
         "ntp_hidden": [],                  # most visited pages removed from the page
         "ntp_theme": "",                   # "" (default) or a NTP_COLORS key
         "privacy_screen": True,            # grey out the windows while Chrome 2 isn't the active app
+        "memory_saver": True,              # discard background tabs left unused (BrowserWindow._sleep_tabs)
     }
 
     def __init__(self, path: Path):
@@ -2485,6 +2491,7 @@ class HistoryStore:
         try:
             self.db = sqlite3.connect(str(path))
             self.db.execute("PRAGMA journal_mode=WAL")
+            self.db.execute("PRAGMA synchronous=NORMAL")  # WAL: crash-safe without an fsync per visit
             self.db.execute(
                 "CREATE TABLE IF NOT EXISTS places (url TEXT PRIMARY KEY, title TEXT NOT NULL DEFAULT '', "
                 "visit_count INTEGER NOT NULL DEFAULT 0, last_visit REAL NOT NULL DEFAULT 0)")
@@ -2567,8 +2574,13 @@ class HistoryStore:
         return found
 
     def delete(self, urls: list[str]) -> None:
-        for url in urls:
-            self._run("DELETE FROM places WHERE url = ?", (url,))
+        if self.db is None or not urls:
+            return
+        try:
+            with self.db:  # one transaction (and one fsync), not one per address
+                self.db.executemany("DELETE FROM places WHERE url = ?", [(u,) for u in urls])
+        except sqlite3.Error as exc:
+            log(f"History error: {exc}")
 
     def clear(self) -> None:
         self._run("DELETE FROM places")
@@ -3072,6 +3084,7 @@ class ExtensionsController(QObject):
         super().__init__()
         self.profile = profile
         self.manager = profile.extensionManager() if HAS_EXTENSIONS else None
+        self._info_memo: tuple[list, dict] | None = None  # the extensions for this event-loop pass, see _infos
         self.registry_path = registry_path
         raw = read_json(registry_path, {})
         self.registry: dict[str, dict] = raw if isinstance(raw, dict) else {}
@@ -3111,6 +3124,17 @@ class ExtensionsController(QObject):
         self._reload_timer.setSingleShot(True)
         self._reload_timer.setInterval(1000)
         self._reload_timer.timeout.connect(self._reload_for_scripts)
+        # One 'changed' per event-loop pass for the extensions switched on or off together (every start-up): each
+        # one has the windows rebuild their toolbar buttons and rewire every tab.
+        self._changed_timer = QTimer(self)
+        self._changed_timer.setSingleShot(True)
+        self._changed_timer.setInterval(0)
+        self._changed_timer.timeout.connect(self.changed)
+        self._loaded_ids: list[str] = []  # just loaded by Qt: switched on (or off) together, in _apply_newly_loaded
+        self._apply_loaded = QTimer(self)
+        self._apply_loaded.setSingleShot(True)
+        self._apply_loaded.setInterval(0)
+        self._apply_loaded.timeout.connect(self._apply_newly_loaded)
         self.chromium = qWebEngineChromiumVersion() if HAS_EXTENSIONS else ""
         self._window = None
         self._nam = QNetworkAccessManager(self)
@@ -3163,7 +3187,7 @@ class ExtensionsController(QObject):
         self._guarding = guard
         if want != self.filtering:
             self.filtering = want
-            QTimer.singleShot(0, self.changed.emit)  # the windows give their tabs' filters the same state
+            self._changed_timer.start()  # the windows give their tabs' filters the same state
 
     @property
     def window(self):
@@ -3175,29 +3199,35 @@ class ExtensionsController(QObject):
 
     TAB_SCRIPT = "foxglove-tab-id"
 
-    def tab_script(self, tab_id: int) -> QWebEngineScript | None:
+    def tab_pairs(self) -> dict:
+        """Each installed extension's tab-query event name -> the answer's (the same for every tab: made once when
+        many tabs are wired)."""
+        pairs = {}
+        for info in self._infos():
+            cfg = self._shim_config_at(info.path())
+            q, a = cfg.get("tabQuery"), cfg.get("tabAnswer")
+            if isinstance(q, str) and isinstance(a, str) and re.fullmatch(r"__fg[0-9a-f]{20}", q) and re.fullmatch(r"__fg[0-9a-f]{20}", a):
+                pairs[q] = a
+        return pairs
+
+    def tab_script(self, tab_id: int, pairs: dict | None = None) -> QWebEngineScript | None:
         """Tells the polyfill (content scripts, extension pages) which tab it is in. DOM events reach every world of a
         page, so each extension asks and is answered under event names only it and Foxglove know."""
         if self.manager is None:
             return None
-        pairs = {}
-        for info in self._infos():
-            cfg = self.shim_config(info.id())
-            q, a = cfg.get("tabQuery"), cfg.get("tabAnswer")
-            if isinstance(q, str) and isinstance(a, str) and re.fullmatch(r"__fg[0-9a-f]{20}", q) and re.fullmatch(r"__fg[0-9a-f]{20}", a):
-                pairs[q] = a
+        pairs = self.tab_pairs() if pairs is None else pairs
         if not pairs:  # no extension to tell: nothing in the page
             return None
         script = QWebEngineScript()
         script.setName(self.TAB_SCRIPT)
-        script.setWorldId(APP_WORLD)
+        script.setWorldId(PAGE_WORLD)  # (the world autofill already has in every frame: no extra V8 context per frame)
         script.setInjectionPoint(QWebEngineScript.InjectionPoint.DocumentCreation)
         script.setRunsOnSubFrames(True)
         script.setSourceCode(f"for (const [q, a] of Object.entries({json.dumps(pairs)})) document.addEventListener(q, () => "
                              f"document.dispatchEvent(new CustomEvent(a, {{detail: '{int(tab_id)}'}})));")
         return script
 
-    def wire_tab(self, page: QWebEnginePage, tab_id: int) -> None:
+    def wire_tab(self, page: QWebEnginePage, tab_id: int, pairs: dict | None = None) -> None:
         """Put (or refresh) the tab-id script in a tab's page; it applies from the next page load on. The page also
         gets a request filter that knows its tab (declarativeNetRequest rules for some tabs only) - while filtering."""
         if self.manager is not None:
@@ -3206,7 +3236,7 @@ class ExtensionsController(QObject):
             if getattr(page, "net_filtering", False) != self.filtering:
                 page.net_filtering = self.filtering
                 page.setUrlRequestInterceptor(page.net_filter if self.filtering else None)
-        script, scripts = self.tab_script(tab_id), page.scripts()
+        script, scripts = self.tab_script(tab_id, pairs), page.scripts()
         old = scripts.find(self.TAB_SCRIPT)
         if script is not None and len(old) == 1 and old[0].sourceCode() == script.sourceCode():
             return
@@ -3250,12 +3280,24 @@ class ExtensionsController(QObject):
 
     # Queries
     def _infos(self) -> list:
+        """The installed extensions - listed once per event-loop pass: Qt adds and removes them only between passes
+        (through the signals below, which forget the list), and the infos themselves are live. Never changed by callers."""
         if self.manager is None or sip.isdeleted(self.manager):  # (a late timer after the profile went away)
             return []
-        return [i for i in self.manager.extensions() if i.isInstalled() and i.id() not in COMPONENT_EXTENSIONS]
+        if self._info_memo is None:
+            infos = [i for i in self.manager.extensions() if i.isInstalled() and i.id() not in COMPONENT_EXTENSIONS]
+            by_id: dict = {}
+            for i in infos:
+                by_id.setdefault(i.id(), i)  # the first one (an update lists an id twice for a moment, see _on_install_finished)
+            self._info_memo = (infos, by_id)
+            QTimer.singleShot(0, self._forget_infos)
+        return self._info_memo[0]
+
+    def _forget_infos(self) -> None:
+        self._info_memo = None
 
     def _info(self, ext_id: str):
-        return next((i for i in self._infos() if i.id() == ext_id), None) if ext_id else None
+        return self._info_memo[1].get(ext_id) if ext_id and self._infos() else None
 
     def _manifest(self, path: str) -> dict:
         try:
@@ -3275,9 +3317,9 @@ class ExtensionsController(QObject):
     def shim_config(self, ext_id: str) -> dict:
         """The polyfill configuration of an installed extension ({} if it runs without one)."""
         info = self._info(ext_id)
-        if info is None:
-            return {}
-        path = info.path()
+        return self._shim_config_at(info.path()) if info is not None else {}
+
+    def _shim_config_at(self, path: str) -> dict:
         try:
             mtime = (Path(path) / SHIM_FILE).stat().st_mtime
         except OSError:
@@ -3348,6 +3390,7 @@ class ExtensionsController(QObject):
 
     # Enable / disable / pin / remove
     def _on_load_finished(self, info) -> None:
+        self._forget_infos()
         job = self._loading.pop(os.path.realpath(info.path()), None) if info.path() else None
         if job is not None:
             self._finish_update(job, info)
@@ -3359,8 +3402,14 @@ class ExtensionsController(QObject):
             return
         if info.isInstalled():
             self._ensure_bridge()
-            ext_id = info.id()
-            QTimer.singleShot(0, lambda: self._apply_enabled(ext_id))
+            if info.id() not in self._loaded_ids:
+                self._loaded_ids.append(info.id())
+            self._apply_loaded.start()
+
+    def _apply_newly_loaded(self) -> None:
+        ids, self._loaded_ids = self._loaded_ids, []
+        for ext_id in ids:  # in one go: one 'changed' for all of them (each has every tab rewired)
+            self._apply_enabled(ext_id)
 
     def _load_without_registered(self, path: str) -> None:
         """An installed extension that doesn't load with the content scripts it registered (written into its manifest -
@@ -3421,17 +3470,21 @@ class ExtensionsController(QObject):
             self.sync_registered(ext_id)  # reloads it - unless it registers the same scripts again first, as most do at start
         if info.isEnabled() != want:
             self.manager.setExtensionEnabled(info, want)
+            self.net.invalidate()  # its request rules apply (or not) at once; the toolbar and tab scripts follow in a pass
             if want:
                 self.bridge.extension_enabled(ext_id)
                 self.reloaded.emit(ext_id)
             else:
                 self.bridge.extension_disabled(ext_id)
-        self.changed.emit()
+        self._changed_timer.start()
 
     def set_enabled(self, ext_id: str, enabled: bool) -> None:
         self.registry.setdefault(ext_id, {})["enabled"] = bool(enabled)
         self.save()
         self._apply_enabled(ext_id)
+        if self._changed_timer.isActive():  # the user's own switch: the toolbar and the extensions dialog follow at once
+            self._changed_timer.stop()
+            self.changed.emit()
 
     def set_pinned(self, ext_id: str, pinned: bool) -> None:
         self.registry.setdefault(ext_id, {})["pinned"] = bool(pinned)
@@ -3462,6 +3515,7 @@ class ExtensionsController(QObject):
         self.manager.uninstallExtension(info)
 
     def _on_uninstall_finished(self, info) -> None:
+        self._forget_infos()
         if info.path() in self._rejected:
             self._rejected.discard(info.path())
             return
@@ -3916,6 +3970,7 @@ class ExtensionsController(QObject):
         self.manager.unloadExtension(info)  # continues in _on_unload_finished
 
     def _on_unload_finished(self, info) -> None:
+        self._forget_infos()
         restore = self._restore_after_reject.pop(info.id(), None)
         if restore is not None:  # a refused copy that took an installed extension's ID (Qt unloads by ID): load that again
             self._rejected.discard(restore[0])
@@ -4108,6 +4163,7 @@ class ExtensionsController(QObject):
         self.manager.installExtension(job["dir"])
 
     def _on_install_finished(self, info) -> None:
+        self._forget_infos()
         # Success reports the installed copy ("<staging name>_XXXXXX"), failure reports the source folder.
         name = Path(info.path()).name if info.path() else ""
         job_key = next((k for k in self._jobs if name == k or name.startswith(k + "_")), None)
@@ -4157,7 +4213,8 @@ class ExtensionsController(QObject):
         self.changed.emit()
 
 
-APP_WORLD = QWebEngineScript.ScriptWorldId.ApplicationWorld.value  # Foxglove's own isolated world in web pages
+PAGE_WORLD = 3                       # Foxglove's one isolated world in web pages (autofill, Claude's helpers, extension
+                                     # tab ids): every extra world costs a V8 context in every frame of every page
 FIRST_EXTENSION_WORLD = 16           # chrome.scripting: a world per extension from here on (never Foxglove's)
 HOST_SCHEMES = ("http", "https", "ws", "wss", "ftp")  # what host permissions reach (file: only if the user allows it)
 MAIN_WINDOW_ID = 1
@@ -4605,7 +4662,7 @@ class ExtensionBridge(QWebEngineUrlSchemeHandler):
             return []
         out = []
         for tab in self.tabs():
-            if tab.pending is not None or sip.isdeleted(tab.page):
+            if sip.isdeleted(tab.page) or unloaded(tab):
                 continue
             urls, frames = {tab.url().toString()}, [tab.page.mainFrame()]
             while frames and len(urls) < 200:
@@ -4617,15 +4674,20 @@ class ExtensionBridge(QWebEngineUrlSchemeHandler):
                 out.append(tab)
         return out
 
-    def relay(self, page: QWebEnginePage, ext_id: str, payload: dict, done=None) -> bool:
-        """Hand something to the extension's content scripts in *page* (a DOM event only they know the name of)."""
+    def relay(self, page: QWebEnginePage, ext_id: str, payload: dict, done=None, script: str | None = None) -> bool:
+        """Hand something to the extension's content scripts in *page* (a DOM event only they know the name of) - or
+        *script*, the event made with _relay_script once for many pages."""
         name = self.c.shim_config(ext_id).get("relay")
         if not name or sip.isdeleted(page):
             return False
-        page.runJavaScript(f"!document.dispatchEvent(new CustomEvent({json.dumps(name)}, "
-                           f"{{detail: {json.dumps(json.dumps(payload, default=str))}, cancelable: true}}))",
-                           APP_WORLD, done or (lambda _result: None))
+        # (the payload stays a JSON string literal: PAGE_WORLD also holds autofill's API)
+        page.runJavaScript(self._relay_script(name, payload) if script is None else script, PAGE_WORLD, done or (lambda _result: None))
         return True
+
+    @staticmethod
+    def _relay_script(name: str, payload: dict) -> str:
+        return (f"!document.dispatchEvent(new CustomEvent({json.dumps(name)}, "
+                f"{{detail: {json.dumps(json.dumps(payload, default=str))}, cancelable: true}}))")
 
     # ── extension life cycle (called by ExtensionsController) ───────────────────────────
     def installed(self, ext_id: str, details: dict) -> None:
@@ -4676,10 +4738,9 @@ class ExtensionBridge(QWebEngineUrlSchemeHandler):
         if page is not None:
             page.deleteLater()
         self._page_listeners.pop(ext_id, None)
-        for call_id, (owner, reply, timer) in list(self._replies.items()):
+        for call_id, (owner, reply, _timer) in list(self._replies.items()):
             if owner == ext_id:
-                self._replies.pop(call_id)
-                timer.stop()
+                self._drop_reply(call_id)
                 reply(error=self.NO_RECEIVER)
         win = self.c.window
         if win is not None:
@@ -4770,14 +4831,14 @@ class ExtensionBridge(QWebEngineUrlSchemeHandler):
     def tab_info(self, ext_id: str, tab) -> dict:
         win = self.c.window
         popup = isinstance(tab, PopupWindow)
-        page, url = tab.page, tab.url().toString()
+        page, url, asleep = tab.page, tab.url().toString(), unloaded(tab)
         active = popup or (win is not None and tab is win.current_tab())
         info = {"id": tab.tab_id, "index": 0 if popup or win is None else win.index_of(tab), "windowId": tab.window_id,
                 "active": active, "highlighted": active, "selected": active, "pinned": bool(getattr(tab, "pinned", False)),
                 "incognito": False,
                 "audible": page.recentlyAudible(), "mutedInfo": {"muted": page.isAudioMuted()},
-                "discarded": tab.pending is not None, "autoDiscardable": True, "frozen": False, "groupId": -1,
-                "status": "unloaded" if tab.pending is not None else "loading" if tab.loading else "complete",
+                "discarded": asleep, "autoDiscardable": True, "frozen": False, "groupId": -1,
+                "status": "unloaded" if asleep else "loading" if tab.loading else "complete",
                 "width": tab.width(), "height": tab.height()}
         opener = getattr(tab, "opener", None)
         if opener is not None:
@@ -4813,7 +4874,7 @@ class ExtensionBridge(QWebEngineUrlSchemeHandler):
 
     def _script_tab(self, ext_id: str, target) -> "Tab":
         tab = self._tab((target or {}).get("tabId") if isinstance(target, dict) else None)
-        if tab.pending is not None:
+        if unloaded(tab):
             raise ApiError("Cannot access contents of a tab that hasn't been loaded yet.")
         if not self.can_access(ext_id, tab.url().toString(), tab.tab_id):
             raise ApiError(self.NO_HOST)
@@ -4874,9 +4935,12 @@ class ExtensionBridge(QWebEngineUrlSchemeHandler):
 
     def _deliver_storage(self, ext_id: str, area: str, changes: dict, src, eid: str | None, ctx: dict, fallback: bool = False) -> None:
         if area != "session" and (ctx["cs"] or self.c.shim_config(ext_id).get("cs")):
-            payload = {"event": "storage.changed", "args": [area, changes, src], "eid": eid}
-            for tab in self.script_tabs(ext_id):
-                self.relay(tab.page, ext_id, payload)
+            tabs = self.script_tabs(ext_id)
+            name = self.c.shim_config(ext_id).get("relay") if tabs else None
+            if name:  # encoded once for all the tabs: a big value (a vault, a cache) costs milliseconds each time
+                script = self._relay_script(name, {"event": "storage.changed", "args": [area, changes, src], "eid": eid})
+                for tab in tabs:
+                    self.relay(tab.page, ext_id, {}, script=script)
         worker = (self.c.registry.get(ext_id) or {}).get("listeners") or []
         if fallback:  # the writer told no one: the worker (woken) and the open pages (the bridge page's channel) hear it here
             self.emit(ext_id, "storage.changed", [area, changes, src], eid=eid)
@@ -5208,8 +5272,13 @@ class ExtensionBridge(QWebEngineUrlSchemeHandler):
 
     # ── chrome.tabs ─────────────────────────────────────────────────────────────────────
     def api_tabs_query(self, ext_id: str, q: dict, ctx: dict):
+        tabs = self.tabs()
+        if q.get("active") is True or q.get("highlighted") is True:  # the usual query: only these can be (see tab_info)
+            win = self.c.window
+            current = win.current_tab() if win is not None else None
+            tabs = [t for t in tabs if isinstance(t, PopupWindow) or t is current]
         out = []
-        for tab in self.tabs():
+        for tab in tabs:
             info = self.tab_info(ext_id, tab)
             if self._matches_query(q, tab, info):
                 out.append(info)
@@ -5348,7 +5417,7 @@ class ExtensionBridge(QWebEngineUrlSchemeHandler):
             tab = self._tab(a.get("tabId"))
         except ApiError:
             raise ApiError(self.NO_RECEIVER) from None
-        if tab.pending is not None:
+        if unloaded(tab):  # (no content scripts in it, as in Chrome)
             raise ApiError(self.NO_RECEIVER)
         call_id = secrets.token_hex(8)
         payload = {"msg": a.get("msg"), "callId": call_id, "frameId": a.get("frameId"),
@@ -5357,23 +5426,29 @@ class ExtensionBridge(QWebEngineUrlSchemeHandler):
         def later(reply) -> None:
             timer = QTimer(self)
             timer.setSingleShot(True)
-            timer.timeout.connect(lambda: self._replies.pop(call_id, None) and reply(error="The message port closed before a response was received."))
+            timer.timeout.connect(lambda: self._drop_reply(call_id) and reply(error="The message port closed before a response was received."))
             timer.start(300_000)
             self._replies[call_id] = (ext_id, reply, timer)  # before delivering: the answer can beat the callback
 
             def delivered(ok) -> None:
-                if ok is not True and self._replies.pop(call_id, None):
-                    timer.stop()
+                if ok is not True and self._drop_reply(call_id):
                     reply(error=self.NO_RECEIVER)
             if not self.relay(tab.page, ext_id, payload, delivered):
                 delivered(False)
         return later
 
+    def _drop_reply(self, call_id: str):
+        """A tabs.sendMessage call is settled: its entry (returned, if it was still waiting) and its timer go."""
+        entry = self._replies.pop(call_id, None)
+        if entry is not None:
+            entry[2].stop()
+            entry[2].deleteLater()
+        return entry
+
     def api_tabs_reply(self, ext_id: str, a: dict, ctx: dict):
         entry = self._replies.get(str(a.get("callId")))
         if entry is not None and entry[0] == ext_id:
-            self._replies.pop(str(a.get("callId")))
-            entry[2].stop()
+            self._drop_reply(str(a.get("callId")))
             entry[1](a.get("value"))
         return None
 
@@ -5825,6 +5900,7 @@ class ExtensionBridge(QWebEngineUrlSchemeHandler):
             self._cookie_waiters.setdefault(key, []).append(waiter)
 
             def gave_up() -> None:
+                timer.deleteLater()
                 if waiter in self._cookie_waiters.get(key, []):
                     self._cookie_waiters[key].remove(waiter)
                     reply(error=f"Failed to parse or set cookie named \"{key[0]}\".")
@@ -5848,6 +5924,7 @@ class ExtensionBridge(QWebEngineUrlSchemeHandler):
         self._cookie_event(cookie, False, "explicit")
         for reply, timer in self._cookie_waiters.pop(key, []):
             timer.stop()
+            timer.deleteLater()
             reply(self._cookie_info(cookie))
 
     def _cookie_removed(self, cookie) -> None:
@@ -6116,6 +6193,26 @@ DNR_REGEX_URL_LIMIT = 2048  # ... for regexFilter rules when only Python's (back
 DNR_REGEX_MAX = 2000    # a longer regexFilter wouldn't fit Chrome's 2 KB RE2 program either
 _URL_SEPARATOR = r"(?:[^A-Za-z0-9_\-.%]|\Z)"  # urlFilter's "^": a separator character, or the end of the URL
 _URL_AUTHORITY = re.compile(r"[a-z][a-z0-9+.-]*://(?:[^/?#@]*@)?", re.I)  # where "||" looks for the host
+_LITERAL = re.compile(r"[^*^|]+")  # a urlFilter's runs of plain characters
+_FILTER_DOMAIN = re.compile(r"\|\|([a-z0-9-]+(?:\.[a-z0-9-]+)+)(?:[\^/:]|\|$)")  # "||domain^"
+_WORD = re.compile(r"[a-z0-9]+")
+_NO_NAMES: frozenset = frozenset()  # shared by every rule without an excluded* list
+_TYPE_SETS: dict = {}  # resource-type sets: a few dozen distinct ones, shared by all rules
+_ALL_BUT_MAIN = DNR_TYPES - {"main_frame"}
+_FRAMES = frozenset(("main_frame", "sub_frame"))
+
+
+def _names(value) -> frozenset | None:
+    """A rule's list of domains, types or methods, lower-cased (None: not a list)."""
+    return frozenset([v.lower() for v in value if isinstance(v, str)]) if isinstance(value, list) else None
+
+
+def _literal(text: str, case: bool) -> str:
+    """The longest run of plain characters a urlFilter needs in the URL ("" if none): a URL without it can't match."""
+    body = text[2:] if text.startswith("||") else text.lstrip("|")
+    best = max((part for part in _LITERAL.findall(body.rstrip("|")) if part.isascii()), key=len, default="")
+    return best if case else best.lower()  # (non-ASCII skipped: re.I folds more than str.lower - URLs are ASCII anyway)
+
 
 try:  # linear-time regular expressions, as Chrome's (pip install google-re2)
     import re2 as _re2
@@ -6129,9 +6226,10 @@ class UrlFilter:
     The pattern's pieces between "*"s are looked for one after another, each as far to the left as it goes: with "*" as
     the only wildcard that finds a match whenever there is one - and unlike a regular expression with a ".*" per "*",
     no URL a web page makes up can keep the browser busy for long."""
-    __slots__ = ("domain", "start", "end", "pieces", "last")
+    __slots__ = ("domain", "start", "end", "pieces", "last", "need")
 
     def __init__(self, text: str, case: bool = False):
+        self.need = _literal(text, case)  # a quick "not in the URL" before any regular expression runs
         self.domain = text.startswith("||")
         self.start = not self.domain and text.startswith("|")
         text = text[2:] if self.domain else text[1:] if self.start else text
@@ -6191,13 +6289,13 @@ def _filter_keys(text: str) -> list[str]:
     """Where a urlFilter rule is filed: the domain of "||domain^", else its longest whole word (one a URL splits out
     as it is - not cut by a "*" or an open end)."""
     low = text.lower()
-    m = re.match(r"\|\|([a-z0-9-]+(?:\.[a-z0-9-]+)+)(?:[\^/:]|\|$)", low)
+    m = _FILTER_DOMAIN.match(low)
     if m:
         return ["d:" + m.group(1)]
     start, end = low.startswith("|"), low.endswith("|")
     pieces, best = low.lstrip("|")[:-1 if end else None].split("*"), ""
     for i, piece in enumerate(pieces):
-        for w in re.finditer(r"[a-z0-9]+", piece):
+        for w in _WORD.finditer(piece):
             whole = (w.start() > 0 or (i == 0 and start)) and (w.end() < len(piece) or (i == len(pieces) - 1 and end))
             if whole and len(w.group()) > len(best) and w.group() not in _COMMON_WORDS:
                 best = w.group()
@@ -6221,27 +6319,29 @@ class NetRule:
             raise ValueError("unknown action")
         if self.kind == "modifyHeaders" and not action.get("requestHeaders"):
             raise ValueError("response headers only")  # Qt can't change those
-        self.id, self.ruleset, self.action = raw["id"], ruleset, action
+        get, kind = cond.get, self.kind
+        self.id, self.ruleset = raw["id"], ruleset
+        self.action = action if kind in ("redirect", "modifyHeaders") else None  # (what the others do is their type)
         self.priority = raw.get("priority") if isinstance(raw.get("priority"), int) else 1
-        self.rank = DNR_ACTIONS.index(self.kind) if self.kind in DNR_ACTIONS else len(DNR_ACTIONS)
-        value = lambda key, alias=None: cond.get(key, cond.get(alias) if alias else None)  # "domains": the old name
-        words = lambda key, alias=None: frozenset(s.lower() for s in _strings(value(key, alias)))
-        listed = lambda key, alias=None: words(key, alias) if isinstance(value(key, alias), list) else None
-        self.text = cond.get("regexFilter") if isinstance(cond.get("regexFilter"), str) else cond.get("urlFilter")
-        self.text = self.text if isinstance(self.text, str) and self.text else ""
-        self.is_regex, self.regex = isinstance(cond.get("regexFilter"), str), None
-        self.case = cond.get("isUrlFilterCaseSensitive") is True
-        types, excluded = listed("resourceTypes"), listed("excludedResourceTypes")
-        self.types = types if types else DNR_TYPES - (excluded if excluded is not None else {"main_frame"})
-        if self.kind == "allowAllRequests":
-            self.types &= {"main_frame", "sub_frame"}
-        self.domains, self.not_domains = listed("requestDomains"), words("excludedRequestDomains")
-        self.initiators = listed("initiatorDomains", "domains")
-        self.not_initiators = words("excludedInitiatorDomains", "excludedDomains")
-        self.methods, self.not_methods = listed("requestMethods"), words("excludedRequestMethods")
-        self.party = cond.get("domainType") if cond.get("domainType") in ("firstParty", "thirdParty") else None
-        ids = lambda key: frozenset(v for v in cond.get(key) if isinstance(v, int)) if isinstance(cond.get(key), list) else None
-        self.tabs, self.not_tabs = ids("tabIds"), ids("excludedTabIds") or frozenset()
+        self.rank = DNR_ACTIONS.index(kind) if kind in DNR_ACTIONS else len(DNR_ACTIONS)
+        regex = get("regexFilter")
+        self.is_regex, self.regex = isinstance(regex, str), None
+        text = regex if self.is_regex else get("urlFilter")
+        self.text = text if isinstance(text, str) and text else ""
+        self.case = get("isUrlFilterCaseSensitive") is True
+        types = _names(get("resourceTypes"))
+        if not types:
+            excluded = _names(get("excludedResourceTypes"))
+            types = DNR_TYPES - excluded if excluded is not None else _ALL_BUT_MAIN
+        types &= _FRAMES if kind == "allowAllRequests" else DNR_TYPES  # (real types only: the shared sets stay few)
+        self.types = _TYPE_SETS.setdefault(types, types)
+        self.domains, self.not_domains = _names(get("requestDomains")), _names(get("excludedRequestDomains")) or _NO_NAMES
+        self.initiators = _names(get("initiatorDomains", get("domains")))  # "domains": the old name
+        self.not_initiators = _names(get("excludedInitiatorDomains", get("excludedDomains"))) or _NO_NAMES
+        self.methods, self.not_methods = _names(get("requestMethods")), _names(get("excludedRequestMethods")) or _NO_NAMES
+        self.party = get("domainType") if get("domainType") in ("firstParty", "thirdParty") else None
+        ids = lambda key: frozenset(v for v in get(key) if isinstance(v, int)) if isinstance(get(key), list) else None
+        self.tabs, self.not_tabs = ids("tabIds"), ids("excludedTabIds") or _NO_NAMES
         self.keys = (["d:" + d for d in self.domains] if self.domains else
                      (_filter_keys(self.text) if self.text and not self.is_regex else []) or
                      (["i:" + d for d in self.initiators] if self.initiators else []))
@@ -6265,7 +6365,11 @@ class NetRule:
                 except re.error:
                     self.text, self.types = "", frozenset()  # Chrome refuses such a rule when it loads
                     return False
-            if not (self.regex.search(req.regex_head) if self.is_regex else self.regex.search(req.head, req.cut)):
+            if self.is_regex:
+                if not self.regex.search(req.regex_head):
+                    return False
+            elif ((self.regex.need and self.regex.need not in (req.head if self.case else req.low))
+                  or not self.regex.search(req.head, req.cut)):
                 return False
         if self.tabs is None and not self.not_tabs:
             return True
@@ -6279,7 +6383,8 @@ class RuleIndex:
 
     def __init__(self, raw_rules, ruleset: str):
         self.keyed: dict[str, list[NetRule]] = {}
-        self.generic: list[NetRule] = []
+        self.by_initiator: dict[str, dict[str, list[NetRule]]] = {}  # key -> initiator -> its rules for that site only
+        self.generic: list[tuple[str, NetRule]] = []  # (what the URL must contain, rule)
         self.tabbed = self.allow_all = False
         for raw in raw_rules if isinstance(raw_rules, list) else []:
             try:
@@ -6289,14 +6394,27 @@ class RuleIndex:
             self.tabbed = self.tabbed or rule.tabs is not None or bool(rule.not_tabs)
             self.allow_all = self.allow_all or rule.kind == "allowAllRequests"
             for key in rule.keys:
-                self.keyed.setdefault(key, []).append(rule)
+                if rule.initiators is not None and not key.startswith("i:"):
+                    sub = self.by_initiator.setdefault(key, {})
+                    for site in rule.initiators:
+                        sub.setdefault(site, []).append(rule)
+                else:
+                    self.keyed.setdefault(key, []).append(rule)
             if not rule.keys:
-                self.generic.append(rule)
+                self.generic.append(("" if rule.is_regex else _literal(rule.text, rule.case), rule))
 
-    def candidates(self, keys: list[str]):
-        yield from self.generic
+    def candidates(self, req: "NetRequest", keys: list[str]):
+        """The rules that might match *req* (*keys*: those of its keys some rule is filed under)."""
+        for need, rule in self.generic:
+            if not need or need in (req.head if rule.case else req.low):
+                yield rule
+        keyed, by_initiator = self.keyed.get, self.by_initiator.get
         for key in keys:
-            yield from self.keyed.get(key, ())
+            yield from keyed(key, ())
+            sub = by_initiator(key)
+            if sub:
+                for site in req.initiators:
+                    yield from sub.get(site, ())
 
 
 @dataclass
@@ -6312,9 +6430,11 @@ class NetRequest:
     head: str = dc_field(init=False, default="")         # what urlFilters look at (DNR_URL_LIMIT)...
     cut: bool = dc_field(init=False, default=False)      # ... and whether that's only the start of the URL
     regex_head: str = dc_field(init=False, default="")   # what regexFilters look at
+    low: str = dc_field(init=False, default="")          # head, lower-cased
 
     def __post_init__(self) -> None:
         self.head, self.cut = self.url[:DNR_URL_LIMIT], len(self.url) > DNR_URL_LIMIT
+        self.low = self.head.lower()
         self.regex_head = self.url if _re2 is not None else self.url[:DNR_REGEX_URL_LIMIT]
 
 
@@ -6324,6 +6444,12 @@ class NetExtension:
     indexes: list
     hosts: list[str]         # host permissions: redirects and header changes need them
     needs_hosts: bool        # declarativeNetRequestWithHostAccess only: every action needs them
+    present: frozenset = dc_field(init=False, default=frozenset())  # every key its indexes file rules under
+    allow_all: bool = dc_field(init=False, default=False)
+
+    def __post_init__(self) -> None:
+        self.present = frozenset().union(*(i.keyed.keys() | i.by_initiator.keys() for i in self.indexes))
+        self.allow_all = any(i.allow_all for i in self.indexes)
 
     def may(self, url: str) -> bool:
         return any(match_pattern(h, url) for h in self.hosts)
@@ -6420,7 +6546,7 @@ class NetRules:
             for ruleset in self.enabled_rulesets(ext_id, manifest):
                 if isinstance(paths.get(ruleset), str):
                     indexes.append(self._ruleset(root, paths[ruleset], str(ruleset)))
-            indexes = [i for i in indexes if i is not None and (i.keyed or i.generic)]
+            indexes = [i for i in indexes if i is not None and (i.keyed or i.by_initiator or i.generic)]
             if indexes:
                 exts.append(NetExtension(ext_id, indexes, bridge._hosts(ext_id), not dnr))
         self._exts = exts
@@ -6433,7 +6559,7 @@ class NetRules:
         party = source or first_party.host().lower()
         third = kind != "main_frame" and bool(party) and _site(host) != _site(party)
         req = NetRequest(text, kind, method, _suffixes(host), _suffixes(source), third, tab)
-        req.keys = (["d:" + h for h in req.hosts] + ["t:" + w for w in set(re.findall(r"[a-z0-9]+", req.head.lower()))]
+        req.keys = (["d:" + h for h in req.hosts] + ["t:" + w for w in set(_WORD.findall(req.low))]
                     + ["i:" + h for h in req.initiators])
         return req
 
@@ -6444,24 +6570,26 @@ class NetRules:
             if len(self._documents) > 500:
                 self._documents.clear()
             req = self._request(page, "main_frame", "get", QUrl(), page, -1)
-            hits = [r.priority for i in ext.indexes if i.allow_all for r in i.candidates(req.keys)
+            hits = [r.priority for i in ext.indexes if i.allow_all for r in i.candidates(req, req.keys)
                     if r.kind == "allowAllRequests" and r.matches(req)]
             self._documents[key] = max(hits) if hits else None
         return self._documents[key]
 
     def decide(self, ext: NetExtension, req: NetRequest, page: QUrl):
         """(winning rule or None, header rules to apply) - or None if it depends on the tab."""
-        best, headers = None, []
+        best, found = None, {}
+        keys = [k for k in req.keys if k in ext.present]  # (in order: the tie-breaks stay the same)
         for index in ext.indexes:
-            for rule in index.candidates(req.keys):
+            for rule in index.candidates(req, keys):
                 hit = rule.matches(req)
                 if hit is None:
                     return None
                 if hit and rule.kind == "modifyHeaders":
-                    headers.append(rule)
+                    found[id(rule)] = rule  # (a rule filed under two of the request's keys counts once)
                 elif hit and (best is None or (rule.priority, -rule.rank) > (best.priority, -best.rank)):
                     best = rule
-        if req.type not in ("main_frame", "sub_frame") and page.isValid() and any(i.allow_all for i in ext.indexes):
+        headers = list(found.values())
+        if req.type not in ("main_frame", "sub_frame") and page.isValid() and ext.allow_all:
             allowed = self._frame_allowed(ext, page)
             if allowed is not None and (best is None or best.priority <= allowed):  # the page is allowed: so is this
                 return None, [h for h in headers if h.priority > allowed]
@@ -7497,12 +7625,18 @@ class Tab(QWidget):
         self.typed_text = ""                  # what was typed, in case the guessed address doesn't exist
         self.back_after_error = ""            # URL whose certificate error page we should step back from
         self.last_recorded = ""
+        self.title_writes = 0                 # history title updates for this document (capped, as Chrome)
         self.webstore_bar: InfoBar | None = None
         self.crash_bar: InfoBar | None = None
         self.permission_bars: list[InfoBar] = []
         self.pinned = False                   # pinned tabs sit left of the others, icon only
         self.split: SplitView | None = None   # shown side by side with another tab (split view)
         self.uid = uuid.uuid4().hex           # survives restarts (session), unlike tab_id
+        # Memory Saver (BrowserWindow._sleep_tabs): a tab opened in the background never says it's hidden, so it is now
+        self.hidden_since: float | None = time.monotonic()  # out of sight since (None: shown)
+        self.keep_awake = ""                  # origin given camera/mic/screen here: a call, never discarded
+        self.typed = False                    # typed into since its page loaded: drafts may live only in its scripts
+        self.page.visibleChanged.connect(self._visible_changed)
 
     # State
     @property
@@ -7539,6 +7673,14 @@ class Tab(QWidget):
         if self.page.isAudioMuted():
             return "muted"
         return "playing" if self.page.recentlyAudible() else ""
+
+    def _visible_changed(self, visible: bool) -> None:
+        self.hidden_since = None if visible else time.monotonic()
+
+    def eventFilter(self, watched, event) -> bool:  # (on the page's focus proxy: BrowserWindow._on_load_finished)
+        if event.type() == QEvent.Type.InputMethod or (event.type() == QEvent.Type.KeyPress and event.text()):
+            self.typed = True
+        return False
 
     # Loading
     def load(self, url: QUrl) -> None:
@@ -7625,6 +7767,12 @@ class Tab(QWidget):
         if self.devtools is not None:
             self.devtools.page().blockSignals(True)
             self.page.setDevToolsPage(None)
+
+
+def unloaded(tab) -> bool:
+    """No document runs in the tab (or pop-up): restored and not opened yet, or Memory Saver discarded it. Showing,
+    loading or reloading it brings it back (with its back/forward list)."""
+    return tab.pending is not None or tab.page.lifecycleState() == QWebEnginePage.LifecycleState.Discarded
 
 
 # ══════════════════════════════════════════════════════════════════════════════════════════
@@ -9563,7 +9711,11 @@ class HistoryDialog(QDialog):
         top = QHBoxLayout()
         self.search = QLineEdit()
         self.search.setPlaceholderText("Search history")
-        self.search.textChanged.connect(lambda *_: self.reload())
+        self._search_timer = QTimer(self)  # one query per pause in typing, not one per keystroke
+        self._search_timer.setSingleShot(True)
+        self._search_timer.setInterval(200)
+        self._search_timer.timeout.connect(self.reload)
+        self.search.textChanged.connect(lambda *_: self._search_timer.start())
         top.addWidget(self.search, 1)
         delete = make_button("Delete")
         delete.clicked.connect(lambda *_: self._delete())
@@ -9584,6 +9736,7 @@ class HistoryDialog(QDialog):
         self.reload()
 
     def reload(self) -> None:
+        self._search_timer.stop()  # (a pending search would only fill the same list again)
         self.tree.clear()
         for url, title, last, _count in self.win.history.recent(self.search.text().strip(), 3000):
             stamp = time.strftime("%Y-%m-%d %H:%M", time.localtime(last))
@@ -10061,6 +10214,15 @@ class SettingsDialog(QDialog):
         bookmarks_bar.toggled.connect(lambda on: win.set_bookmarks_bar_visible(on))
         layout.addWidget(bookmarks_bar)
 
+        section("Performance")
+        self.memory_saver = QCheckBox("Memory Saver: tabs you haven't used for an hour give back their memory")
+        self.memory_saver.setToolTip(f"Only when more than {TAB_LIVE_LIMIT} background tabs are open. A tab reloads when "
+                                     "you go back to it. Pinned tabs, tabs playing sound, calls, tabs you typed in and "
+                                     "sites allowed to send notifications always stay active")
+        self.memory_saver.setChecked(settings.get("memory_saver"))
+        self.memory_saver.toggled.connect(lambda on: settings.set("memory_saver", on))
+        layout.addWidget(self.memory_saver)
+
         section("Downloads")
         folder_row = QHBoxLayout()
         folder_row.addWidget(QLabel("Save files to"))
@@ -10427,13 +10589,18 @@ class VpnPanel(Panel):
 # ══════════════════════════════════════════════════════════════════════════════════════════
 # Chrome's password manager and form autofill. Passwords and card numbers live only in the system keychain
 # (SecretStore); sites, usernames, addresses and the last digits of cards in autofill.json (your user only). In web
-# pages a script in an isolated world of its own (AUTOFILL_WORLD) finds login, address and payment forms: page scripts
-# can't see it, call it or read what it holds. When it has news it logs a console message that carries no data (a
+# pages a script in an isolated world (AUTOFILL_WORLD) finds login, address and payment forms: page scripts can't see
+# it, call it or read what it holds. When it has news it logs a console message that carries no data (a
 # "poke", which pages can't read); the browser then collects the news from that frame's isolated world. Saved data goes
 # into a page only when you pick it from the browser's own suggestion list - and only into the frame it was offered for.
-AUTOFILL_WORLD = 3                     # (APP_WORLD 1: other internal scripts; 4: the AI agent; 16+: extensions)
+AUTOFILL_WORLD = PAGE_WORLD            # (shared with Claude's helpers and the extension tab-id script; 16+: extensions)
 KEYCHAIN_SERVICE = "Chrome 2"          # the keychain items' service: fixed, so renaming the app never orphans them
 AUTOFILL_SCRIPT = "chrome2-autofill"
+# Only web and file pages get the script (Qt honours these Greasemonkey headers): an about:blank, srcdoc, data: or
+# internal frame it would return from at once would still run it. @run-at keeps DocumentCreation. (Claude's watch,
+# AGENT_WATCH_JS, is a script of its own in the same world: it must be in every document.)
+AUTOFILL_MATCH = ("// ==UserScript==\n// @match http://*/*\n// @match https://*/*\n// @match file:///*\n"
+                  "// @run-at document-start\n// ==/UserScript==\n")
 AUTOFILL_POKE = "⁣chrome2-autofill:"  # + a per-run token + the frame's address
 
 ICONS.update({
@@ -10537,12 +10704,13 @@ def secret_store() -> SecretStore:
 def write_private_json(path: Path, data) -> bool:
     """write_json for a file only your user may read (0600 from the moment it exists)."""
     try:
+        text = json.dumps(data, ensure_ascii=False, indent=1)  # (as write_json)
         path.parent.mkdir(parents=True, exist_ok=True)
         tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
         with os.fdopen(os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "w", encoding="utf-8") as fh:
             if os.name == "posix":
                 os.fchmod(fh.fileno(), 0o600)  # (a temp file left from before kept its mode)
-            json.dump(data, fh, ensure_ascii=False, indent=1)
+            fh.write(text)
             fh.flush()
             os.fsync(fh.fileno())
         os.replace(tmp, path)
@@ -10873,9 +11041,9 @@ class AutofillData(QObject):
         self.store.delete(f"card:{entry_id}")
 
 
-# The page side. It runs in every frame of every web page, in AUTOFILL_WORLD; nothing it holds is reachable from the
-# page's own scripts. Forms are grouped like Chrome does (a <form>, else every form-less field of the document); fields
-# are typed by their autocomplete attribute first, then by name/id/placeholder/label.
+# The page side. It runs in every http(s) frame of every web page, in AUTOFILL_WORLD; nothing it holds is reachable
+# from the page's own scripts. Forms are grouped like Chrome does (a <form>, else every form-less field of the
+# document); fields are typed by their autocomplete attribute first, then by name/id/placeholder/label.
 AUTOFILL_JS = r"""(() => {
   if (!/^https?:$/.test(location.protocol) || typeof __fgAutofill !== "undefined") return;
   const POKE = __POKE__;
@@ -11289,8 +11457,9 @@ class Autofill(QObject):
         script.setWorldId(AUTOFILL_WORLD)
         script.setInjectionPoint(QWebEngineScript.InjectionPoint.DocumentCreation)
         script.setRunsOnSubFrames(True)
-        script.setSourceCode(AUTOFILL_JS.replace("__POKE__", json.dumps(self.poke)))
+        script.setSourceCode(AUTOFILL_MATCH + AUTOFILL_JS.replace("__POKE__", json.dumps(self.poke)))
         scripts.insert(script)
+        install_agent_watch(profile)  # (same world: no context of its own; every document, header or not)
 
     @classmethod
     def of(cls, profile: QWebEngineProfile | None) -> "Autofill | None":
@@ -12736,7 +12905,8 @@ class BookmarksBar(QWidget):
 from PyQt6.QtGui import QImage, QInputMethodEvent, QKeyEvent  # (only the agent needs these)
 from PyQt6.QtWidgets import QPlainTextEdit, QSpinBox
 
-AGENT_WORLD = 4                     # Claude's isolated world in web pages: its element labels are out of the page's reach
+AGENT_WORLD = PAGE_WORLD            # Claude's helpers, in autofill's isolated world: still out of the page's reach. Never
+                                    # run model-written or page-derived JS here: __fgAutofill.fill/drain live in it
 AGENT_SECRET_KEY = "anthropic_api_key"  # its item in the app's SecretStore (the keychain, KEYCHAIN_SERVICE)
 AGENT_KEY_FILE = "anthropic-api-key"  # (in the profile folder, 0600) when there is no system keychain
 AGENT_MAX_TOKENS = 64000
@@ -12922,6 +13092,16 @@ def agent_sdk():
     return anthropic
 
 
+def agent_sdk_installed() -> bool:
+    """Whether the anthropic package is there - without importing it, which takes about a second (see AgentPanel)."""
+    if "anthropic" in sys.modules:
+        return sys.modules["anthropic"] is not None  # (None: an import that failed, or a test standing in for one)
+    try:
+        return importlib.util.find_spec("anthropic") is not None
+    except (ImportError, ValueError):
+        return False
+
+
 def agent_echo_content(content: list) -> list:
     """The assistant turn as it goes back into the history: the response unchanged - except that after a fallback in
     mid-answer, the declined model's thinking and tool calls before the switch are left out, as the API asks."""
@@ -13104,10 +13284,14 @@ const styleOf = (el) => el.ownerDocument.defaultView.getComputedStyle(el);
 const textOf = (node) => !node ? "" : node.innerText !== undefined ? node.innerText : node.textContent;
 const kind = (el) => (el.getAttribute("type") || "text").toLowerCase();
 
+function watched(el) {  // the watch of the field's own document (a same-site frame read from here has its own)
+  try { const w = el.ownerDocument.defaultView; return (w && w.__claudeEverPassword) || everPassword; } catch (e) { return everPassword; }
+}
 function secret(el) {
   if (!el || el.tagName !== "INPUT") return false;
-  if (kind(el) === "password") { everPassword.add(el); return true; }
-  return everPassword.has(el) || SECRET.test(el.getAttribute("autocomplete") || "");
+  const seen = watched(el);
+  if (kind(el) === "password") { seen.add(el); return true; }
+  return seen.has(el) || SECRET.test(el.getAttribute("autocomplete") || "");
 }
 function roleOf(el) {
   const explicit = squash(el.getAttribute("role")).split(" ")[0].toLowerCase();
@@ -13604,6 +13788,9 @@ window.__claudeAgent = {collect, point, clickFallback, focus, fieldState, stillF
                         aimAt, armAt, landed, masks};
 })();"""
 
+# Its own script in AGENT_WORLD, in EVERY document (about:blank, srcdoc, data: and extension pages too - the autofill
+# script's @match header must not apply here): a password the user typed and then had shown (a "show password" button
+# makes the field type=text) still reads as [redacted] to Claude, and screenshots cover it.
 AGENT_WATCH_SCRIPT = "chrome2-agent-watch"
 AGENT_WATCH_JS = r"""(() => {  // (Claude's world, from the start of every document) password fields, before any "show"
   if (window.__claudeEverPassword) return;
@@ -13622,11 +13809,10 @@ AGENT_WATCH_JS = r"""(() => {  // (Claude's world, from the start of every docum
 
 
 def install_agent_watch(profile: QWebEngineProfile) -> None:
-    """AGENT_WATCH_JS on every page of *profile*: a password the user typed and then had shown (a "show password"
-    button makes the field type=text) still reads as [redacted] to Claude."""
+    """AGENT_WATCH_JS in every document of *profile* (see above)."""
     scripts = profile.scripts()
-    if scripts.find(AGENT_WATCH_SCRIPT):
-        return
+    for old in scripts.find(AGENT_WATCH_SCRIPT):
+        scripts.remove(old)
     script = QWebEngineScript()
     script.setName(AGENT_WATCH_SCRIPT)
     script.setWorldId(AGENT_WORLD)
@@ -15118,6 +15304,10 @@ class AgentPanel(QFrame):
         self.session.controlling.connect(self.indicator.show_on)
         win.tab_bar.currentChanged.connect(lambda _index: self._on_tab_changed())
         self._update_usage()
+        if agent_sdk_installed() and "anthropic" not in sys.modules:
+            # Importing the SDK takes about a second: do it off the UI thread while the panel opens. It only fills
+            # sys.modules (no Qt objects); agent_sdk() on the UI thread then finds the module, or waits for the import.
+            threading.Thread(target=agent_sdk, name="anthropic-import", daemon=True).start()
         self._show_hint()
 
     # ── settings ─────────────────────────────────────────────────────────────────────────
@@ -15245,7 +15435,7 @@ class AgentPanel(QFrame):
 
     def _show_hint(self) -> None:
         """What Claude can do, how to install the SDK or add a key - while the transcript is empty."""
-        sdk = agent_sdk() is not None
+        sdk = agent_sdk_installed()
         self.input.setEnabled(sdk)
         self.send_button.setEnabled(sdk)
         if self.column.count() > (2 if self.hint is not None else 1):
@@ -15319,7 +15509,7 @@ class AgentPanel(QFrame):
         text = self.input.toPlainText().strip()
         if not text:
             return
-        if self._key_where is None and agent_sdk() is not None:
+        if self._key_where is None and agent_sdk_installed():
             self._refresh_key_status()
         if self.session.send(text):
             self.input.clear()
@@ -15403,7 +15593,6 @@ class BrowserWindow(QMainWindow):
         self._cleaners: list[SiteDataCleaner] = []  # clearing site data, still running
         self.settings = settings
         self.autofill = Autofill.of(profile) or Autofill(profile, settings, session_path.parent)  # (before any page)
-        install_agent_watch(profile)
         self.bookmarks = bookmarks
         self.history = history
         self.favicons = favicons
@@ -15491,6 +15680,10 @@ class BrowserWindow(QMainWindow):
         self._autosave.setInterval(15_000)
         self._autosave.timeout.connect(self.save_session)
         self._autosave.start()
+        self._sleeper = QTimer(self)  # Memory Saver
+        self._sleeper.setInterval(60_000)
+        self._sleeper.timeout.connect(self._sleep_tabs)
+        self._sleeper.start()
         self._rebuild_extension_buttons()
         self._restore(startup_urls)
         self.privacy_screen = PrivacyScreen(self, settings)
@@ -15850,7 +16043,7 @@ class BrowserWindow(QMainWindow):
     def close_tab(self, tab: Tab | None) -> None:
         if tab is None:
             return
-        if tab.pending is not None or tab.crashed or tab.close_requested or self._closing:
+        if unloaded(tab) or tab.crashed or tab.close_requested or self._closing:
             self._remove_tab(tab)
             return
         # Let the page run its "leave page?" check (onbeforeunload); it answers via windowCloseRequested.
@@ -16134,6 +16327,8 @@ class BrowserWindow(QMainWindow):
         page.findTextFinished.connect(lambda result, t=tab: self._on_find_result(t, result))
         page.certificateAccepted.connect(self._on_certificate_accepted)
         page.certificateProblem.connect(lambda error, t=tab: self._on_certificate_problem(t, error))
+        page.lifecycleStateChanged.connect(  # (Memory Saver discarded it, or it's back)
+            lambda state, t=tab: self._tab_updated(t, {"discarded": state == QWebEnginePage.LifecycleState.Discarded}))
         tab.view.printFinished.connect(lambda ok: self._on_print_finished(ok))
 
     def _on_current_changed(self, index: int) -> None:
@@ -16165,8 +16360,12 @@ class BrowserWindow(QMainWindow):
             self.find_bar.find()
         if tab.split is not None:
             tab.split.set_focused(tab)
-        for visible in self.visible_tabs():
+        on_screen = self.visible_tabs()
+        if previous is not None and not sip.isdeleted(previous) and previous not in on_screen:
+            previous.hidden_since = time.monotonic()  # (Memory Saver: least recently used first)
+        for visible in on_screen:
             visible.ensure_loaded()
+            visible.hidden_since = None
         self.content.bubble.hide()
         self._sync_chrome(tab)
         if self._keep_focus:  # you clicked into this side of the split view: the focus is where you put it
@@ -16177,6 +16376,42 @@ class BrowserWindow(QMainWindow):
             tab.view.setFocus()
         self.tab_bar.update()  # (a split view's outline follows the current tab)
         self.schedule_session_save()
+
+    # Memory Saver (like Chrome's): beyond the TAB_LIVE_LIMIT most recently used background tabs, one left unused for
+    # TAB_DISCARD_AFTER gives back its memory (its renderer ends). It keeps its title, address and back/forward list, and
+    # reloads when shown. Never a tab in use: pinned, shown, playing sound, in a call, typed into, with notifications...
+    def _can_sleep(self, tab: Tab) -> bool:
+        url, page = tab.url(), tab.page
+        if (tab.pending is not None or tab.pinned or tab.devtools is not None or tab.loading or tab.crashed
+                or tab.close_requested or tab.keep_awake or tab.typed or tab.permission_bars or page.js_dialog is not None
+                or page.isVisible() or tab is self._fullscreen_tab or tab in self.visible_tabs() or page.recentlyAudible()):
+            return False
+        if is_newtab(url):
+            return True
+        return url.scheme() in ("http", "https") and self.profile.queryPermission(
+            QUrl(origin_of(url)), _PT.Notifications).state() != QWebEnginePermission.State.Granted
+
+    def _sleep_tabs(self) -> None:
+        if self._closing or not self.settings.get("memory_saver") or self.agent_running():
+            return
+        S, now, shown, tabs = QWebEnginePage.LifecycleState, time.monotonic(), self.visible_tabs(), self.tabs()
+        excess = sum(t.pending is None and t not in shown and t.page.lifecycleState() != S.Discarded for t in tabs) - TAB_LIVE_LIMIT
+        for tab in sorted((t for t in tabs if t.hidden_since is not None), key=lambda t: t.hidden_since):
+            if excess <= 0 or now - tab.hidden_since < TAB_DISCARD_AFTER:
+                break
+            page = tab.page
+            if page.lifecycleState() != S.Active or page.recommendedState() == S.Active or not self._can_sleep(tab):
+                continue  # (Qt keeps a page Active while it's shown or plays sound)
+            page.blockSignals(True)  # (a probe nobody hears of: extensions see only the discarding)
+            page.setLifecycleState(S.Frozen)  # Qt's last checks (a pop-up it opened, a PDF...) need a frozen page,
+            discard = page.recommendedState() == S.Discarded  # and answer at once: no lasting freeze (it would
+            if not discard:                                   # block the site's other tabs on IndexedDB, locks...)
+                page.setLifecycleState(S.Active)
+                tab.hidden_since = now  # (asked again in TAB_DISCARD_AFTER)
+            page.blockSignals(False)
+            if discard:
+                page.setLifecycleState(S.Discarded)
+                excess -= 1
 
     def _sync_chrome(self, tab: Tab) -> None:
         """Update toolbar, address bar and window title for the current tab."""
@@ -16269,9 +16504,11 @@ class BrowserWindow(QMainWindow):
         if tab is self.current_tab():
             self.setWindowTitle(APP_NAME if is_newtab(tab.url()) else f"{tab.title()} — {APP_NAME}")
         url = tab.page.url()
-        if title and HistoryStore.recordable(url):
+        if title and HistoryStore.recordable(url) and tab.title_writes < 5:  # (as Chrome: a page's first few titles;
+            tab.title_writes += 1                                            # a flashing "(3) Inbox" would commit forever)
             self.history.set_title(url.toString(), title)
-        self.schedule_session_save()
+        # No session save for a title: it is inside the saved history blob anyway, and the 15 s autosave, the URL/load
+        # saves and closeEvent still write it. A ticking title would rewrite session.json (with fsync) every second.
 
     def _on_icon_changed(self, tab: Tab, icon_: QIcon) -> None:
         if not icon_.isNull() and tab.page.url().scheme() in ("http", "https"):
@@ -16279,6 +16516,7 @@ class BrowserWindow(QMainWindow):
         self._refresh_tab(tab)
 
     def _on_url_changed(self, tab: Tab, url: QUrl) -> None:
+        tab.title_writes = 0
         self.extensions.bridge.tab_navigated(tab, url)
         self._tab_updated(tab, {"url": url.toString()})
         self._navigation_event(tab, "onCommitted" if tab.loading else "onHistoryStateUpdated", url)
@@ -16291,6 +16529,8 @@ class BrowserWindow(QMainWindow):
                 tab.permission_bars.remove(bar)
                 if not sip.isdeleted(bar):
                     bar.dismiss()
+        if tab.keep_awake and origin_of(url) != tab.keep_awake:
+            tab.keep_awake = ""  # (the call's site is gone)
         if tab.loading:
             self.site_visited(url)
         if not tab.loading and HistoryStore.recordable(url) and url.toString() != tab.last_recorded:
@@ -16300,7 +16540,7 @@ class BrowserWindow(QMainWindow):
         self.schedule_session_save()
 
     def _on_load_started(self, tab: Tab) -> None:
-        tab.loading, tab.progress, tab.crashed = True, 0, False
+        tab.loading, tab.progress, tab.crashed, tab.title_writes = True, 0, False, 0
         self._tab_updated(tab, {"status": "loading"})
         self._navigation_event(tab, "onBeforeNavigate", tab.page.requestedUrl())
         if tab.crash_bar is not None and not sip.isdeleted(tab.crash_bar):
@@ -16318,25 +16558,41 @@ class BrowserWindow(QMainWindow):
 
     def _on_load_finished(self, tab: Tab, ok: bool) -> None:
         tab.loading, tab.progress = False, 100
+        if ok:  # (a new document; a cache restore keeps the one typed into)
+            tab.typed = False
+        if (proxy := tab.view.focusProxy()) is not None:  # (Memory Saver: notes typing; a new renderer may bring a new
+            proxy.installEventFilter(tab)                  # proxy, and Qt keeps one filter per object)
         self._refresh_tab(tab)
         self._tab_updated(tab, {"status": "complete"})
         if ok:
-            self._navigation_event(tab, "onDOMContentLoaded", tab.page.url())
-            self._navigation_event(tab, "onCompleted", tab.page.url())
-        url = tab.page.url()
-        if ok and HistoryStore.recordable(url):
-            tab.last_recorded = url.toString()
-            self.history.add_visit(url.toString(), tab.page.title())
+            self._load_succeeded(tab)
         self._apply_site_zoom(tab)
         if tab is self.current_tab():
             self._sync_chrome(tab)
         self.schedule_session_save()
 
+    def _load_succeeded(self, tab: Tab) -> None:
+        """A page loaded (or came back from the back/forward cache): webNavigation's last events, a history visit."""
+        url = tab.page.url()
+        self._navigation_event(tab, "onDOMContentLoaded", url)
+        self._navigation_event(tab, "onCompleted", url)
+        if HistoryStore.recordable(url):
+            tab.last_recorded = url.toString()
+            self.history.add_visit(url.toString(), tab.page.title())
+
     def _on_loading_changed(self, tab: Tab, info: QWebEngineLoadingInfo) -> None:
         status = info.status()
+        # Qt reports a page restored from the back/forward cache as a failed load (loadFinished(False), just before
+        # this) with no error at all; a real failure has an error code (Stop and 204 report LoadStoppedStatus)
+        # (so does a renderer that died mid-load: _on_crashed has run by then)
+        restored = (status == QWebEngineLoadingInfo.LoadStatus.LoadFailedStatus and info.errorCode() == 0
+                    and info.errorDomain() == QWebEngineLoadingInfo.ErrorDomain.NoErrorDomain and not info.isErrorPage()
+                    and not tab.crashed)
+        if restored:
+            self._load_succeeded(tab)
         if status == QWebEngineLoadingInfo.LoadStatus.LoadFailedStatus and info.errorCode() in PROXY_ERROR_CODES:
             self._warn_vpn_unreachable(tab)
-        if tab.back_after_error and status != QWebEngineLoadingInfo.LoadStatus.LoadStartedStatus:
+        if tab.back_after_error and status != QWebEngineLoadingInfo.LoadStatus.LoadStartedStatus and not restored:
             target, tab.back_after_error = tab.back_after_error, ""
             if status == QWebEngineLoadingInfo.LoadStatus.LoadFailedStatus and info.url().toString() == target:
                 QTimer.singleShot(0, lambda: tab.page.history().canGoBack()
@@ -16464,9 +16720,15 @@ class BrowserWindow(QMainWindow):
         if text is None:
             permission.deny()
             return
+
+        def grant() -> None:
+            permission.grant()
+            if permission.permissionType() in _CAPTURE:
+                tab.keep_awake = origin_of(permission.origin())  # (a call: Memory Saver leaves the tab alone)
+
         remembered = self.remembered_decision(permission)  # set in site settings, or answered before
         if remembered is not None:
-            permission.grant() if remembered else permission.deny()
+            grant() if remembered else permission.deny()
             return
         origin = permission.origin()
         bar = InfoBar(icon("info", P.ACCENT), f"Allow <b>{html.escape(origin.host() or origin.toString())}</b> to {text}?")
@@ -16476,7 +16738,7 @@ class BrowserWindow(QMainWindow):
         def decide(allow: bool, remember: bool = False) -> None:
             if not decided["done"]:
                 decided["done"] = True
-                permission.grant() if allow else permission.deny()
+                grant() if allow else permission.deny()
                 if remember:
                     self.remember_decision(permission, allow)
 
@@ -16989,8 +17251,9 @@ class BrowserWindow(QMainWindow):
 
     def _rewire_tabs(self) -> None:
         """Installed extensions changed: every tab's tab-id script must know the current ones (from the next load)."""
+        pairs = self.extensions.tab_pairs()  # once for all of them
         for tab in [*self.tabs(), *(p for p in list(self.popups) if not sip.isdeleted(p))]:
-            self.extensions.wire_tab(tab.page, tab.tab_id)
+            self.extensions.wire_tab(tab.page, tab.tab_id, pairs)
 
     def _on_extension_reloaded(self, ext_id: str) -> None:
         """Pages of an extension opened while it was off (or an older version) have no chrome.* APIs: reload them."""
@@ -17608,8 +17871,8 @@ class BrowserWindow(QMainWindow):
                 self._cleaners.remove(cleaner)
             for tab in self.tabs():
                 origin = origin_of(tab.url())
-                if tab.pending is None and origin in cleaner.done and not (everything and origin in cleaner.visited):
-                    tab.page.triggerAction(QWebEnginePage.WebAction.Reload)
+                if not unloaded(tab) and origin in cleaner.done and not (everything and origin in cleaner.visited):
+                    tab.page.triggerAction(QWebEnginePage.WebAction.Reload)  # (a discarded one: when shown)
             cleaner.deleteLater()
             if done is not None:
                 done()
@@ -17785,6 +18048,7 @@ class BrowserWindow(QMainWindow):
         self._closing = True
         self._session_timer.stop()
         self._autosave.stop()
+        self._sleeper.stop()
         self.bookmarks.flush()
         self.settings.save()
         self.extensions.save()
@@ -18010,9 +18274,44 @@ def write_icns(target: Path) -> str:
     return "direct"
 
 
+def bytecode_cache() -> str:
+    """Where boot_command() keeps the script's compiled bytecode: not a __pycache__ next to the script (the user's
+    Desktop, or somewhere read-only) but ~/Library/Caches/Chrome 2/pycache on macOS and $XDG_CACHE_HOME/Foxglove/pycache
+    elsewhere - unless Python was already given a cache prefix (-X pycache_prefix / PYTHONPYCACHEPREFIX)."""
+    if sys.pycache_prefix:
+        return sys.pycache_prefix
+    if IS_MAC:
+        return str(Path.home() / "Library" / "Caches" / APP_NAME / "pycache")
+    return str(Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache") / DATA_NAME / "pycache")
+
+
+def boot_command(script: str) -> str:
+    """Code for `python -c` that starts *script* as __main__ through importlib, which caches its bytecode:
+    `python script.py` compiles all 18k lines on every start (about 0.2 s here; reading the cache takes 5 ms).
+    Everything then looks as it does for `python script.py`: sys.path[0] is the script's folder (not the current
+    directory, which -c puts there), sys.argv[0] is the script, __name__ is "__main__" and __file__ is absolute. Any
+    file name works. Only this file's bytecode goes under bytecode_cache(): the prefix is global, so it is set just
+    while the code is read and put back before the script's own imports run. A cache that can't be written (or a
+    stale one) just means a compile, as today."""
+    path = os.path.abspath(script)
+    return "\n".join((
+        "import importlib.util, os, sys",
+        f"p, c = {path!r}, {bytecode_cache()!r}",
+        'sys.path[0:1] = [os.path.dirname(p)] if sys.path[:1] == [""] else [os.path.dirname(p), *sys.path[:1]]',
+        "sys.argv[0] = p",
+        "k, sys.pycache_prefix = sys.pycache_prefix, c",
+        'spec = importlib.util.spec_from_file_location("__main__", p)',
+        "main = importlib.util.module_from_spec(spec)",
+        'sys.modules["__main__"] = main',
+        'code = spec.loader.get_code("__main__")',
+        "sys.pycache_prefix = k",
+        "exec(code, main.__dict__)"))
+
+
 def make_app_bundle(bundle: Path, python: str, script: str) -> Path:
-    """A macOS app bundle that starts *script* with *python* (the Python - venv - it was made with), logging to
-    ~/Library/Logs/Chrome 2.log. Made in a temporary folder first, then put in place of any older one."""
+    """A macOS app bundle that starts *script* with *python* (the Python - venv - it was made with) from cached
+    bytecode (boot_command), logging to ~/Library/Logs/Chrome 2.log. Made in a temporary folder first, then put in
+    place of any older one."""
     import plistlib
     import shlex
     bundle.parent.mkdir(parents=True, exist_ok=True)
@@ -18034,10 +18333,11 @@ def make_app_bundle(bundle: Path, python: str, script: str) -> Path:
     launcher.write_text(
         "#!/bin/sh\n"
         f"# Starts {APP_NAME}; made by: python3 foxglove.py --install-app (run that again if Python or the script moves)\n"
+        f"# The script is started through importlib so its compiled form is cached (under ~/Library/Caches/{APP_NAME})\n"
         f'LOG="$HOME/Library/Logs/{APP_NAME}.log"\n'
         'mkdir -p "$HOME/Library/Logs"\n'
         f'echo "--- $(date): starting {APP_NAME}" >>"$LOG"\n'
-        f'exec {shlex.quote(python)} {shlex.quote(script)} "$@" >>"$LOG" 2>&1\n', encoding="utf-8")
+        f'exec {shlex.quote(python)} -c {shlex.quote(boot_command(script))} "$@" >>"$LOG" 2>&1\n', encoding="utf-8")
     launcher.chmod(0o755)
     write_icns(contents / "Resources" / "icon.icns")
     shutil.rmtree(bundle, ignore_errors=True)
@@ -18187,6 +18487,10 @@ def main(argv: list[str] | None = None) -> int:
                         ("JavascriptCanOpenWindows", True), ("LocalStorageEnabled", True)):
         web_settings.setAttribute(getattr(attribute, name), value)
     web_settings.setAttribute(attribute.ForceDarkMode, settings.get("force_dark_pages"))
+    if hasattr(attribute, "BackForwardCacheEnabled"):  # (not in older PyQt6)
+        # Back/Forward show the page as you left it, at once, as Chrome does (no-store pages aren't kept). It keeps its
+        # JS state: content, autofill, agent and tab-id scripts aren't injected again (a new extension: after a reload)
+        web_settings.setAttribute(attribute.BackForwardCacheEnabled, True)
 
     pages = InternalPages(NewTabPage(settings, history, favicons, app), app)
     profile.installUrlSchemeHandler(b"foxglove", pages)
@@ -18239,7 +18543,8 @@ def main(argv: list[str] | None = None) -> int:
 
 
 def restart_process(profile_name: str, original_flags: str | None) -> None:
-    """Start Chrome 2 again in this same process (same terminal, same Ctrl+C), e.g. to apply a VPN change."""
+    """Start Chrome 2 again in this same process (same terminal, same Ctrl+C), e.g. to apply a VPN change - from
+    cached bytecode (boot_command), so the restart doesn't compile this file again."""
     if original_flags is None:
         os.environ.pop("QTWEBENGINE_CHROMIUM_FLAGS", None)
     else:
@@ -18248,7 +18553,7 @@ def restart_process(profile_name: str, original_flags: str | None) -> None:
         shutil.rmtree(_icon_factory.dir, ignore_errors=True)
     sys.stdout.flush()
     sys.stderr.flush()
-    os.execv(sys.executable, [sys.executable, os.path.abspath(__file__), "--profile", profile_name])
+    os.execv(sys.executable, [sys.executable, "-c", boot_command(__file__), "--profile", profile_name])
 
 
 if __name__ == "__main__":

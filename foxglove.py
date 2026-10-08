@@ -10597,7 +10597,8 @@ AUTOFILL_WORLD = PAGE_WORLD            # (shared with Claude's helpers and the e
 KEYCHAIN_SERVICE = "Chrome 2"          # the keychain items' service: fixed, so renaming the app never orphans them
 AUTOFILL_SCRIPT = "chrome2-autofill"
 # Only web and file pages get the script (Qt honours these Greasemonkey headers): an about:blank, srcdoc, data: or
-# internal frame it would return from at once still costs a V8 context of its own. @run-at keeps DocumentCreation.
+# internal frame it would return from at once would still run it. @run-at keeps DocumentCreation. (Claude's watch,
+# AGENT_WATCH_JS, is a script of its own in the same world: it must be in every document.)
 AUTOFILL_MATCH = ("// ==UserScript==\n// @match http://*/*\n// @match https://*/*\n// @match file:///*\n"
                   "// @run-at document-start\n// ==/UserScript==\n")
 AUTOFILL_POKE = "⁣chrome2-autofill:"  # + a per-run token + the frame's address
@@ -11456,10 +11457,9 @@ class Autofill(QObject):
         script.setWorldId(AUTOFILL_WORLD)
         script.setInjectionPoint(QWebEngineScript.InjectionPoint.DocumentCreation)
         script.setRunsOnSubFrames(True)
-        # one script, one world: Claude's password watch rides along (a throw in it must never stop autofill)
-        script.setSourceCode(AUTOFILL_MATCH + "try {" + AGENT_WATCH_JS + "} catch (e) {}\n"
-                             + AUTOFILL_JS.replace("__POKE__", json.dumps(self.poke)))
+        script.setSourceCode(AUTOFILL_MATCH + AUTOFILL_JS.replace("__POKE__", json.dumps(self.poke)))
         scripts.insert(script)
+        install_agent_watch(profile)  # (same world: no context of its own; every document, header or not)
 
     @classmethod
     def of(cls, profile: QWebEngineProfile | None) -> "Autofill | None":
@@ -13284,10 +13284,14 @@ const styleOf = (el) => el.ownerDocument.defaultView.getComputedStyle(el);
 const textOf = (node) => !node ? "" : node.innerText !== undefined ? node.innerText : node.textContent;
 const kind = (el) => (el.getAttribute("type") || "text").toLowerCase();
 
+function watched(el) {  // the watch of the field's own document (a same-site frame read from here has its own)
+  try { const w = el.ownerDocument.defaultView; return (w && w.__claudeEverPassword) || everPassword; } catch (e) { return everPassword; }
+}
 function secret(el) {
   if (!el || el.tagName !== "INPUT") return false;
-  if (kind(el) === "password") { everPassword.add(el); return true; }
-  return everPassword.has(el) || SECRET.test(el.getAttribute("autocomplete") || "");
+  const seen = watched(el);
+  if (kind(el) === "password") { seen.add(el); return true; }
+  return seen.has(el) || SECRET.test(el.getAttribute("autocomplete") || "");
 }
 function roleOf(el) {
   const explicit = squash(el.getAttribute("role")).split(" ")[0].toLowerCase();
@@ -13784,8 +13788,10 @@ window.__claudeAgent = {collect, point, clickFallback, focus, fieldState, stillF
                         aimAt, armAt, landed, masks};
 })();"""
 
-# Part of the autofill script (AUTOFILL_SCRIPT, from the start of every web page and frame): a password the user typed
-# and then had shown (a "show password" button makes the field type=text) still reads as [redacted] to Claude.
+# Its own script in AGENT_WORLD, in EVERY document (about:blank, srcdoc, data: and extension pages too - the autofill
+# script's @match header must not apply here): a password the user typed and then had shown (a "show password" button
+# makes the field type=text) still reads as [redacted] to Claude, and screenshots cover it.
+AGENT_WATCH_SCRIPT = "chrome2-agent-watch"
 AGENT_WATCH_JS = r"""(() => {  // (Claude's world, from the start of every document) password fields, before any "show"
   if (window.__claudeEverPassword) return;
   const seen = new WeakSet();
@@ -13800,6 +13806,20 @@ AGENT_WATCH_JS = r"""(() => {  // (Claude's world, from the start of every docum
       if (r.target.tagName === "INPUT" && String(r.oldValue || "").toLowerCase() === "password") seen.add(r.target);
   }).observe(document, {subtree: true, attributes: true, attributeFilter: ["type"], attributeOldValue: true});
 })();"""
+
+
+def install_agent_watch(profile: QWebEngineProfile) -> None:
+    """AGENT_WATCH_JS in every document of *profile* (see above)."""
+    scripts = profile.scripts()
+    for old in scripts.find(AGENT_WATCH_SCRIPT):
+        scripts.remove(old)
+    script = QWebEngineScript()
+    script.setName(AGENT_WATCH_SCRIPT)
+    script.setWorldId(AGENT_WORLD)
+    script.setInjectionPoint(QWebEngineScript.InjectionPoint.DocumentCreation)
+    script.setRunsOnSubFrames(True)
+    script.setSourceCode(AGENT_WATCH_JS)
+    scripts.insert(script)
 
 
 AGENT_KEY_ALIASES = {
@@ -16562,8 +16582,10 @@ class BrowserWindow(QMainWindow):
         status = info.status()
         # Qt reports a page restored from the back/forward cache as a failed load (loadFinished(False), just before
         # this) with no error at all; a real failure has an error code (Stop and 204 report LoadStoppedStatus)
+        # (so does a renderer that died mid-load: _on_crashed has run by then)
         restored = (status == QWebEngineLoadingInfo.LoadStatus.LoadFailedStatus and info.errorCode() == 0
-                    and info.errorDomain() == QWebEngineLoadingInfo.ErrorDomain.NoErrorDomain and not info.isErrorPage())
+                    and info.errorDomain() == QWebEngineLoadingInfo.ErrorDomain.NoErrorDomain and not info.isErrorPage()
+                    and not tab.crashed)
         if restored:
             self._load_succeeded(tab)
         if status == QWebEngineLoadingInfo.LoadStatus.LoadFailedStatus and info.errorCode() in PROXY_ERROR_CODES:

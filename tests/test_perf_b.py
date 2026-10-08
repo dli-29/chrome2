@@ -201,3 +201,11 @@ def test_only_the_restore_signature_counts_from_loading_changed(fg, window, monk
         # a restore doesn't use up "step back past the certificate error page"; any other end of a load does
         assert tab.back_after_error == (target if counted else ""), (status, code, domain, error_page)
     tab.back_after_error = ""
+    # a renderer that died mid-load ends with the very same signature: no success for a dead page
+    calls.clear()
+    tab.crashed = True
+    info = SimpleNamespace(status=lambda: STATUS.LoadFailedStatus, errorCode=lambda: 0, errorDomain=lambda: DOMAIN.NoErrorDomain,
+                           isErrorPage=lambda: False, url=lambda: QUrl("http://127.0.0.1:9/x"))
+    window._on_loading_changed(tab, info)
+    tab.crashed = False
+    assert calls == []

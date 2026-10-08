@@ -1,8 +1,8 @@
 """One isolated world per frame: autofill, Claude's password watch and the extension tab-id script share PAGE_WORLD
-(every extra world is a V8 context in every frame of every page), the shared script is only injected into http(s) and
-file documents (about:blank, srcdoc and internal frames get no context at all) - and pages, extensions and Claude see
-exactly what they did before: a shown password stays [redacted], the world stays out of the page's reach, content
-scripts in frames still learn their tab."""
+(every extra world is a V8 context in every frame of every page), autofill's script is only injected into http(s) and
+file documents while Claude's password watch is in every document - and pages, extensions and Claude see exactly what
+they did before: a shown password stays [redacted] (in a srcdoc frame or a data: page too), the world stays out of the
+page's reach, content scripts in frames still learn their tab."""
 from __future__ import annotations
 
 import json
@@ -40,7 +40,8 @@ def test_one_world_for_all_of_the_browsers_page_scripts(window, harness, server,
     assert fg.AGENT_WORLD == fg.AUTOFILL_WORLD == fg.PAGE_WORLD and 0 < fg.PAGE_WORLD < fg.FIRST_EXTENSION_WORLD
     profile = window.profile.scripts().toList()
     assert {s.worldId() for s in profile} <= {0, fg.PAGE_WORLD}
-    assert not window.profile.scripts().find("chrome2-agent-watch")  # the watch no longer has a script (world) of its own
+    (watch,) = window.profile.scripts().find(fg.AGENT_WATCH_SCRIPT)  # the watch: its own script, in the same world,
+    assert watch.worldId() == fg.PAGE_WORLD and watch.runsOnSubFrames() and not watch.sourceCode().startswith("//")  # no header
     (script,) = window.profile.scripts().find(fg.AUTOFILL_SCRIPT)
     assert script.worldId() == fg.PAGE_WORLD and script.runsOnSubFrames()
     assert script.injectionPoint() == QWebEngineScript.InjectionPoint.DocumentCreation
@@ -49,7 +50,7 @@ def test_one_world_for_all_of_the_browsers_page_scripts(window, harness, server,
     header = source.split("// ==/UserScript==")[0]
     assert all(f"// @match {m}" in header for m in ("http://*/*", "https://*/*", "file:///*"))
     assert "// @run-at document-start" in header
-    assert "__claudeEverPassword" in source and "__fgAutofill" in source  # the watch rides along with autofill
+    assert "__fgAutofill" in source and "__claudeEverPassword" not in source
     # with an extension installed, the tab-id script joins them instead of opening a world of its own
     harness.install_ok(eb.probe_extension(tmp_path / "probe", "Probe", "probe"), "Probe")
     controller, tab = harness.controller, window.current_tab()
@@ -59,7 +60,7 @@ def test_one_world_for_all_of_the_browsers_page_scripts(window, harness, server,
     assert worlds == {fg.PAGE_WORLD}
 
 
-def test_web_frames_share_the_world_and_other_frames_get_none(window, server, fg):
+def test_web_frames_get_autofill_and_every_frame_gets_the_watch(window, server, fg):
     server.add("/mixed", MIXED, "text/html; charset=utf-8")
     tab = window.current_tab()
     assert load(tab.page, server.url("/mixed"))
@@ -67,8 +68,9 @@ def test_web_frames_share_the_world_and_other_frames_get_none(window, server, fg
     web = next(frame for url, frame in frames.items() if url.startswith("http://"))
     assert world_js(tab.page, PROBE, fg.PAGE_WORLD) == "object,true"  # autofill and the watch, in one world
     assert world_js(web, PROBE, fg.PAGE_WORLD) == "object,true"
-    assert world_js(frames["about:blank"], PROBE, fg.PAGE_WORLD) == "undefined,false"  # nothing was injected there
-    assert world_js(frames["about:srcdoc"], PROBE, fg.PAGE_WORLD) == "undefined,false"
+    assert world_js(frames["about:blank"], PROBE, fg.PAGE_WORLD) == "undefined,true"  # no autofill there, the watch yes
+    assert world_js(frames["about:srcdoc"], PROBE, fg.PAGE_WORLD) == "undefined,true"
+    assert {s.worldId() for s in tab.page.profile().scripts().toList()} <= {0, fg.PAGE_WORLD}  # (and no world besides)
     # Claude's page code lands in the same world and picks up the watch's set
     assert world_js(tab.page, f"{fg.AGENT_JS}\ntypeof __fgAutofill + ',' + typeof window.__claudeAgent", fg.PAGE_WORLD) == "object,object"
     # the page sees none of it
@@ -76,14 +78,16 @@ def test_web_frames_share_the_world_and_other_frames_get_none(window, server, fg
     assert run_js(tab.page, "Object.keys(window).filter(k => /autofill|claude|__fg/i.test(k)).length") == 0
 
 
-def test_file_pages_keep_the_watch_and_internal_pages_get_nothing(window, tmp_path, fg):
+def test_file_and_internal_pages_keep_the_watch_and_get_no_autofill(window, tmp_path, fg):
     local = tmp_path / "local.html"
     local.write_text("<!doctype html><title>Local</title><input id=pw type=password>", encoding="utf-8")
     tab = window.current_tab()
     assert load(tab.page, QUrl.fromLocalFile(str(local)))
     assert world_js(tab.page, PROBE, fg.PAGE_WORLD) == "undefined,true"  # no autofill on file: pages, the watch yes
     assert load(tab.page, fg.NEWTAB)
-    assert world_js(tab.page, PROBE, fg.PAGE_WORLD) == "undefined,false"
+    assert world_js(tab.page, PROBE, fg.PAGE_WORLD) == "undefined,true"
+    assert load(tab.page, QUrl("data:text/html,<title>Data</title><input id=pw type=password>"))
+    assert world_js(tab.page, PROBE, fg.PAGE_WORLD) == "undefined,true"
 
 
 def test_shown_password_stays_redacted_from_claude(window, server, fg):
@@ -99,6 +103,48 @@ def test_shown_password_stays_redacted_from_claude(window, server, fg):
     wait_until(lambda: box, 30, "the read_page tool")
     assert not box["e"] and "sw0rdfish-77" not in box["c"] and 'textbox "Password" value=[redacted]' in box["c"]
     assert run_js(tab.page, "typeof window.__claudeAgent + typeof window.__claudeEverPassword") == "undefinedundefined"
+
+
+SHOW_JS = ("const pw = document.getElementById('pw'); pw.focus(); pw.value = 'sw0rdfish-77'; "
+           "pw.dispatchEvent(new Event('input', {bubbles: true})); pw.type = 'text'; pw.type")
+
+
+def read_page(fg, window) -> dict:
+    browser, box = fg.AgentBrowser(window), {}
+    browser.run("read_page", {}, lambda content, error=False, log_line="": box.update(c=content, e=error))
+    wait_until(lambda: box, 30, "the read_page tool")
+    return box
+
+
+def hidden_boxes(fg, window, tab) -> list | None:
+    box: dict = {}
+    fg.AgentBrowser(window)._hidden_boxes(tab, [], lambda found: box.setdefault("r", found))
+    wait_until(lambda: box, 30, "the hidden boxes")
+    return box["r"]
+
+
+def test_shown_password_in_a_srcdoc_frame_stays_redacted_and_covered(window, server, fg):
+    """A login form in an about:srcdoc (or about:blank) frame: no @match header keeps the watch out of it."""
+    server.add("/srcdoc-login", b"""<!doctype html><title>Framed login</title><body><p>outer</p>
+<iframe id=f srcdoc="<label>Password <input id=pw type=password style='width:160px;height:24px'></label>"></iframe>
+</body></html>""", "text/html; charset=utf-8")
+    tab = window.current_tab()
+    assert load(tab.page, server.url("/srcdoc-login"))
+    frame = wait_until(lambda: next((f for f in tab.page.mainFrame().children() if f.url().toString() == "about:srcdoc"), None),
+                       10, "the srcdoc frame")
+    assert world_js(frame, SHOW_JS, 0) == "text"
+    box = read_page(fg, window)
+    assert not box["e"] and "sw0rdfish-77" not in box["c"] and "value=[redacted]" in box["c"], box["c"]
+    boxes = hidden_boxes(fg, window, tab)  # the screenshot paints over the field too
+    assert boxes and any(b.get("w", 0) >= 100 for b in boxes), boxes
+
+
+def test_shown_password_on_a_data_page_stays_redacted(window, fg):
+    tab = window.current_tab()
+    assert load(tab.page, QUrl("data:text/html,<title>Data login</title><label>Password <input id=pw type=password></label>"))
+    assert run_js(tab.page, SHOW_JS) == "text"
+    box = read_page(fg, window)
+    assert not box["e"] and "sw0rdfish-77" not in box["c"] and "value=[redacted]" in box["c"], box["c"]
 
 
 def test_content_scripts_in_frames_learn_their_tab(window, harness, server, tmp_path):

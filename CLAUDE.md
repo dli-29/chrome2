@@ -17,7 +17,8 @@ or Xcode on their machine. They are new to GitHub and the terminal: give exact, 
   Don't rename these - it would orphan the user's data and break installed extensions.
 - Extensions: `ExtensionsController`, `ExtensionBridge` (foxglove-ext:// API bridge), `EXTENSION_SHIM_JS`
   (chrome.* polyfill), `NetRules` (declarativeNetRequest engine). Extension script worlds start at
-  `FIRST_EXTENSION_WORLD = 16`; `APP_WORLD` = 1, autofill = 3, Claude agent = 4.
+  `FIRST_EXTENSION_WORLD = 16`; `PAGE_WORLD` = 3 is Foxglove's one isolated world in web pages (autofill, Claude's
+  helpers and the extension tab-id script share it: every extra world costs a V8 context per frame).
 - Claude side panel (`Agent*` classes): Anthropic SDK, default model `claude-opus-5-5`, API key in the keychain via
   `SecretStore` (service "Chrome 2"). Passwords/card numbers are redacted from everything the agent sees.
 - Autofill/password manager (`Autofill*`, `SecretStore`, keyring package).

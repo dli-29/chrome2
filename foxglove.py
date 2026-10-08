@@ -3076,6 +3076,7 @@ class ExtensionsController(QObject):
         super().__init__()
         self.profile = profile
         self.manager = profile.extensionManager() if HAS_EXTENSIONS else None
+        self._info_memo: tuple[list, dict] | None = None  # the extensions for this event-loop pass, see _infos
         self.registry_path = registry_path
         raw = read_json(registry_path, {})
         self.registry: dict[str, dict] = raw if isinstance(raw, dict) else {}
@@ -3115,6 +3116,17 @@ class ExtensionsController(QObject):
         self._reload_timer.setSingleShot(True)
         self._reload_timer.setInterval(1000)
         self._reload_timer.timeout.connect(self._reload_for_scripts)
+        # One 'changed' per event-loop pass for the extensions switched on or off together (every start-up): each
+        # one has the windows rebuild their toolbar buttons and rewire every tab.
+        self._changed_timer = QTimer(self)
+        self._changed_timer.setSingleShot(True)
+        self._changed_timer.setInterval(0)
+        self._changed_timer.timeout.connect(self.changed)
+        self._loaded_ids: list[str] = []  # just loaded by Qt: switched on (or off) together, in _apply_newly_loaded
+        self._apply_loaded = QTimer(self)
+        self._apply_loaded.setSingleShot(True)
+        self._apply_loaded.setInterval(0)
+        self._apply_loaded.timeout.connect(self._apply_newly_loaded)
         self.chromium = qWebEngineChromiumVersion() if HAS_EXTENSIONS else ""
         self._window = None
         self._nam = QNetworkAccessManager(self)
@@ -3167,7 +3179,7 @@ class ExtensionsController(QObject):
         self._guarding = guard
         if want != self.filtering:
             self.filtering = want
-            QTimer.singleShot(0, self.changed.emit)  # the windows give their tabs' filters the same state
+            self._changed_timer.start()  # the windows give their tabs' filters the same state
 
     @property
     def window(self):
@@ -3179,17 +3191,23 @@ class ExtensionsController(QObject):
 
     TAB_SCRIPT = "foxglove-tab-id"
 
-    def tab_script(self, tab_id: int) -> QWebEngineScript | None:
+    def tab_pairs(self) -> dict:
+        """Each installed extension's tab-query event name -> the answer's (the same for every tab: made once when
+        many tabs are wired)."""
+        pairs = {}
+        for info in self._infos():
+            cfg = self._shim_config_at(info.path())
+            q, a = cfg.get("tabQuery"), cfg.get("tabAnswer")
+            if isinstance(q, str) and isinstance(a, str) and re.fullmatch(r"__fg[0-9a-f]{20}", q) and re.fullmatch(r"__fg[0-9a-f]{20}", a):
+                pairs[q] = a
+        return pairs
+
+    def tab_script(self, tab_id: int, pairs: dict | None = None) -> QWebEngineScript | None:
         """Tells the polyfill (content scripts, extension pages) which tab it is in. DOM events reach every world of a
         page, so each extension asks and is answered under event names only it and Foxglove know."""
         if self.manager is None:
             return None
-        pairs = {}
-        for info in self._infos():
-            cfg = self.shim_config(info.id())
-            q, a = cfg.get("tabQuery"), cfg.get("tabAnswer")
-            if isinstance(q, str) and isinstance(a, str) and re.fullmatch(r"__fg[0-9a-f]{20}", q) and re.fullmatch(r"__fg[0-9a-f]{20}", a):
-                pairs[q] = a
+        pairs = self.tab_pairs() if pairs is None else pairs
         if not pairs:  # no extension to tell: nothing in the page
             return None
         script = QWebEngineScript()
@@ -3201,7 +3219,7 @@ class ExtensionsController(QObject):
                              f"document.dispatchEvent(new CustomEvent(a, {{detail: '{int(tab_id)}'}})));")
         return script
 
-    def wire_tab(self, page: QWebEnginePage, tab_id: int) -> None:
+    def wire_tab(self, page: QWebEnginePage, tab_id: int, pairs: dict | None = None) -> None:
         """Put (or refresh) the tab-id script in a tab's page; it applies from the next page load on. The page also
         gets a request filter that knows its tab (declarativeNetRequest rules for some tabs only) - while filtering."""
         if self.manager is not None:
@@ -3210,7 +3228,7 @@ class ExtensionsController(QObject):
             if getattr(page, "net_filtering", False) != self.filtering:
                 page.net_filtering = self.filtering
                 page.setUrlRequestInterceptor(page.net_filter if self.filtering else None)
-        script, scripts = self.tab_script(tab_id), page.scripts()
+        script, scripts = self.tab_script(tab_id, pairs), page.scripts()
         old = scripts.find(self.TAB_SCRIPT)
         if script is not None and len(old) == 1 and old[0].sourceCode() == script.sourceCode():
             return
@@ -3254,12 +3272,24 @@ class ExtensionsController(QObject):
 
     # Queries
     def _infos(self) -> list:
+        """The installed extensions - listed once per event-loop pass: Qt adds and removes them only between passes
+        (through the signals below, which forget the list), and the infos themselves are live. Never changed by callers."""
         if self.manager is None or sip.isdeleted(self.manager):  # (a late timer after the profile went away)
             return []
-        return [i for i in self.manager.extensions() if i.isInstalled() and i.id() not in COMPONENT_EXTENSIONS]
+        if self._info_memo is None:
+            infos = [i for i in self.manager.extensions() if i.isInstalled() and i.id() not in COMPONENT_EXTENSIONS]
+            by_id: dict = {}
+            for i in infos:
+                by_id.setdefault(i.id(), i)  # the first one (an update lists an id twice for a moment, see _on_install_finished)
+            self._info_memo = (infos, by_id)
+            QTimer.singleShot(0, self._forget_infos)
+        return self._info_memo[0]
+
+    def _forget_infos(self) -> None:
+        self._info_memo = None
 
     def _info(self, ext_id: str):
-        return next((i for i in self._infos() if i.id() == ext_id), None) if ext_id else None
+        return self._info_memo[1].get(ext_id) if ext_id and self._infos() else None
 
     def _manifest(self, path: str) -> dict:
         try:
@@ -3279,9 +3309,9 @@ class ExtensionsController(QObject):
     def shim_config(self, ext_id: str) -> dict:
         """The polyfill configuration of an installed extension ({} if it runs without one)."""
         info = self._info(ext_id)
-        if info is None:
-            return {}
-        path = info.path()
+        return self._shim_config_at(info.path()) if info is not None else {}
+
+    def _shim_config_at(self, path: str) -> dict:
         try:
             mtime = (Path(path) / SHIM_FILE).stat().st_mtime
         except OSError:
@@ -3352,6 +3382,7 @@ class ExtensionsController(QObject):
 
     # Enable / disable / pin / remove
     def _on_load_finished(self, info) -> None:
+        self._forget_infos()
         job = self._loading.pop(os.path.realpath(info.path()), None) if info.path() else None
         if job is not None:
             self._finish_update(job, info)
@@ -3363,8 +3394,14 @@ class ExtensionsController(QObject):
             return
         if info.isInstalled():
             self._ensure_bridge()
-            ext_id = info.id()
-            QTimer.singleShot(0, lambda: self._apply_enabled(ext_id))
+            if info.id() not in self._loaded_ids:
+                self._loaded_ids.append(info.id())
+            self._apply_loaded.start()
+
+    def _apply_newly_loaded(self) -> None:
+        ids, self._loaded_ids = self._loaded_ids, []
+        for ext_id in ids:  # in one go: one 'changed' for all of them (each has every tab rewired)
+            self._apply_enabled(ext_id)
 
     def _load_without_registered(self, path: str) -> None:
         """An installed extension that doesn't load with the content scripts it registered (written into its manifest -
@@ -3425,17 +3462,21 @@ class ExtensionsController(QObject):
             self.sync_registered(ext_id)  # reloads it - unless it registers the same scripts again first, as most do at start
         if info.isEnabled() != want:
             self.manager.setExtensionEnabled(info, want)
+            self.net.invalidate()  # its request rules apply (or not) at once; the toolbar and tab scripts follow in a pass
             if want:
                 self.bridge.extension_enabled(ext_id)
                 self.reloaded.emit(ext_id)
             else:
                 self.bridge.extension_disabled(ext_id)
-        self.changed.emit()
+        self._changed_timer.start()
 
     def set_enabled(self, ext_id: str, enabled: bool) -> None:
         self.registry.setdefault(ext_id, {})["enabled"] = bool(enabled)
         self.save()
         self._apply_enabled(ext_id)
+        if self._changed_timer.isActive():  # the user's own switch: the toolbar and the extensions dialog follow at once
+            self._changed_timer.stop()
+            self.changed.emit()
 
     def set_pinned(self, ext_id: str, pinned: bool) -> None:
         self.registry.setdefault(ext_id, {})["pinned"] = bool(pinned)
@@ -3466,6 +3507,7 @@ class ExtensionsController(QObject):
         self.manager.uninstallExtension(info)
 
     def _on_uninstall_finished(self, info) -> None:
+        self._forget_infos()
         if info.path() in self._rejected:
             self._rejected.discard(info.path())
             return
@@ -3920,6 +3962,7 @@ class ExtensionsController(QObject):
         self.manager.unloadExtension(info)  # continues in _on_unload_finished
 
     def _on_unload_finished(self, info) -> None:
+        self._forget_infos()
         restore = self._restore_after_reject.pop(info.id(), None)
         if restore is not None:  # a refused copy that took an installed extension's ID (Qt unloads by ID): load that again
             self._rejected.discard(restore[0])
@@ -4112,6 +4155,7 @@ class ExtensionsController(QObject):
         self.manager.installExtension(job["dir"])
 
     def _on_install_finished(self, info) -> None:
+        self._forget_infos()
         # Success reports the installed copy ("<staging name>_XXXXXX"), failure reports the source folder.
         name = Path(info.path()).name if info.path() else ""
         job_key = next((k for k in self._jobs if name == k or name.startswith(k + "_")), None)
@@ -4621,15 +4665,19 @@ class ExtensionBridge(QWebEngineUrlSchemeHandler):
                 out.append(tab)
         return out
 
-    def relay(self, page: QWebEnginePage, ext_id: str, payload: dict, done=None) -> bool:
-        """Hand something to the extension's content scripts in *page* (a DOM event only they know the name of)."""
+    def relay(self, page: QWebEnginePage, ext_id: str, payload: dict, done=None, script: str | None = None) -> bool:
+        """Hand something to the extension's content scripts in *page* (a DOM event only they know the name of) - or
+        *script*, the event made with _relay_script once for many pages."""
         name = self.c.shim_config(ext_id).get("relay")
         if not name or sip.isdeleted(page):
             return False
-        page.runJavaScript(f"!document.dispatchEvent(new CustomEvent({json.dumps(name)}, "
-                           f"{{detail: {json.dumps(json.dumps(payload, default=str))}, cancelable: true}}))",
-                           APP_WORLD, done or (lambda _result: None))
+        page.runJavaScript(self._relay_script(name, payload) if script is None else script, APP_WORLD, done or (lambda _result: None))
         return True
+
+    @staticmethod
+    def _relay_script(name: str, payload: dict) -> str:
+        return (f"!document.dispatchEvent(new CustomEvent({json.dumps(name)}, "
+                f"{{detail: {json.dumps(json.dumps(payload, default=str))}, cancelable: true}}))")
 
     # ── extension life cycle (called by ExtensionsController) ───────────────────────────
     def installed(self, ext_id: str, details: dict) -> None:
@@ -4680,10 +4728,9 @@ class ExtensionBridge(QWebEngineUrlSchemeHandler):
         if page is not None:
             page.deleteLater()
         self._page_listeners.pop(ext_id, None)
-        for call_id, (owner, reply, timer) in list(self._replies.items()):
+        for call_id, (owner, reply, _timer) in list(self._replies.items()):
             if owner == ext_id:
-                self._replies.pop(call_id)
-                timer.stop()
+                self._drop_reply(call_id)
                 reply(error=self.NO_RECEIVER)
         win = self.c.window
         if win is not None:
@@ -4878,9 +4925,12 @@ class ExtensionBridge(QWebEngineUrlSchemeHandler):
 
     def _deliver_storage(self, ext_id: str, area: str, changes: dict, src, eid: str | None, ctx: dict, fallback: bool = False) -> None:
         if area != "session" and (ctx["cs"] or self.c.shim_config(ext_id).get("cs")):
-            payload = {"event": "storage.changed", "args": [area, changes, src], "eid": eid}
-            for tab in self.script_tabs(ext_id):
-                self.relay(tab.page, ext_id, payload)
+            tabs = self.script_tabs(ext_id)
+            name = self.c.shim_config(ext_id).get("relay") if tabs else None
+            if name:  # encoded once for all the tabs: a big value (a vault, a cache) costs milliseconds each time
+                script = self._relay_script(name, {"event": "storage.changed", "args": [area, changes, src], "eid": eid})
+                for tab in tabs:
+                    self.relay(tab.page, ext_id, {}, script=script)
         worker = (self.c.registry.get(ext_id) or {}).get("listeners") or []
         if fallback:  # the writer told no one: the worker (woken) and the open pages (the bridge page's channel) hear it here
             self.emit(ext_id, "storage.changed", [area, changes, src], eid=eid)
@@ -5212,8 +5262,13 @@ class ExtensionBridge(QWebEngineUrlSchemeHandler):
 
     # ── chrome.tabs ─────────────────────────────────────────────────────────────────────
     def api_tabs_query(self, ext_id: str, q: dict, ctx: dict):
+        tabs = self.tabs()
+        if q.get("active") is True or q.get("highlighted") is True:  # the usual query: only these can be (see tab_info)
+            win = self.c.window
+            current = win.current_tab() if win is not None else None
+            tabs = [t for t in tabs if isinstance(t, PopupWindow) or t is current]
         out = []
-        for tab in self.tabs():
+        for tab in tabs:
             info = self.tab_info(ext_id, tab)
             if self._matches_query(q, tab, info):
                 out.append(info)
@@ -5361,23 +5416,29 @@ class ExtensionBridge(QWebEngineUrlSchemeHandler):
         def later(reply) -> None:
             timer = QTimer(self)
             timer.setSingleShot(True)
-            timer.timeout.connect(lambda: self._replies.pop(call_id, None) and reply(error="The message port closed before a response was received."))
+            timer.timeout.connect(lambda: self._drop_reply(call_id) and reply(error="The message port closed before a response was received."))
             timer.start(300_000)
             self._replies[call_id] = (ext_id, reply, timer)  # before delivering: the answer can beat the callback
 
             def delivered(ok) -> None:
-                if ok is not True and self._replies.pop(call_id, None):
-                    timer.stop()
+                if ok is not True and self._drop_reply(call_id):
                     reply(error=self.NO_RECEIVER)
             if not self.relay(tab.page, ext_id, payload, delivered):
                 delivered(False)
         return later
 
+    def _drop_reply(self, call_id: str):
+        """A tabs.sendMessage call is settled: its entry (returned, if it was still waiting) and its timer go."""
+        entry = self._replies.pop(call_id, None)
+        if entry is not None:
+            entry[2].stop()
+            entry[2].deleteLater()
+        return entry
+
     def api_tabs_reply(self, ext_id: str, a: dict, ctx: dict):
         entry = self._replies.get(str(a.get("callId")))
         if entry is not None and entry[0] == ext_id:
-            self._replies.pop(str(a.get("callId")))
-            entry[2].stop()
+            self._drop_reply(str(a.get("callId")))
             entry[1](a.get("value"))
         return None
 
@@ -5829,6 +5890,7 @@ class ExtensionBridge(QWebEngineUrlSchemeHandler):
             self._cookie_waiters.setdefault(key, []).append(waiter)
 
             def gave_up() -> None:
+                timer.deleteLater()
                 if waiter in self._cookie_waiters.get(key, []):
                     self._cookie_waiters[key].remove(waiter)
                     reply(error=f"Failed to parse or set cookie named \"{key[0]}\".")
@@ -5852,6 +5914,7 @@ class ExtensionBridge(QWebEngineUrlSchemeHandler):
         self._cookie_event(cookie, False, "explicit")
         for reply, timer in self._cookie_waiters.pop(key, []):
             timer.stop()
+            timer.deleteLater()
             reply(self._cookie_info(cookie))
 
     def _cookie_removed(self, cookie) -> None:
@@ -17087,8 +17150,9 @@ class BrowserWindow(QMainWindow):
 
     def _rewire_tabs(self) -> None:
         """Installed extensions changed: every tab's tab-id script must know the current ones (from the next load)."""
+        pairs = self.extensions.tab_pairs()  # once for all of them
         for tab in [*self.tabs(), *(p for p in list(self.popups) if not sip.isdeleted(p))]:
-            self.extensions.wire_tab(tab.page, tab.tab_id)
+            self.extensions.wire_tab(tab.page, tab.tab_id, pairs)
 
     def _on_extension_reloaded(self, ext_id: str) -> None:
         """Pages of an extension opened while it was off (or an older version) have no chrome.* APIs: reload them."""

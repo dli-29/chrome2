@@ -635,6 +635,72 @@ def test_toolbar_button_and_shortcut_toggle_the_panel(window):
     assert panel.isVisible()
 
 
+# ── the keyboard focus when a run ends ────────────────────────────────────────────────────
+# (with text shown: Chromium drops the input a page gets before it first shows something)
+COMPOSER = b"""<!doctype html><meta charset="utf-8"><title>Chat</title>
+<p>#general</p><div id=box contenteditable style="min-height:300px"></div>"""
+
+
+def composer(window, server):
+    """The current tab on a chat's message box (full page), with the focus in it."""
+    from PyQt6.QtWidgets import QApplication
+    server.add("/composer", COMPOSER, "text/html; charset=utf-8")
+    tab = window.current_tab()
+    assert load(tab.page, server.url("/composer"))
+    tab.view.setFocus()  # (no click: the typing below is the only input the page gets from the user)
+    run_js(tab.page, "document.getElementById('box').focus()")
+    wait_until(lambda: QApplication.focusWidget() is tab.view.focusProxy()
+               and run_js(tab.page, "document.activeElement.id") == "box", 10, "the message box's focus")
+    return tab
+
+
+def user_types(widget, text: str, how: str) -> None:
+    from PyQt6.QtGui import QInputMethodEvent
+    from PyQt6.QtTest import QTest
+    from PyQt6.QtWidgets import QApplication
+    if how == "keys":
+        QTest.keyClicks(widget, text)
+    else:  # as macOS sends input-method text (accents, emoji, dictation): with sendEvent, not spontaneous
+        event = QInputMethodEvent("", [])
+        event.setCommitString(text)
+        QApplication.sendEvent(widget, event)
+
+
+def box_text(tab) -> str:
+    return run_js(tab.page, "document.getElementById('box').innerText")
+
+
+@pytest.mark.parametrize("how", ["keys", "input method"])
+def test_run_end_leaves_the_focus_where_the_user_types(window, server, how):
+    """A run that ends while the user types in the page (a chat's message box) mustn't pull the focus into the prompt
+    box: the rest of the message - and the Enter that sends it - went to Claude."""
+    from PyQt6.QtWidgets import QApplication
+    window.toggle_agent_panel(True)
+    panel = window.agent_panel
+    tab = composer(window, server)
+    user_types(tab.view.focusProxy(), "hel", how)
+    wait_until(lambda: box_text(tab) == "hel", 10, "the first letters")
+    panel._on_busy(False)  # a run ends
+    user_types(QApplication.focusWidget(), "lo", how)
+    wait_until(lambda: box_text(tab) == "hello" or panel.input.toPlainText(), 10, "the rest of the word")
+    assert box_text(tab) == "hello" and panel.input.toPlainText() == ""
+    assert QApplication.focusWidget() is tab.view.focusProxy()
+
+
+def test_run_end_focuses_the_prompt_box_after_claudes_own_input(window, server):
+    """As before when nobody used the page after Claude's last key there: the prompt box gets the focus back (Claude's
+    own keys, sent like a user's, aren't taken for the user's)."""
+    from PyQt6.QtWidgets import QApplication
+    tab = composer(window, server)
+    user_types(tab.view.focusProxy(), "hi", "keys")  # (the user typed in the page before asking Claude)
+    wait_until(lambda: box_text(tab) == "hi", 10, "the user's typing")
+    users = tab.user_input_at
+    panel = open_panel(window, FakeClient(message(use("press_key", key="x")), message(text("Done."), stop="end_turn")))
+    ask(panel, "Press x in the message box")
+    assert box_text(tab) == "hix" and tab.user_input_at == users < tab.agent_acted_at
+    wait_until(lambda: QApplication.focusWidget() is panel.input, 10, "the prompt box's focus")
+
+
 # ── the API key ───────────────────────────────────────────────────────────────────────────
 @pytest.fixture
 def memory_keyring(fg, monkeypatch):

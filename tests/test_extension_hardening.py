@@ -180,7 +180,9 @@ DNR_RULES = [
      "condition": {"urlFilter": "/old-page", "resourceTypes": ["main_frame"]}},
     {"id": 4, "action": {"type": "redirect", "redirect": {"extensionPath": "/surrogate.js"}},
      "condition": {"urlFilter": "/tracker.js", "resourceTypes": ["script"]}},
-    {"id": 5, "action": {"type": "modifyHeaders", "requestHeaders": [{"header": "X-Foxglove", "operation": "set", "value": "ruled"}]},
+    {"id": 5, "action": {"type": "modifyHeaders", "requestHeaders": [{"header": "X-Foxglove", "operation": "set", "value": "ruled"},
+                                                                     {"header": "X-Requested-With", "operation": "remove"},
+                                                                     {"header": "Accept-Language", "operation": "remove"}]},
      "condition": {"urlFilter": "/echo", "resourceTypes": ["xmlhttprequest"]}},
     {"id": 6, "action": {"type": "redirect", "redirect": {"transform": {"queryTransform": {"removeParams": ["utm_source"]}}}},
      "condition": {"urlFilter": "utm_source=", "resourceTypes": ["main_frame"]}},
@@ -223,7 +225,11 @@ def test_declarative_net_request_rules_are_enforced(window, harness, server, tmp
     assert got == {"/ads/allowed.png", "/ok.png", "/dyn.png", "/sess.png", "/extra.png", "/nohost.png"}  # blocked; allowed; upgraded
     assert run_js(tab.page, "document.documentElement.getAttribute('data-tracker')") == "surrogate"  # redirected to the extension
     assert not [r for r in server.requests if r.startswith("/tracker.js")]
-    assert next(v for k, v in server.headers.items() if k.startswith("/echo")).get("X-Foxglove") == "ruled"
+    echo = next(v for k, v in server.headers.items() if k.startswith("/echo"))
+    assert echo.get("X-Foxglove") == "ruled"
+    assert "X-Requested-With" not in echo, echo  # removing one the page never sent adds nothing (it came, empty)
+    ok = next(v for k, v in server.headers.items() if k.startswith("/ok.png"))
+    assert ok.get("Accept-Language") and not echo.get("Accept-Language")  # (Chromium adds it after the rules: still removed)
 
     page, other = ext_page(harness, entry), ext_page(harness, nohost)
     run_js_async(page, f"""await chrome.declarativeNetRequest.updateDynamicRules({{addRules: [
@@ -275,6 +281,25 @@ def test_rule_precedence(fg):
     headers = {"id": 4, "priority": 9, "action": {"type": "modifyHeaders", "requestHeaders": [{"header": "a", "operation": "set", "value": "b"}]},
                "condition": {"urlFilter": "x.js"}}
     assert outcome([block, allow_page, headers]) == (None, [4])  # the page is allowed; a higher rule still changes headers
+
+
+def test_header_removal_adds_no_header(fg):
+    """modifyHeaders "remove" set an empty header even on a request that didn't have it: "X-Requested-With: " on every
+    match. One the request has is emptied (Qt can't drop it); one Chromium adds after the interceptor still is."""
+    class Info:  # what NetRules._headers sees of a request
+        def __init__(self):
+            self.h = {b"X-Debug-Options": b"bugReporterEnabled", b"Origin": b"https://a.example"}
+        httpHeaders = lambda self: dict(self.h)
+
+        def setHttpHeader(self, name, value):  # (as Qt: it replaces the header in any case)
+            self.h = {k: v for k, v in self.h.items() if k.lower() != bytes(name).lower()} | {bytes(name): bytes(value)}
+
+    rule = fg.NetRule({"id": 1, "action": {"type": "modifyHeaders", "requestHeaders": [
+        {"header": name, "operation": "remove"} for name in ("X-Requested-With", "x-debug-options", "Accept-Language", "Accept-Encoding")]},
+        "condition": {"urlFilter": "/x"}}, "r")
+    info = Info()
+    fg.NetRules._headers(info, rule)
+    assert info.h == {b"Origin": b"https://a.example", b"x-debug-options": b"", b"Accept-Language": b"", b"Accept-Encoding": b""}
 
 
 @pytest.mark.parametrize("pattern, url, hit", [

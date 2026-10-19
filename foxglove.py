@@ -6191,6 +6191,7 @@ def _suffixes(host: str) -> list[str]:
 DNR_URL_LIMIT = 8192    # how much of a URL declarativeNetRequest rules look at: a page can't make matching slow with a long one
 DNR_REGEX_URL_LIMIT = 2048  # ... for regexFilter rules when only Python's (backtracking) re is there
 DNR_REGEX_MAX = 2000    # a longer regexFilter wouldn't fit Chrome's 2 KB RE2 program either
+NET_LATE_HEADERS = frozenset(("accept-language", "accept-encoding"))  # request headers Chromium adds after the interceptor ran
 _URL_SEPARATOR = r"(?:[^A-Za-z0-9_\-.%]|\Z)"  # urlFilter's "^": a separator character, or the end of the URL
 _URL_AUTHORITY = re.compile(r"[a-z][a-z0-9+.-]*://(?:[^/?#@]*@)?", re.I)  # where "||" looks for the host
 _LITERAL = re.compile(r"[^*^|]+")  # a urlFilter's runs of plain characters
@@ -6705,7 +6706,11 @@ class NetRules:
                 old = current.get(name.lower())
                 info.setHttpHeader(name.encode(), old + b", " + value if old else value)
             elif change.get("operation") == "remove":
-                info.setHttpHeader(name.encode(), b"")  # Qt can't drop a header: an empty one is the closest
+                # Qt can't drop a header: an empty one is the closest. One the request doesn't have stays out (an empty
+                # one would be added), but those Chromium adds after this filter are never seen here: always emptied
+                if current.pop(name.lower(), None) is not None or name.lower() in NET_LATE_HEADERS:
+                    info.setHttpHeader(name.encode(), b"")
+                continue
             current[name.lower()] = value
 
 
@@ -12118,6 +12123,10 @@ class AutofillPopup(QFrame):
     def eventFilter(self, watched, event) -> bool:
         kind = event.type()
         if watched is self._proxy and self._proxy is not None:
+            if kind == QEvent.Type.ShortcutOverride and self.target is not None and self.isVisible() and \
+                    event.key() in (Qt.Key.Key_Down, Qt.Key.Key_Up):
+                event.accept()  # (the list takes this key: else Qt WebEngine keeps its edit command - MoveDown - for
+                return True     #  the key press it never gets, and runs it with the page's NEXT key instead of that key)
             if kind == QEvent.Type.KeyPress and self.target is not None and self.isVisible():
                 key = event.key()
                 if key in (Qt.Key.Key_Down, Qt.Key.Key_Up):

@@ -3,7 +3,9 @@ the focused side of a split view drives (address bar, find, zoom, extension APIs
 page gets first."""
 from __future__ import annotations
 
+import os
 import re
+import signal
 from urllib.parse import quote, unquote
 
 from PyQt6.QtCore import QEvent, QPointF, Qt, QUrl
@@ -536,3 +538,30 @@ def test_shortcuts_the_page_leaves_alone_still_run_once(window):
     press(tab, Qt.Key.Key_F)
     wait_until(lambda: window.find_bar.isVisible(), 10, "Ctrl+F to open the find bar")
     assert page_keys(tab) == ["k", "f"]
+
+
+def test_a_crashed_tab_runs_the_browser_shortcuts_at_once(window, server):
+    """A crashed tab has no page widget: no page to give Ctrl+L / Ctrl+F to first (they did nothing at all)."""
+    server.add("/crashing", b"<!doctype html><title>Crashing</title><p>gone soon</p>", "text/html; charset=utf-8")
+    tab = window.new_tab(None)  # (a site of its own: its own renderer)
+    assert loaded(window, tab, QUrl(server.url("/crashing")))
+    os.kill(tab.page.renderProcessPid(), signal.SIGKILL)
+    wait_until(lambda: tab.crashed and tab.view.focusProxy() is None, 15, "the tab to crash")
+    window.focus_tab(tab)
+    tab.view.setFocus()
+    wait_until(lambda: QApplication.focusWidget() is tab.view, 10, "the crashed tab's focus")
+    QTest.keyClick(tab.view, Qt.Key.Key_L, Qt.KeyboardModifier.ControlModifier)
+    wait_until(lambda: window.url_bar.hasFocus(), 10, "Ctrl+L to focus the address bar")
+    tab.view.setFocus()
+    QTest.keyClick(tab.view, Qt.Key.Key_F, Qt.KeyboardModifier.ControlModifier)
+    wait_until(lambda: window.find_bar.isVisible(), 10, "Ctrl+F to open the find bar")
+
+
+def test_browser_shortcuts_are_not_typing(window):
+    """Ctrl+F, Ctrl+L... reach the page first now, but they aren't typing: Memory Saver may still free the tab."""
+    tab = keys_page(window, handles=False)
+    spin(0.3)
+    assert not tab.typed
+    press(tab, Qt.Key.Key_F)
+    wait_until(lambda: window.find_bar.isVisible(), 10, "Ctrl+F to open the find bar")
+    assert page_keys(tab) == ["f"] and not tab.typed

@@ -6191,7 +6191,8 @@ def _suffixes(host: str) -> list[str]:
 DNR_URL_LIMIT = 8192    # how much of a URL declarativeNetRequest rules look at: a page can't make matching slow with a long one
 DNR_REGEX_URL_LIMIT = 2048  # ... for regexFilter rules when only Python's (backtracking) re is there
 DNR_REGEX_MAX = 2000    # a longer regexFilter wouldn't fit Chrome's 2 KB RE2 program either
-NET_LATE_HEADERS = frozenset(("accept-language", "accept-encoding"))  # request headers Chromium adds after the interceptor ran
+# request headers Chromium (and Qt, for User-Agent on a WebSocket handshake) add after the interceptor: never seen there
+NET_LATE_HEADERS = frozenset(("accept-language", "accept-encoding", "user-agent"))
 _URL_SEPARATOR = r"(?:[^A-Za-z0-9_\-.%]|\Z)"  # urlFilter's "^": a separator character, or the end of the URL
 _URL_AUTHORITY = re.compile(r"[a-z][a-z0-9+.-]*://(?:[^/?#@]*@)?", re.I)  # where "||" looks for the host
 _LITERAL = re.compile(r"[^*^|]+")  # a urlFilter's runs of plain characters
@@ -7694,13 +7695,14 @@ class Tab(QWidget):
 
     def eventFilter(self, watched, event) -> bool:  # (on the view and its page widgets: __init__, WebView.childEvent)
         kind = event.type()
-        if watched is self.view:  # (a ShortcutOverride Qt WebEngine's page widget left: not an editing key in a field)
-            if kind == QEvent.Type.ShortcutOverride and self.win.page_first(event):
+        if watched is self.view:  # (a ShortcutOverride Qt WebEngine's page widget left: not an editing key in a field;
+                                  #  no page widget - a crashed tab - no page to give it to: the browser's at once)
+            if kind == QEvent.Type.ShortcutOverride and self.view.focusProxy() is not None and self.win.page_first(event):
                 event.accept()  # the page sees the key first, as in Chrome: one it leaves alone comes back from Qt
                 return True     # WebEngine as an unhandled key, and Qt's shortcut map runs the browser's action then
             return False
-        if kind == QEvent.Type.InputMethod or (kind == QEvent.Type.KeyPress and event.text()):
-            self.typed = True
+        if kind == QEvent.Type.InputMethod or (kind == QEvent.Type.KeyPress and event.text() and not self.win.page_first(event)):
+            self.typed = True  # (Cmd+F, Cmd+L...: a browser shortcut the page saw first, not typing)
         # (not event.spontaneous(): macOS sends input-method text - accents, emoji, dictation - with sendEvent too)
         user = kind in (QEvent.Type.KeyPress, QEvent.Type.InputMethod, QEvent.Type.MouseButtonPress)
         if user and not self.agent_sending:
@@ -15259,6 +15261,7 @@ class AgentPanel(QFrame):
         self._open: dict[str, QLabel | None] = {"text": None, "thinking": None}
         self._key_where: str | None = None  # where the key is from, once looked up (the keychain is asked only once)
         self.hint: QLabel | None = None
+        self._run_started = 0.0  # (monotonic) only the user's input in the page since then keeps the focus there
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -15526,6 +15529,8 @@ class AgentPanel(QFrame):
         self.stop_button.setVisible(busy)
         self.send_button.setVisible(not busy)
         self.model_box.setEnabled(not busy)
+        if busy:
+            self._run_started = time.monotonic()
         self.status.setText("Claude is working…" if busy else "")
         self.win.agent_button.setToolTip("Claude is working - click to show the panel" if busy else self.win.agent_tip)
         if not busy and self.isVisible() and self._may_take_focus():
@@ -15534,12 +15539,21 @@ class AgentPanel(QFrame):
     def _may_take_focus(self) -> bool:
         """Whether the prompt box may take the focus back as a run ends: not from where the user went on typing or
         clicking meanwhile (a chat's message box: the rest of the message, and its Enter, would go to Claude)."""
-        focus = QApplication.focusWidget() or self.win.focusWidget()
+        focus = QApplication.focusWidget()
+        if focus is not None and focus.window() is not self.win:
+            if self.win.isActiveWindow():
+                return False  # (a pop-up of this window in use: the bookmark, VPN or an extension's panel)
+            focus = None      # (another window is active: this one's own focus, for when the user comes back)
+        if focus is None:
+            focus = self.win.focusWidget()
         if focus is None or focus is self or self.isAncestorOf(focus):
             return True
         tab = self.win.current_tab()
-        return (tab is not None and (focus is tab.view or tab.view.isAncestorOf(focus))
-                and tab.user_input_at <= tab.agent_acted_at)
+        if tab is not None and (focus is tab.view or tab.view.isAncestorOf(focus)):  # the page: unless used during the run
+            return tab.user_input_at <= max(tab.agent_acted_at, self._run_started)
+        # elsewhere: the button a click left it on, the address bar of Claude's new tab - not an address or search the
+        # user is typing, nor DevTools
+        return not (isinstance(focus, QLineEdit) and focus.isModified()) and not isinstance(focus.parentWidget(), QWebEngineView)
 
     def _on_tab_changed(self) -> None:
         if self.session.running:  # Claude acts on the current tab, so the indicator goes with it

@@ -300,6 +300,13 @@ def test_header_removal_adds_no_header(fg):
     info = Info()
     fg.NetRules._headers(info, rule)
     assert info.h == {b"Origin": b"https://a.example", b"x-debug-options": b"", b"Accept-Language": b"", b"Accept-Encoding": b""}
+    # a WebSocket handshake: Qt shows the interceptor no headers and adds User-Agent after it, unless one was set
+    rule = fg.NetRule({"id": 2, "action": {"type": "modifyHeaders", "requestHeaders": [
+        {"header": name, "operation": "remove"} for name in ("User-Agent", "X-Gone")]}, "condition": {"urlFilter": "/ws"}}, "r")
+    info = Info()
+    info.h = {}
+    fg.NetRules._headers(info, rule)
+    assert info.h == {b"User-Agent": b""}
 
 
 @pytest.mark.parametrize("pattern, url, hit", [

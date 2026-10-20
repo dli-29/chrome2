@@ -599,7 +599,25 @@ def test_backspace_skips_qt_webengines_backward_delete_command(window):
     assert tab.eventFilter(proxy, key_press) is False  # (the key itself goes on to the page)
 
 
+def test_backspace_override_in_pop_ups_too(fg, window, server):
+    """window.open pop-ups (sign-in windows) and extension pop-ups are plain web views: the same rule for Backspace."""
+    server.add("/opener", b"<!doctype html><title>Opener</title><p>opener</p>", "text/html; charset=utf-8")
+    server.add("/popped", b"<!doctype html><title>Popped</title><div contenteditable>x</div>", "text/html; charset=utf-8")
+    tab = loaded(window, window.current_tab(), QUrl(server.url("/opener")))
+    run_js(tab.page, f"window.open({server.url('/popped')!r}, 'p', 'width=400,height=300') && 1")
+    popup = wait_until(lambda: next(iter(window.popups), None), 10, "the pop-up window")
+    wait_until(lambda: popup.view.focusProxy() is not None and "/popped" in popup.view.url().toString(), 10, "its page")
+    assert isinstance(popup.view, fg.PageView)
+    override = QKeyEvent(QEvent.Type.ShortcutOverride, Qt.Key.Key_Backspace, Qt.KeyboardModifier.NoModifier)
+    override.ignore()
+    QApplication.sendEvent(popup.view.focusProxy(), override)
+    assert override.isAccepted()
+    popup.close()
+
+
 def test_backspace_deletes_from_a_slate_like_editors_model(window):
+    """(On Linux Qt WebEngine never stored "BackwardDelete": this passes without the fix too. It shows that taking the
+    override leaves deletion, a held Backspace and Shift+Backspace working; the test above guards the fix itself.)"""
     tab = box_page(window, SLATE)
     proxy = tab.view.focusProxy()
 

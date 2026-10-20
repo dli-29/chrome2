@@ -7588,6 +7588,35 @@ class WebPage(QWebEnginePage):
                 pass
 
 
+def takes_backspace(event: QEvent) -> bool:
+    """A plain Backspace's ShortcutOverride, taken from Qt WebEngine's page widget. On macOS Qt WebEngine makes it its
+    "BackwardDelete" command, which Blink runs without a beforeinput event: editors with a model of their own (Slate:
+    Discord) never saw the deletion, and the text came back on send. Taken, the key goes on and Blink's own
+    DeleteBackward fires beforeinput, as in Chrome. (Shift/Option/Cmd+Backspace have commands that do; Control+H stays.)"""
+    if (event.type() == QEvent.Type.ShortcutOverride and event.key() == Qt.Key.Key_Backspace
+            and not event.modifiers() & ~Qt.KeyboardModifier.KeypadModifier):
+        event.accept()
+        return True
+    return False
+
+
+class _PageKeys(QObject):
+    def eventFilter(self, watched, event) -> bool:
+        return takes_backspace(event)
+
+
+class PageView(QWebEngineView):
+    """A web view that isn't a tab's (pop-up windows, extension pop-ups): its page widgets get takes_backspace too."""
+    _keys: _PageKeys | None = None
+
+    def childEvent(self, event) -> None:
+        super().childEvent(event)
+        if event.added() and event.child().isWidgetType():
+            if PageView._keys is None or sip.isdeleted(PageView._keys):
+                PageView._keys = _PageKeys(QApplication.instance())
+            event.child().installEventFilter(PageView._keys)
+
+
 class WebView(QWebEngineView):
     def __init__(self, tab: "Tab"):
         super().__init__()
@@ -7701,10 +7730,8 @@ class Tab(QWidget):
                 event.accept()  # the page sees the key first, as in Chrome: one it leaves alone comes back from Qt
                 return True     # WebEngine as an unhandled key, and Qt's shortcut map runs the browser's action then
             return False
-        if (kind == QEvent.Type.ShortcutOverride and event.key() == Qt.Key.Key_Backspace
-                and not event.modifiers() & ~Qt.KeyboardModifier.KeypadModifier):
-            event.accept()  # macOS: Qt WebEngine made Backspace its "BackwardDelete", which fires no beforeinput, so
-            return True     # Discord's deleted text came back on send. Taken here: the key goes on, Blink deletes
+        if takes_backspace(event):  # (macOS: Discord's deleted text came back on send)
+            return True
         if kind == QEvent.Type.InputMethod or (kind == QEvent.Type.KeyPress and event.text() and not self.win.page_first(event)):
             self.typed = True  # (Cmd+F, Cmd+L...: a browser shortcut the page saw first, not typing)
         # (not event.spontaneous(): macOS sends input-method text - accents, emoji, dictation - with sendEvent too)
@@ -9145,7 +9172,7 @@ class ExtensionPopup(Panel):
         self.ext_id = ext_id or url.host()
         layout = QVBoxLayout(self)
         layout.setContentsMargins(1, 1, 1, 1)
-        self.view = QWebEngineView(self)
+        self.view = PageView(self)
         self.page = WebPage(win.profile, self.view)
         self.view.setPage(self.page)
         self.view.setFixedSize(360, 160)
@@ -9397,7 +9424,7 @@ class PopupWindow(QWidget):
         self.header = QLabel()
         self.header.setTextFormat(Qt.TextFormat.PlainText)
         self.header.setObjectName("PopupUrl")
-        self.view = QWebEngineView(self)
+        self.view = PageView(self)
         self.page = WebPage(win.profile, self.view)
         self.view.setPage(self.page)
         self.tab_id, self.window_id = next(_TAB_IDS), next(_WINDOW_IDS)  # a window of its own for chrome.windows

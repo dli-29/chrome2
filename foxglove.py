@@ -7701,6 +7701,10 @@ class Tab(QWidget):
                 event.accept()  # the page sees the key first, as in Chrome: one it leaves alone comes back from Qt
                 return True     # WebEngine as an unhandled key, and Qt's shortcut map runs the browser's action then
             return False
+        if (kind == QEvent.Type.ShortcutOverride and event.key() == Qt.Key.Key_Backspace
+                and not event.modifiers() & ~Qt.KeyboardModifier.KeypadModifier):
+            event.accept()  # macOS: Qt WebEngine made Backspace its "BackwardDelete", which fires no beforeinput, so
+            return True     # Discord's deleted text came back on send. Taken here: the key goes on, Blink deletes
         if kind == QEvent.Type.InputMethod or (kind == QEvent.Type.KeyPress and event.text() and not self.win.page_first(event)):
             self.typed = True  # (Cmd+F, Cmd+L...: a browser shortcut the page saw first, not typing)
         # (not event.spontaneous(): macOS sends input-method text - accents, emoji, dictation - with sendEvent too)

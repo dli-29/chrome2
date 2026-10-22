@@ -635,6 +635,173 @@ def test_toolbar_button_and_shortcut_toggle_the_panel(window):
     assert panel.isVisible()
 
 
+# ── the keyboard focus when a run ends ────────────────────────────────────────────────────
+# (with text shown: Chromium drops the input a page gets before it first shows something)
+COMPOSER = b"""<!doctype html><meta charset="utf-8"><title>Chat</title>
+<p>#general</p><div id=box contenteditable style="min-height:300px"></div>"""
+
+
+def composer(window, server):
+    """The current tab on a chat's message box (full page), with the focus in it."""
+    from PyQt6.QtWidgets import QApplication
+    server.add("/composer", COMPOSER, "text/html; charset=utf-8")
+    tab = window.current_tab()
+    assert load(tab.page, server.url("/composer"))
+    tab.view.setFocus()  # (no click: the typing below is the only input the page gets from the user)
+    run_js(tab.page, "document.getElementById('box').focus()")
+    wait_until(lambda: QApplication.focusWidget() is tab.view.focusProxy()
+               and run_js(tab.page, "document.activeElement.id") == "box", 10, "the message box's focus")
+    return tab
+
+
+def user_types(widget, text: str, how: str) -> None:
+    from PyQt6.QtGui import QInputMethodEvent
+    from PyQt6.QtTest import QTest
+    from PyQt6.QtWidgets import QApplication
+    if how == "keys":
+        QTest.keyClicks(widget, text)
+    else:  # as macOS sends input-method text (accents, emoji, dictation): with sendEvent, not spontaneous
+        event = QInputMethodEvent("", [])
+        event.setCommitString(text)
+        QApplication.sendEvent(widget, event)
+
+
+def box_text(tab) -> str:
+    return run_js(tab.page, "document.getElementById('box').innerText")
+
+
+@pytest.mark.parametrize("how", ["keys", "input method"])
+def test_run_end_leaves_the_focus_where_the_user_types(window, server, how):
+    """A run that ends while the user types in the page (a chat's message box) mustn't pull the focus into the prompt
+    box: the rest of the message - and the Enter that sends it - went to Claude."""
+    from PyQt6.QtWidgets import QApplication
+    window.toggle_agent_panel(True)
+    panel = window.agent_panel
+    tab = composer(window, server)
+    user_types(tab.view.focusProxy(), "hel", how)
+    wait_until(lambda: box_text(tab) == "hel", 10, "the first letters")
+    panel._on_busy(False)  # a run ends
+    user_types(QApplication.focusWidget(), "lo", how)
+    wait_until(lambda: box_text(tab) == "hello" or panel.input.toPlainText(), 10, "the rest of the word")
+    assert box_text(tab) == "hello" and panel.input.toPlainText() == ""
+    assert QApplication.focusWidget() is tab.view.focusProxy()
+
+
+def test_run_end_focuses_the_prompt_box_after_claudes_own_input(window, server):
+    """As before when nobody used the page after Claude's last key there: the prompt box gets the focus back (Claude's
+    own keys, sent like a user's, aren't taken for the user's)."""
+    from PyQt6.QtWidgets import QApplication
+    tab = composer(window, server)
+    user_types(tab.view.focusProxy(), "hi", "keys")  # (the user typed in the page before asking Claude)
+    wait_until(lambda: box_text(tab) == "hi", 10, "the user's typing")
+    users = tab.user_input_at
+    panel = open_panel(window, FakeClient(message(use("press_key", key="x")), message(text("Done."), stop="end_turn")))
+    ask(panel, "Press x in the message box")
+    assert box_text(tab) == "hix" and tab.user_input_at == users < tab.agent_acted_at
+    wait_until(lambda: QApplication.focusWidget() is panel.input, 10, "the prompt box's focus")
+
+
+@pytest.mark.parametrize("how", ["send", "stop", "indicator stop"])
+def test_run_end_focuses_the_prompt_box_after_a_button_click(window, server, how):
+    """A click on Send or Stop leaves the focus wherever Qt moves it from the hidden button (the address bar): the
+    prompt box still takes it back - only the user's own input in the page during the run keeps it there."""
+    from PyQt6.QtCore import Qt
+    from PyQt6.QtTest import QTest
+    from PyQt6.QtWidgets import QApplication, QPushButton
+    tab = composer(window, server)
+    user_types(tab.view.focusProxy(), "hi", "keys")  # (before the run: doesn't count)
+    wait_until(lambda: box_text(tab) == "hi", 10, "the user's typing")
+    if how == "send":
+        panel = open_panel(window, FakeClient(message(use("read_page")), message(text("Done."), stop="end_turn")))
+        panel.focus_input()
+        panel.input.setPlainText("Summarize")
+        QTest.mouseClick(panel.send_button, Qt.MouseButton.LeftButton)
+    else:
+        panel = open_panel(window, FakeClient(FakeStream(None, gate=True)))
+        panel.focus_input()
+        panel.input.setPlainText("Do it")
+        panel.submit()
+        if how == "stop":
+            wait_until(lambda: panel.stop_button.isVisible(), 10, "the run")
+            QTest.mouseClick(panel.stop_button, Qt.MouseButton.LeftButton)
+        else:
+            wait_until(lambda: panel.indicator.pill is not None and panel.indicator.pill.isVisible(), 10, "the indicator")
+            stop = next(b for b in panel.indicator.pill.findChildren(QPushButton) if b.text() == "Stop")
+            QTest.mouseClick(stop, Qt.MouseButton.LeftButton)
+    wait_until(lambda: not panel.session.running, 30, "the run to end")
+    wait_until(lambda: QApplication.focusWidget() is panel.input, 10, "the prompt box's focus")
+
+
+def test_run_end_focuses_the_prompt_box_after_claude_moved_the_focus(window, server):
+    """Claude's new tab (the address bar has the focus) or a switch to a tab the user used before the run (its page has
+    it): no input from the user during the run, so the prompt box takes the focus back."""
+    from PyQt6.QtCore import QPoint, Qt
+    from PyQt6.QtTest import QTest
+    from PyQt6.QtWidgets import QApplication
+    first = window.current_tab()
+    other = composer(window, server)  # (composer: the current tab...)
+    QTest.mouseClick(other.view.focusProxy(), Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier, QPoint(50, 50))
+    assert other.user_input_at > 0
+    window.focus_tab(window.new_tab(None))
+    panel = open_panel(window, FakeClient(message(use("switch_tab", index=window.tabs().index(other))),
+                                          message(text("Done."), stop="end_turn")))
+    panel.focus_input()
+    ask(panel, "Switch to the chat tab")
+    assert window.current_tab() is other
+    wait_until(lambda: QApplication.focusWidget() is panel.input, 10, "the prompt box's focus after switch_tab")
+    panel = open_panel(window, FakeClient(message(use("new_tab")), message(text("Done."), stop="end_turn")))
+    panel.focus_input()
+    ask(panel, "Open a new tab")
+    assert window.current_tab() not in (first, other)
+    wait_until(lambda: QApplication.focusWidget() is panel.input, 10, "the prompt box's focus after new_tab")
+
+
+def test_run_end_leaves_an_address_the_user_types(window):
+    """The user went on to type an address during the run: it stays where it is."""
+    from PyQt6.QtCore import Qt
+    from PyQt6.QtTest import QTest
+    from PyQt6.QtWidgets import QApplication
+    panel = open_panel(window, FakeClient(FakeStream(None, gate=True)))
+    panel.focus_input()
+    panel.input.setPlainText("Do it")
+    panel.submit()
+    wait_until(lambda: panel.session.running, 10, "the run")
+    QTest.mouseClick(window.url_bar, Qt.MouseButton.LeftButton)
+    QTest.keyClicks(window.url_bar, "exam")
+    panel.session.stop()
+    wait_until(lambda: not panel.session.running, 10, "the run to end")
+    spin(0.3)
+    assert QApplication.focusWidget() is window.url_bar and panel.input.toPlainText() == ""
+
+
+def test_run_end_in_a_window_left_meanwhile(window, harness, server):
+    """The user went to another window during the run: this window's prompt box gets its focus back for when they
+    return (not the field Claude typed in), and the other window keeps its own."""
+    from PyQt6.QtWidgets import QApplication
+    tab = composer(window, server)
+    other = harness.window()
+    window.activateWindow()
+    wait_until(lambda: QApplication.activeWindow() is window, 10, "this window to be active")
+    waiting, release = threading.Event(), threading.Event()
+
+    def later(_params):
+        waiting.set()
+        release.wait(20)
+        return message(text("Done."), stop="end_turn")
+
+    panel = open_panel(window, FakeClient(message(use("press_key", key="x")), later))
+    panel.input.setPlainText("Press x")
+    panel.submit()
+    wait_until(waiting.is_set, 20, "Claude's second request")
+    other.activateWindow()
+    other.raise_()
+    wait_until(lambda: QApplication.activeWindow() is other, 10, "the other window to be active")
+    release.set()
+    wait_until(lambda: not panel.session.running, 20, "the run to end")
+    wait_until(lambda: window.focusWidget() is panel.input, 10, "this window's focus on the prompt box")
+    assert QApplication.activeWindow() is other and box_text(tab) == "x"
+
+
 # ── the API key ───────────────────────────────────────────────────────────────────────────
 @pytest.fixture
 def memory_keyring(fg, monkeypatch):

@@ -6191,6 +6191,8 @@ def _suffixes(host: str) -> list[str]:
 DNR_URL_LIMIT = 8192    # how much of a URL declarativeNetRequest rules look at: a page can't make matching slow with a long one
 DNR_REGEX_URL_LIMIT = 2048  # ... for regexFilter rules when only Python's (backtracking) re is there
 DNR_REGEX_MAX = 2000    # a longer regexFilter wouldn't fit Chrome's 2 KB RE2 program either
+# request headers Chromium (and Qt, for User-Agent on a WebSocket handshake) add after the interceptor: never seen there
+NET_LATE_HEADERS = frozenset(("accept-language", "accept-encoding", "user-agent"))
 _URL_SEPARATOR = r"(?:[^A-Za-z0-9_\-.%]|\Z)"  # urlFilter's "^": a separator character, or the end of the URL
 _URL_AUTHORITY = re.compile(r"[a-z][a-z0-9+.-]*://(?:[^/?#@]*@)?", re.I)  # where "||" looks for the host
 _LITERAL = re.compile(r"[^*^|]+")  # a urlFilter's runs of plain characters
@@ -6705,7 +6707,11 @@ class NetRules:
                 old = current.get(name.lower())
                 info.setHttpHeader(name.encode(), old + b", " + value if old else value)
             elif change.get("operation") == "remove":
-                info.setHttpHeader(name.encode(), b"")  # Qt can't drop a header: an empty one is the closest
+                # Qt can't drop a header: an empty one is the closest. One the request doesn't have stays out (an empty
+                # one would be added), but those Chromium adds after this filter are never seen here: always emptied
+                if current.pop(name.lower(), None) is not None or name.lower() in NET_LATE_HEADERS:
+                    info.setHttpHeader(name.encode(), b"")
+                continue
             current[name.lower()] = value
 
 
@@ -7582,10 +7588,44 @@ class WebPage(QWebEnginePage):
                 pass
 
 
+def takes_backspace(event: QEvent) -> bool:
+    """A plain Backspace's ShortcutOverride, taken from Qt WebEngine's page widget. On macOS Qt WebEngine makes it its
+    "BackwardDelete" command, which Blink runs without a beforeinput event: editors with a model of their own (Slate:
+    Discord) never saw the deletion, and the text came back on send. Taken, the key goes on and Blink's own
+    DeleteBackward fires beforeinput, as in Chrome. (Shift/Option/Cmd+Backspace have commands that do; Control+H stays.)"""
+    if (event.type() == QEvent.Type.ShortcutOverride and event.key() == Qt.Key.Key_Backspace
+            and not event.modifiers() & ~Qt.KeyboardModifier.KeypadModifier):
+        event.accept()
+        return True
+    return False
+
+
+class _PageKeys(QObject):
+    def eventFilter(self, watched, event) -> bool:
+        return takes_backspace(event)
+
+
+class PageView(QWebEngineView):
+    """A web view that isn't a tab's (pop-up windows, extension pop-ups): its page widgets get takes_backspace too."""
+    _keys: _PageKeys | None = None
+
+    def childEvent(self, event) -> None:
+        super().childEvent(event)
+        if event.added() and event.child().isWidgetType():
+            if PageView._keys is None or sip.isdeleted(PageView._keys):
+                PageView._keys = _PageKeys(QApplication.instance())
+            event.child().installEventFilter(PageView._keys)
+
+
 class WebView(QWebEngineView):
     def __init__(self, tab: "Tab"):
         super().__init__()
         self.tab = tab
+
+    def childEvent(self, event) -> None:  # Qt WebEngine's page widget, the focus proxy (each renderer brings its own):
+        super().childEvent(event)          # Tab.eventFilter watches it from the start, before the page has loaded
+        if event.added() and event.child().isWidgetType():
+            event.child().installEventFilter(self.tab)
 
     def contextMenuEvent(self, event) -> None:
         self.tab.win.show_page_context_menu(self.tab, event.globalPos())
@@ -7636,6 +7676,11 @@ class Tab(QWidget):
         self.hidden_since: float | None = time.monotonic()  # out of sight since (None: shown)
         self.keep_awake = ""                  # origin given camera/mic/screen here: a call, never discarded
         self.typed = False                    # typed into since its page loaded: drafts may live only in its scripts
+        # Claude's panel takes the focus back after a run only if nobody used the page since Claude's last input there
+        self.user_input_at = 0.0              # the user's last key, click or input-method text in the page (monotonic)
+        self.agent_acted_at = 0.0             # Claude's last key, click or typing here (AgentBrowser._send)
+        self.agent_sending = False            # an event being sent is Claude's, not the user's
+        self.view.installEventFilter(self)    # (the page first for a browser shortcut: eventFilter)
         self.page.visibleChanged.connect(self._visible_changed)
 
     # State
@@ -7677,9 +7722,22 @@ class Tab(QWidget):
     def _visible_changed(self, visible: bool) -> None:
         self.hidden_since = None if visible else time.monotonic()
 
-    def eventFilter(self, watched, event) -> bool:  # (on the page's focus proxy: BrowserWindow._on_load_finished)
-        if event.type() == QEvent.Type.InputMethod or (event.type() == QEvent.Type.KeyPress and event.text()):
-            self.typed = True
+    def eventFilter(self, watched, event) -> bool:  # (on the view and its page widgets: __init__, WebView.childEvent)
+        kind = event.type()
+        if watched is self.view:  # (a ShortcutOverride Qt WebEngine's page widget left: not an editing key in a field;
+                                  #  no page widget - a crashed tab - no page to give it to: the browser's at once)
+            if kind == QEvent.Type.ShortcutOverride and self.view.focusProxy() is not None and self.win.page_first(event):
+                event.accept()  # the page sees the key first, as in Chrome: one it leaves alone comes back from Qt
+                return True     # WebEngine as an unhandled key, and Qt's shortcut map runs the browser's action then
+            return False
+        if takes_backspace(event):  # (macOS: Discord's deleted text came back on send)
+            return True
+        if kind == QEvent.Type.InputMethod or (kind == QEvent.Type.KeyPress and event.text() and not self.win.page_first(event)):
+            self.typed = True  # (Cmd+F, Cmd+L...: a browser shortcut the page saw first, not typing)
+        # (not event.spontaneous(): macOS sends input-method text - accents, emoji, dictation - with sendEvent too)
+        user = kind in (QEvent.Type.KeyPress, QEvent.Type.InputMethod, QEvent.Type.MouseButtonPress)
+        if user and not self.agent_sending:
+            self.user_input_at = time.monotonic()
         return False
 
     # Loading
@@ -9114,7 +9172,7 @@ class ExtensionPopup(Panel):
         self.ext_id = ext_id or url.host()
         layout = QVBoxLayout(self)
         layout.setContentsMargins(1, 1, 1, 1)
-        self.view = QWebEngineView(self)
+        self.view = PageView(self)
         self.page = WebPage(win.profile, self.view)
         self.view.setPage(self.page)
         self.view.setFixedSize(360, 160)
@@ -9366,7 +9424,7 @@ class PopupWindow(QWidget):
         self.header = QLabel()
         self.header.setTextFormat(Qt.TextFormat.PlainText)
         self.header.setObjectName("PopupUrl")
-        self.view = QWebEngineView(self)
+        self.view = PageView(self)
         self.page = WebPage(win.profile, self.view)
         self.view.setPage(self.page)
         self.tab_id, self.window_id = next(_TAB_IDS), next(_WINDOW_IDS)  # a window of its own for chrome.windows
@@ -12118,6 +12176,10 @@ class AutofillPopup(QFrame):
     def eventFilter(self, watched, event) -> bool:
         kind = event.type()
         if watched is self._proxy and self._proxy is not None:
+            if kind == QEvent.Type.ShortcutOverride and self.target is not None and self.isVisible() and \
+                    event.key() in (Qt.Key.Key_Down, Qt.Key.Key_Up):
+                event.accept()  # (the list takes this key: else Qt WebEngine keeps its edit command - MoveDown - for
+                return True     #  the key press it never gets, and runs it with the page's NEXT key instead of that key)
             if kind == QEvent.Type.KeyPress and self.target is not None and self.isVisible():
                 key = event.key()
                 if key in (Qt.Key.Key_Down, Qt.Key.Key_Up):
@@ -14100,6 +14162,15 @@ class AgentBrowser:
     def _input_target(tab: "Tab") -> QWidget:
         return tab.view.focusProxy() or tab.view  # Chromium's own widget: input sent there is trusted like a user's
 
+    @staticmethod
+    def _send(tab: "Tab", target: QWidget, event: QEvent) -> None:
+        """Claude's own input into the page, marked: not the user's (Tab.eventFilter, AgentPanel._on_busy)."""
+        tab.agent_sending = True
+        try:
+            QApplication.sendEvent(target, event)
+        finally:
+            tab.agent_sending, tab.agent_acted_at = False, time.monotonic()
+
     def _mouse(self, tab: "Tab", x: float, y: float, press: bool = True, move: bool = True) -> None:
         """Real mouse input at (x, y) CSS px of the visible viewport: a move there, then a click (press and release)."""
         if self._token["over"]:  # (Claude was stopped)
@@ -14113,7 +14184,7 @@ class AgentBrowser:
         if press:
             events += [(QEvent.Type.MouseButtonPress, left, left), (QEvent.Type.MouseButtonRelease, left, none)]
         for kind, button, buttons in events:
-            QApplication.sendEvent(target, QMouseEvent(kind, local, screen, button, buttons, Qt.KeyboardModifier.NoModifier))
+            self._send(tab, target, QMouseEvent(kind, local, screen, button, buttons, Qt.KeyboardModifier.NoModifier))
 
     def _checked_click(self, tab: "Tab", n: int, point: dict, then) -> None:
         """Click element [n] at *point* (from point()) with the real mouse - making sure it's [n] the click lands on:
@@ -14182,7 +14253,7 @@ class AgentBrowser:
             return
         target = self._input_target(tab)
         for kind in (QEvent.Type.KeyPress, QEvent.Type.KeyRelease):
-            QApplication.sendEvent(target, QKeyEvent(kind, key, modifiers, text))
+            self._send(tab, target, QKeyEvent(kind, key, modifiers, text))
 
     def _type(self, tab: "Tab", text: str, multiline: bool) -> None:
         """Real typing into the focused field (it has its content selected, so this replaces it)."""
@@ -14196,7 +14267,7 @@ class AgentBrowser:
         if len(text) > 300:  # long text: in one go, as an input method would
             event = QInputMethodEvent("", [])
             event.setCommitString(text if multiline else text.replace("\n", " "))
-            QApplication.sendEvent(self._input_target(tab), event)
+            self._send(tab, self._input_target(tab), event)
             return
         for char in text:
             if char == "\n":
@@ -15221,6 +15292,7 @@ class AgentPanel(QFrame):
         self._open: dict[str, QLabel | None] = {"text": None, "thinking": None}
         self._key_where: str | None = None  # where the key is from, once looked up (the keychain is asked only once)
         self.hint: QLabel | None = None
+        self._run_started = 0.0  # (monotonic) only the user's input in the page since then keeps the focus there
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -15488,10 +15560,31 @@ class AgentPanel(QFrame):
         self.stop_button.setVisible(busy)
         self.send_button.setVisible(not busy)
         self.model_box.setEnabled(not busy)
+        if busy:
+            self._run_started = time.monotonic()
         self.status.setText("Claude is working…" if busy else "")
         self.win.agent_button.setToolTip("Claude is working - click to show the panel" if busy else self.win.agent_tip)
-        if not busy and self.isVisible():
+        if not busy and self.isVisible() and self._may_take_focus():
             self.focus_input()  # (typing and key presses moved the focus into the page)
+
+    def _may_take_focus(self) -> bool:
+        """Whether the prompt box may take the focus back as a run ends: not from where the user went on typing or
+        clicking meanwhile (a chat's message box: the rest of the message, and its Enter, would go to Claude)."""
+        focus = QApplication.focusWidget()
+        if focus is not None and focus.window() is not self.win:
+            if self.win.isActiveWindow():
+                return False  # (a pop-up of this window in use: the bookmark, VPN or an extension's panel)
+            focus = None      # (another window is active: this one's own focus, for when the user comes back)
+        if focus is None:
+            focus = self.win.focusWidget()
+        if focus is None or focus is self or self.isAncestorOf(focus):
+            return True
+        tab = self.win.current_tab()
+        if tab is not None and (focus is tab.view or tab.view.isAncestorOf(focus)):  # the page: unless used during the run
+            return tab.user_input_at <= max(tab.agent_acted_at, self._run_started)
+        # elsewhere: the button a click left it on, the address bar of Claude's new tab - not an address or search the
+        # user is typing, nor DevTools
+        return not (isinstance(focus, QLineEdit) and focus.isModified()) and not isinstance(focus.parentWidget(), QWebEngineView)
 
     def _on_tab_changed(self) -> None:
         if self.session.running:  # Claude acts on the current tab, so the indicator goes with it
@@ -15836,7 +15929,17 @@ class BrowserWindow(QMainWindow):
         self.act_shortcuts = a("Keyboard Shortcuts", self.show_shortcuts)
         self.act_quit = a(f"Quit {APP_NAME}" if mac else "Exit", self.close, [QKeySequence.StandardKey.Quit, "Ctrl+Q"],
                           role=QAction.MenuRole.QuitRole)
+        # Shortcuts a web page gets first, as in Chrome (Discord's Cmd+K, a site's own Cmd+F/G/P/S): the action runs
+        # only if the page leaves the key alone (Tab.eventFilter). New/close/reopen/switch tab, quit, Esc, zoom: never
+        self.page_first_keys = {seq[0].toCombined() for action in (
+            self.act_focus_url, self.act_find, self.act_find_next, self.act_find_prev, self.act_print, self.act_save,
+            self.act_bookmark, self.act_source, self.act_history, self.act_downloads, self.act_extensions)
+            for seq in action.shortcuts() if seq.count() == 1 and seq != QKeySequence("F6")}
         self.menu_button.setMenu(self._build_app_menu())
+
+    def page_first(self, event: QKeyEvent) -> bool:
+        """Whether the page gets this key before the browser's shortcut for it (page_first_keys)."""
+        return (event.keyCombination().toCombined() & ~Qt.KeyboardModifier.KeypadModifier.value) in self.page_first_keys
 
     def _build_app_menu(self) -> QMenu:
         menu = Menu("", self.menu_button)
@@ -16560,8 +16663,6 @@ class BrowserWindow(QMainWindow):
         tab.loading, tab.progress = False, 100
         if ok:  # (a new document; a cache restore keeps the one typed into)
             tab.typed = False
-        if (proxy := tab.view.focusProxy()) is not None:  # (Memory Saver: notes typing; a new renderer may bring a new
-            proxy.installEventFilter(tab)                  # proxy, and Qt keeps one filter per object)
         self._refresh_tab(tab)
         self._tab_updated(tab, {"status": "complete"})
         if ok:

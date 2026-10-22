@@ -296,6 +296,41 @@ def test_login_is_offered_saved_to_keychain_and_filled_on_revisit(fg, win, vault
     assert not pop.isVisible()
 
 
+@pytest.mark.parametrize("arrows", [[Qt.Key.Key_Down], [Qt.Key.Key_Down, Qt.Key.Key_Down, Qt.Key.Key_Up]])
+def test_arrow_keys_in_the_list_leave_the_next_key_alone(fg, win, vault, forms, arrows):
+    """The list took Up/Down's key press but not its ShortcutOverride, where Qt WebEngine notes the key's edit command
+    ("MoveDown"): it ran that with the page's next key instead of that key's own typing (the first letter lost)."""
+    for name in ("alice", "bob"):
+        win.autofill.data.add_login(forms.origin, name, PASSWORD)
+    tab = show(win, forms.add("/login", LOGIN))
+    click(tab, "#user")
+    pop = wait_popup(fg, win)
+    for arrow in arrows:
+        key(tab, arrow)  # (QTest: the ShortcutOverride first, as from the keyboard)
+    picked = pop.widgets[pop.selected].text.text()
+    assert picked == "alice"
+    key(tab, Qt.Key.Key_Return)
+    poll_js(tab.page, "document.querySelector('#pass').value", lambda v: v == PASSWORD, what="the filled password")
+    keys(tab, "Z")
+    poll_js(tab.page, "document.querySelector('#user').value", lambda v: v == picked + "Z", what="the letter typed after")
+
+
+def test_a_pick_with_the_keyboard_leaves_typing_elsewhere_alone(fg, win, vault, forms):
+    """... the left-over command outlived the list: the first key typed in another box on the page (a chat's message
+    box, after signing in on a one-page app) was lost."""
+    win.autofill.data.add_login(forms.origin, "alice", PASSWORD)
+    chat = '</form><div id="chat" contenteditable="true" style="width:220px;height:40px;border:1px solid"></div>'
+    tab = show(win, forms.add("/chat", LOGIN.replace("</form>", chat)))
+    click(tab, "#user")
+    wait_popup(fg, win)
+    key(tab, Qt.Key.Key_Down)
+    key(tab, Qt.Key.Key_Return)
+    poll_js(tab.page, "document.querySelector('#pass').value", lambda v: v == PASSWORD, what="the filled password")
+    click(tab, "#chat")
+    keys(tab, "hi")
+    poll_js(tab.page, "document.querySelector('#chat').textContent", lambda v: v == "hi", what="the message typed")
+
+
 def test_fill_reaches_react_controlled_inputs_and_update_password(fg, win, vault, forms):
     url = forms.add("/react", REACT_LOGIN)
     win.autofill.data.add_login(forms.origin, "alice", "old-pass-1")

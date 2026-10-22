@@ -1,12 +1,16 @@
 """Pinned tabs and split view (like Chrome's): ordering, looks, dragging, closing/reopening, the session, and what
-the focused side of a split view drives (address bar, find, zoom, extension APIs, full screen)."""
+the focused side of a split view drives (address bar, find, zoom, extension APIs, full screen); keyboard shortcuts the
+page gets first; Backspace in a Slate-like (Discord) editor."""
 from __future__ import annotations
 
+import os
 import re
+import signal
 from urllib.parse import quote, unquote
 
 from PyQt6.QtCore import QEvent, QPointF, Qt, QUrl
-from PyQt6.QtGui import QMouseEvent
+from PyQt6.QtGui import QInputMethodEvent, QKeyEvent, QMouseEvent
+from PyQt6.QtTest import QTest
 from PyQt6.QtWidgets import QApplication, QTabBar
 
 from helpers import run_js, spin, wait_until
@@ -460,3 +464,179 @@ def test_pinned_tabs_come_back_even_without_session_restore(harness, fg):
     assert len(tabs) == 2 and tabs[0].pinned and shows(tabs[0]) == "c"
     assert fg.is_newtab(tabs[1].url()) and not tabs[1].pinned and second.current_tab() is tabs[1]
     assert all(t.split is None for t in tabs)
+
+
+# ══════════════════════════════════════════════════════════════════════════════════════════
+#  Keyboard shortcuts: the page first, as in Chrome
+# ══════════════════════════════════════════════════════════════════════════════════════════
+def box_page(window, script: str):
+    """The current tab on a full-page editor (a chat's message box, #box) running *script*, the box focused."""
+    html = ("<!doctype html><title>keys</title><p>#general</p>"  # (text shown: Chromium drops input until then)
+            f"<div id=box contenteditable style='min-height:300px'></div><script>{script}</script>")
+    tab = loaded(window, window.current_tab(), QUrl("data:text/html," + quote(html)))
+    tab.view.setFocus()
+    run_js(tab.page, "document.getElementById('box').focus()")
+    wait_until(lambda: QApplication.focusWidget() is tab.view.focusProxy()
+               and run_js(tab.page, "document.hasFocus() && document.activeElement.id") == "box", 10, "the focus")
+    return tab
+
+
+def keys_page(window, handles: bool):
+    """A message box that logs its keys; with *handles* it takes every Ctrl/Cmd shortcut itself, as Discord does with
+    Cmd+K (Quick Switcher) and Cmd+G (GIFs)."""
+    return box_page(window, "window.keys = []; document.addEventListener('keydown', e => {"
+                    " if (e.key.length > 1) return; keys.push(e.key.toLowerCase());"
+                    f" if ({'true' if handles else 'false'} && (e.ctrlKey || e.metaKey)) e.preventDefault(); }});")
+
+
+def press(tab, key) -> None:
+    QTest.keyClick(tab.view.focusProxy(), key, Qt.KeyboardModifier.ControlModifier)
+
+
+def page_keys(tab) -> list:
+    return run_js(tab.page, "keys.join(',')").split(",")
+
+
+def test_page_gets_the_shortcuts_it_handles_before_the_browser(window):
+    tab = keys_page(window, handles=True)
+    opened: list = []
+    window.act_focus_url.triggered.connect(lambda *_: opened.append(1))
+    press(tab, Qt.Key.Key_K)  # Discord's Quick Switcher: the typing used to go to the address bar
+    wait_until(lambda: page_keys(tab) == ["k"], 10, "the page to see Ctrl+K")
+    spin(0.4)
+    assert opened == [] and not window.url_bar.hasFocus() and QApplication.focusWidget() is tab.view.focusProxy()
+    press(tab, Qt.Key.Key_G)
+    wait_until(lambda: page_keys(tab) == ["k", "g"], 10, "the page to see Ctrl+G")
+    spin(0.4)
+    assert not window.find_bar.isVisible() and QApplication.focusWidget() is tab.view.focusProxy()
+    count = len(window.tabs())
+    press(tab, Qt.Key.Key_T)  # new tab, close tab: the browser's, even on a page that takes every shortcut (as Chrome)
+    assert len(window.tabs()) == count + 1 and window.current_tab() is not tab and page_keys(tab) == ["k", "g"]
+    window.focus_tab(tab)
+    tab.view.setFocus()
+    wait_until(lambda: QApplication.focusWidget() is tab.view.focusProxy(), 10, "the page's focus again")
+    press(tab, Qt.Key.Key_W)
+    wait_until(lambda: tab not in window.tabs(), 10, "Ctrl+W to close the tab")
+    assert len(window.tabs()) == count
+    # (a new tab's page gets them first before its first load finished, too, and its input is noted from the start)
+    fresh, finished = window.new_tab(None), []
+    fresh.page.loadFinished.connect(finished.append)
+    fresh.load(page("fresh"))
+    override = QKeyEvent(QEvent.Type.ShortcutOverride, Qt.Key.Key_K, Qt.KeyboardModifier.ControlModifier)
+    override.ignore()
+    assert fresh.view.focusProxy() is not None and finished == [] and fresh.user_input_at == 0
+    QApplication.sendEvent(fresh.view.focusProxy(), override)
+    QApplication.sendEvent(fresh.view.focusProxy(), QInputMethodEvent())
+    assert override.isAccepted() and fresh.user_input_at > 0
+
+
+def test_shortcuts_the_page_leaves_alone_still_run_once(window):
+    tab = keys_page(window, handles=False)
+    opened: list = []
+    window.act_focus_url.triggered.connect(lambda *_: opened.append(1))
+    press(tab, Qt.Key.Key_K)  # the page sees it first, then Qt WebEngine hands it back unhandled: the action runs
+    wait_until(lambda: window.url_bar.hasFocus(), 10, "Ctrl+K to focus the address bar")
+    spin(0.4)
+    assert page_keys(tab) == ["k"] and opened == [1]
+    tab.view.setFocus()
+    wait_until(lambda: QApplication.focusWidget() is tab.view.focusProxy(), 10, "the page's focus again")
+    press(tab, Qt.Key.Key_F)
+    wait_until(lambda: window.find_bar.isVisible(), 10, "Ctrl+F to open the find bar")
+    assert page_keys(tab) == ["k", "f"]
+
+
+def test_a_crashed_tab_runs_the_browser_shortcuts_at_once(window, server):
+    """A crashed tab has no page widget: no page to give Ctrl+L / Ctrl+F to first (they did nothing at all)."""
+    server.add("/crashing", b"<!doctype html><title>Crashing</title><p>gone soon</p>", "text/html; charset=utf-8")
+    tab = window.new_tab(None)  # (a site of its own: its own renderer)
+    assert loaded(window, tab, QUrl(server.url("/crashing")))
+    os.kill(tab.page.renderProcessPid(), signal.SIGKILL)
+    wait_until(lambda: tab.crashed and tab.view.focusProxy() is None, 15, "the tab to crash")
+    window.focus_tab(tab)
+    tab.view.setFocus()
+    wait_until(lambda: QApplication.focusWidget() is tab.view, 10, "the crashed tab's focus")
+    QTest.keyClick(tab.view, Qt.Key.Key_L, Qt.KeyboardModifier.ControlModifier)
+    wait_until(lambda: window.url_bar.hasFocus(), 10, "Ctrl+L to focus the address bar")
+    tab.view.setFocus()
+    QTest.keyClick(tab.view, Qt.Key.Key_F, Qt.KeyboardModifier.ControlModifier)
+    wait_until(lambda: window.find_bar.isVisible(), 10, "Ctrl+F to open the find bar")
+
+
+def test_browser_shortcuts_are_not_typing(window):
+    """Ctrl+F, Ctrl+L... reach the page first now, but they aren't typing: Memory Saver may still free the tab."""
+    tab = keys_page(window, handles=False)
+    spin(0.3)
+    assert not tab.typed
+    press(tab, Qt.Key.Key_F)
+    wait_until(lambda: window.find_bar.isVisible(), 10, "Ctrl+F to open the find bar")
+    assert page_keys(tab) == ["f"] and not tab.typed
+
+
+# Backspace: Blink's own DeleteBackward, which fires beforeinput (Slate, Discord's editor, learns deletions from it)
+SLATE = ("window.types = []; window.model = ''; const box = document.getElementById('box');"  # (like Slate: the
+         "box.addEventListener('beforeinput', e => { types.push(e.inputType); e.preventDefault();"  # model is sent)
+         " if (e.inputType == 'insertText') model += e.data;"
+         " else if (e.inputType == 'deleteContentBackward') model = model.slice(0, -1);"
+         " box.textContent = model; getSelection().collapse(box, box.childNodes.length); });")
+
+
+def test_backspace_skips_qt_webengines_backward_delete_command(window):
+    """macOS: Qt WebEngine stored Backspace's ShortcutOverride as its "BackwardDelete" edit command, which deletes with
+    no beforeinput: Discord showed the text deleted, but its model kept it and sent it. Tab.eventFilter takes it."""
+    tab = loaded(window, window.current_tab(), page("backspace"))
+    proxy = tab.view.focusProxy()
+    for mods in (Qt.KeyboardModifier.NoModifier, Qt.KeyboardModifier.KeypadModifier):
+        override = QKeyEvent(QEvent.Type.ShortcutOverride, Qt.Key.Key_Backspace, mods)
+        override.ignore()
+        QApplication.sendEvent(proxy, override)
+        assert override.isAccepted()
+        assert tab.eventFilter(proxy, QKeyEvent(QEvent.Type.ShortcutOverride, Qt.Key.Key_Backspace, mods)) is True
+    mod = Qt.KeyboardModifier  # (Shift: Blink's DeleteBackward anyway; Meta+H, Control+H on a Mac: Blink has none)
+    for key, mods in ((Qt.Key.Key_Backspace, mod.ShiftModifier), (Qt.Key.Key_Backspace, mod.AltModifier),
+                      (Qt.Key.Key_Backspace, mod.ControlModifier), (Qt.Key.Key_H, mod.MetaModifier)):
+        assert tab.eventFilter(proxy, QKeyEvent(QEvent.Type.ShortcutOverride, key, mods)) is False
+    key_press = QKeyEvent(QEvent.Type.KeyPress, Qt.Key.Key_Backspace, Qt.KeyboardModifier.NoModifier)
+    assert tab.eventFilter(proxy, key_press) is False  # (the key itself goes on to the page)
+
+
+def test_backspace_override_in_pop_ups_too(fg, window, server):
+    """window.open pop-ups (sign-in windows) and extension pop-ups are plain web views: the same rule for Backspace."""
+    server.add("/opener", b"<!doctype html><title>Opener</title><p>opener</p>", "text/html; charset=utf-8")
+    server.add("/popped", b"<!doctype html><title>Popped</title><div contenteditable>x</div>", "text/html; charset=utf-8")
+    tab = loaded(window, window.current_tab(), QUrl(server.url("/opener")))
+    run_js(tab.page, f"window.open({server.url('/popped')!r}, 'p', 'width=400,height=300') && 1")
+    popup = wait_until(lambda: next(iter(window.popups), None), 10, "the pop-up window")
+    wait_until(lambda: popup.view.focusProxy() is not None and "/popped" in popup.view.url().toString(), 10, "its page")
+    assert isinstance(popup.view, fg.PageView)
+    override = QKeyEvent(QEvent.Type.ShortcutOverride, Qt.Key.Key_Backspace, Qt.KeyboardModifier.NoModifier)
+    override.ignore()
+    QApplication.sendEvent(popup.view.focusProxy(), override)
+    assert override.isAccepted()
+    popup.close()
+
+
+def test_backspace_deletes_from_a_slate_like_editors_model(window):
+    """(On Linux Qt WebEngine never stored "BackwardDelete": this passes without the fix too. It shows that taking the
+    override leaves deletion, a held Backspace and Shift+Backspace working; the test above guards the fix itself.)"""
+    tab = box_page(window, SLATE)
+    proxy = tab.view.focusProxy()
+
+    def state() -> list:
+        return run_js(tab.page, "[box.textContent, model, types.filter(t => t == 'deleteContentBackward').length]")
+
+    QTest.keyClicks(proxy, "hello")
+    wait_until(lambda: state() == ["hello", "hello", 0], 10, "'hello' in the box and the model")
+    QTest.keyClick(proxy, Qt.Key.Key_Backspace)
+    QTest.keyClick(proxy, Qt.Key.Key_Backspace)
+    wait_until(lambda: state() == ["hel", "hel", 2], 10, "two Backspaces to delete from the model too")
+    QTest.keyClicks(proxy, "lo world")
+    wait_until(lambda: state()[:2] == ["hello world"] * 2, 10, "'hello world'")
+    none = Qt.KeyboardModifier.NoModifier  # held: a press, autorepeat presses (as macOS sends them), a release
+    for repeat in (False, True, True, True):  # (the focus object's ShortcutOverride first, as from the window)
+        QTest.simulateEvent(proxy, True, Qt.Key.Key_Backspace.value, none, "", repeat)
+        spin(0.03)
+    QTest.simulateEvent(proxy, False, Qt.Key.Key_Backspace.value, none, "", False)
+    wait_until(lambda: state() == ["hello w", "hello w", 6], 10, "a held Backspace to delete from the model")
+    QTest.keyClick(proxy, Qt.Key.Key_Backspace, Qt.KeyboardModifier.ShiftModifier)
+    wait_until(lambda: state() == ["hello ", "hello ", 7], 10, "Shift+Backspace to delete from the model")
+    assert run_js(tab.page, "types.filter(t => t != 'insertText' && t != 'deleteContentBackward').length") == 0

@@ -110,6 +110,22 @@ def test_restart_process_boots_from_cached_bytecode(fg, monkeypatch):
     assert os.path.abspath(fg.__file__) in argv[2] and fg.bytecode_cache() in argv[2]
 
 
+def test_restart_on_windows_quotes_the_boot_code(fg, monkeypatch):
+    """Windows' os.execv joins its arguments without quoting: the -c code reached Python cut at its first space
+    ("import" alone, a SyntaxError) and Chrome 2 never came back after Apply & Restart. There a child is started
+    with subprocess (which quotes each argument) and waited for."""
+    calls = []
+    monkeypatch.setattr(fg.sys, "platform", "win32")
+    monkeypatch.setattr(fg.subprocess, "call", lambda args: calls.append(args) or 0)
+    monkeypatch.setattr(fg.os, "execv", lambda *args: pytest.fail("execv on Windows"))
+    monkeypatch.setattr(fg, "_icon_factory", None)
+    with pytest.raises(SystemExit) as stop:
+        fg.restart_process("work", os.environ.get("QTWEBENGINE_CHROMIUM_FLAGS"))
+    assert stop.value.code == 0
+    [args] = calls
+    assert args == [sys.executable, "-c", fg.boot_command(fg.__file__), "--profile", "work"]  # (a list: quoted per item)
+
+
 def test_app_launcher_starts_from_cached_bytecode(fg, tmp_path, cache, monkeypatch, qapp):
     real_which = shutil.which
     monkeypatch.setattr(fg.shutil, "which", lambda name, *a, **k: None if name == "iconutil" else real_which(name, *a, **k))

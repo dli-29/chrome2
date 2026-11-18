@@ -18654,7 +18654,10 @@ def restart_process(profile_name: str, original_flags: str | None) -> None:
         shutil.rmtree(_icon_factory.dir, ignore_errors=True)
     sys.stdout.flush()
     sys.stderr.flush()
-    os.execv(sys.executable, [sys.executable, "-c", boot_command(__file__), "--profile", profile_name])
+    args = [sys.executable, "-c", boot_command(__file__), "--profile", profile_name]
+    if sys.platform == "win32":  # Windows' execv doesn't quote its arguments: the -c code split at its first space
+        sys.exit(subprocess.call(args))  # ("import" alone). A child, waited for, keeps the same console and Ctrl+C
+    os.execv(sys.executable, args)
 
 
 if __name__ == "__main__":
